@@ -1,0 +1,7 @@
+OpenSwitcher.exe
+os_console.exe
+*.log
+selftest_result.txt
+obj/
+bin/
+.vs/

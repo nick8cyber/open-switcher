@@ -1,0 +1,170 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+namespace OpenSwitcher.Core
+{
+    /// <summary>Биты модификаторов для хоткеев.</summary>
+    public static class HK
+    {
+        public const int CTRL = 1;
+        public const int SHIFT = 2;
+        public const int ALT = 4;
+        public const int WIN = 8;
+    }
+
+    public class Settings
+    {
+        // --- автоисправление (по умолчанию ВЫКЛЮЧЕНО: ручные хоткеи работают всегда) ---
+        public bool FixOnEnter = false;           // проверять слово при голом Enter (как в Punto)
+        public bool AutoConvertOnWordEnd = false; // проверять слово при пробеле / знаке препинания
+        public int MinWordLen = 3;
+        public double Sensitivity = 1.0;          // 0.7 низкая / 1.0 средняя / 1.5 высокая
+
+        // --- хоткеи ---
+        public int HotFixWordVk = 0x20;            // Ctrl+Space
+        public int HotFixWordMods = HK.CTRL;
+        public int HotFixSelVk = 0x20;             // Ctrl+Shift+Space
+        public int HotFixSelMods = HK.CTRL | HK.SHIFT;
+        public int HotRuVk = 0xA0;        // левый Shift -> РУС
+        public int HotRuMods = 0;
+        public int HotEnVk = 0xA1;        // правый Shift -> ENG
+        public int HotEnMods = 0;
+        public int HotAutoToggleVk = 0x13;    // Break — пауза автоперевода, как в Caramba
+        public int HotAutoToggleMods = 0;
+        public bool LockAutoAfterManualSwitch = true; // ручной выбор раскладки отключает автодетект до новой сессии
+        public bool DoubleShiftSwitch = false;
+
+        // --- система ---
+        public bool ShowPopup = true;
+        public bool RestoreClipboard = true;
+        public bool StartWithWindows = false;
+        public bool Paused = false;
+        public string Exclusions = "";
+        public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
+        public int DefaultsV = 3; // версия дефолтов (3 = хоткеи без Pause/Break)
+    }
+
+    public static class SettingsStore
+    {
+        public static string Dir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "OpenSwitcher"); }
+        }
+
+        private static string FilePath
+        {
+            get { return Path.Combine(Dir, "settings.ini"); }
+        }
+
+        public static Settings Load()
+        {
+            var s = new Settings();
+            bool fileExists = false;
+            try
+            {
+                if (File.Exists(FilePath))
+                {
+                    fileExists = true;
+                    foreach (string line in File.ReadAllLines(FilePath)) ApplyLine(s, line);
+                }
+            }
+            catch (Exception) { }
+            // миграция на безопасные дефолты: старые настройки могли держать
+            // автоисправление и double-shift включёнными
+            if (!fileExists || s.DefaultsV < 2)
+            {
+                s.FixOnEnter = false;
+                s.AutoConvertOnWordEnd = false;
+                s.DoubleShiftSwitch = false;
+                s.DefaultsV = 2;
+            }
+            // v3: хоткеи исправления без мёртвой клавиши Pause/Break (кастомные не трогаем)
+            if (s.DefaultsV < 3)
+            {
+                if (s.HotFixWordVk == 0x13)
+                {
+                    s.HotFixWordVk = 0x20;
+                    s.HotFixWordMods = HK.CTRL;
+                }
+                if (s.HotFixSelVk == 0x13)
+                {
+                    s.HotFixSelVk = 0x20;
+                    s.HotFixSelMods = HK.CTRL | HK.SHIFT;
+                }
+                s.DefaultsV = 3;
+                Save(s);
+            }
+            return s;
+        }
+
+        private static void ApplyLine(Settings s, string line)
+        {
+            int i = line.IndexOf('=');
+            if (i <= 0) return;
+            string k = line.Substring(0, i).Trim();
+            string v = line.Substring(i + 1).Trim();
+            switch (k)
+            {
+                case "FixOnEnter": s.FixOnEnter = v == "1"; break;
+                case "AutoConvertOnWordEnd": s.AutoConvertOnWordEnd = v == "1"; break;
+                case "DoubleShiftSwitch": s.DoubleShiftSwitch = v == "1"; break;
+                case "ShowPopup": s.ShowPopup = v == "1"; break;
+                case "RestoreClipboard": s.RestoreClipboard = v == "1"; break;
+                case "StartWithWindows": s.StartWithWindows = v == "1"; break;
+                case "Paused": s.Paused = v == "1"; break;
+                case "MinWordLen": { int n; if (int.TryParse(v, out n)) s.MinWordLen = Math.Max(2, Math.Min(8, n)); break; }
+                case "Sensitivity": { double d; if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) s.Sensitivity = d; break; }
+                case "HotFixWordVk": { int n; if (int.TryParse(v, out n)) s.HotFixWordVk = n; break; }
+                case "HotFixWordMods": { int n; if (int.TryParse(v, out n)) s.HotFixWordMods = n; break; }
+                case "HotFixSelVk": { int n; if (int.TryParse(v, out n)) s.HotFixSelVk = n; break; }
+                case "HotFixSelMods": { int n; if (int.TryParse(v, out n)) s.HotFixSelMods = n; break; }
+                case "HotRuVk": { int n; if (int.TryParse(v, out n)) s.HotRuVk = n; break; }
+                case "HotRuMods": { int n; if (int.TryParse(v, out n)) s.HotRuMods = n; break; }
+                case "HotEnVk": { int n; if (int.TryParse(v, out n)) s.HotEnVk = n; break; }
+                case "HotEnMods": { int n; if (int.TryParse(v, out n)) s.HotEnMods = n; break; }
+                case "HotAutoToggleVk": { int n; if (int.TryParse(v, out n)) s.HotAutoToggleVk = n; break; }
+                case "HotAutoToggleMods": { int n; if (int.TryParse(v, out n)) s.HotAutoToggleMods = n; break; }
+                case "LockAutoAfterManualSwitch": s.LockAutoAfterManualSwitch = v == "1"; break;
+                case "Exclusions": s.Exclusions = v; break;
+                case "ThemeMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 2) s.ThemeMode = n; break; }
+                case "DefaultsV": { int n; if (int.TryParse(v, out n)) s.DefaultsV = n; break; }
+            }
+        }
+
+        public static void Save(Settings s)
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                var sb = new StringBuilder();
+                sb.AppendLine("FixOnEnter=" + (s.FixOnEnter ? "1" : "0"));
+                sb.AppendLine("AutoConvertOnWordEnd=" + (s.AutoConvertOnWordEnd ? "1" : "0"));
+                sb.AppendLine("DoubleShiftSwitch=" + (s.DoubleShiftSwitch ? "1" : "0"));
+                sb.AppendLine("ShowPopup=" + (s.ShowPopup ? "1" : "0"));
+                sb.AppendLine("RestoreClipboard=" + (s.RestoreClipboard ? "1" : "0"));
+                sb.AppendLine("StartWithWindows=" + (s.StartWithWindows ? "1" : "0"));
+                sb.AppendLine("Paused=" + (s.Paused ? "1" : "0"));
+                sb.AppendLine("MinWordLen=" + s.MinWordLen);
+                sb.AppendLine("Sensitivity=" + s.Sensitivity.ToString("0.0", CultureInfo.InvariantCulture));
+                sb.AppendLine("HotFixWordVk=" + s.HotFixWordVk);
+                sb.AppendLine("HotFixWordMods=" + s.HotFixWordMods);
+                sb.AppendLine("HotFixSelVk=" + s.HotFixSelVk);
+                sb.AppendLine("HotFixSelMods=" + s.HotFixSelMods);
+                sb.AppendLine("HotRuVk=" + s.HotRuVk);
+                sb.AppendLine("HotRuMods=" + s.HotRuMods);
+                sb.AppendLine("HotEnVk=" + s.HotEnVk);
+                sb.AppendLine("HotEnMods=" + s.HotEnMods);
+                sb.AppendLine("HotAutoToggleVk=" + s.HotAutoToggleVk);
+                sb.AppendLine("HotAutoToggleMods=" + s.HotAutoToggleMods);
+                sb.AppendLine("LockAutoAfterManualSwitch=" + (s.LockAutoAfterManualSwitch ? "1" : "0"));
+                sb.AppendLine("Exclusions=" + s.Exclusions);
+                sb.AppendLine("ThemeMode=" + s.ThemeMode);
+                sb.AppendLine("DefaultsV=" + s.DefaultsV);
+                File.WriteAllText(FilePath, sb.ToString());
+            }
+            catch (Exception) { }
+        }
+    }
+}
