@@ -26,7 +26,7 @@ namespace OpenSwitcher.UI
         private PageCard[] _cards;
 
         private ToggleSwitch _tEnter, _tAuto, _tDouble, _tPopup, _tClip, _tRun, _tLock;
-        private HotkeyBox _hkWord, _hkSel, _hkRu, _hkEn, _hkAuto;
+        private HotkeyBox _hkWord, _hkSel, _hkRu, _hkEn, _hkAuto, _hkUndo;
         private NumBox _numLen;
         private ChoiceSeg _segSens, _segTheme;
         private TextBox _tbExcl, _tbSandbox;
@@ -160,10 +160,14 @@ namespace OpenSwitcher.UI
             _tDouble = new ToggleSwitch();
             _tDouble.Checked = _engine.S.DoubleShiftSwitch;
             c3.AddRow("Двойной Shift — сменить раскладку", "Двойной тап любого Shift переключает на другую", _tDouble, 44);
+            _hkUndo = new HotkeyBox();
+            _hkUndo.Vk = _engine.S.HotUndoVk;
+            _hkUndo.Mods = _engine.S.HotUndoMods;
+            c3.AddRow("Отменить последнюю автозамену", "Вернуть слово и раскладку, которые были до автозамены", _hkUndo, 52);
             _hkAuto = new HotkeyBox();
             _hkAuto.Vk = _engine.S.HotAutoToggleVk;
             _hkAuto.Mods = _engine.S.HotAutoToggleMods;
-            c3.AddRow("Пауза автоперевода", "Как в Caramba: Break блокирует и возвращает автоперевод", _hkAuto, 52);
+            c3.AddRow("Пауза автоперевода", "Глобальный тумблер; по умолчанию не назначена", _hkAuto, 52);
 
             // ================= страница «Внешний вид»
             Panel pLook = MkPage(w);
@@ -392,6 +396,7 @@ namespace OpenSwitcher.UI
             _hkRu.Vk = s.HotRuVk; _hkRu.Mods = s.HotRuMods;
             _hkEn.Vk = s.HotEnVk; _hkEn.Mods = s.HotEnMods;
             _hkAuto.Vk = s.HotAutoToggleVk; _hkAuto.Mods = s.HotAutoToggleMods;
+            _hkUndo.Vk = s.HotUndoVk; _hkUndo.Mods = s.HotUndoMods;
             _tDouble.Checked = s.DoubleShiftSwitch;
             _segTheme.SelectedIndex = s.ThemeMode;
             _tPopup.Checked = s.ShowPopup;
@@ -419,6 +424,8 @@ namespace OpenSwitcher.UI
             s.HotEnMods = _hkEn.Mods;
             s.HotAutoToggleVk = _hkAuto.Vk;
             s.HotAutoToggleMods = _hkAuto.Mods;
+            s.HotUndoVk = _hkUndo.Vk;
+            s.HotUndoMods = _hkUndo.Mods;
             s.DoubleShiftSwitch = _tDouble.Checked;
             s.ThemeMode = _segTheme.SelectedIndex;
             s.ShowPopup = _tPopup.Checked;

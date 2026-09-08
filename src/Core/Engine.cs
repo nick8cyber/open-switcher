@@ -38,6 +38,15 @@ namespace OpenSwitcher.Core
         private IntPtr _expectedHkl;         // раскладка, которую ожидаем в переднем окне
         private bool _expectedValid;
 
+        // точка отката последней автозамены
+        private bool _undoPending;
+        private string _undoText = "";       // что было набрано (до замены)
+        private int _undoLen;                // длина заменённого текста (сколько стирать)
+        private IntPtr _undoHkl;             // раскладка до замены
+        private IntPtr _undoHwnd;            // окно, где была замена
+        private int _undoTick;
+        private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
+
         // состояние переднего окна
         private IntPtr _fgHwnd;
         private IntPtr _fgHkl;
@@ -246,6 +255,16 @@ namespace OpenSwitcher.Core
 
             if (IsExcludedHere()) { _buf.Clear(); return true; }
 
+            // отмена последней автозамены (Break по умолчанию)
+            if (S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))
+            {
+                UndoLastConversion();
+                return false;
+            }
+
+            // после этой точки любое нажатие делает откат небезопасным
+            _keysSinceUndoPoint++;
+
             // хоткеи: MatchHot сверяет и vk, и все модификаторы, так что
             // случайное срабатывание при обычной печати исключено
             if (S.HotFixWordVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixWordVk, S.HotFixWordMods))
@@ -349,7 +368,8 @@ namespace OpenSwitcher.Core
                 {
                     if (_buf.Count > 0) _lastWord = _buf.Snapshot();
                     _buf.Clear();
-                    _tapAlone = false; // клик между нажатием и отпусканием отменяет тап
+                    _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
+                    _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
                 }
             }
             return Native.CallNextHookEx(_mouseHook, code, wParam, lParam);
@@ -361,6 +381,7 @@ namespace OpenSwitcher.Core
             _buf.Clear();
             _anyKeySinceShift = true;
             _tapAlone = false;
+            _undoPending = false; // сменилось окно — откатывать нечего/небезопасно
             // новое окно — новая сессия ввода: лок снимается
             _autoLocked = false;
             _expectedValid = false;
@@ -456,6 +477,16 @@ namespace OpenSwitcher.Core
             if (viaEnter) TextConverter.SendKey(0x0D, false); // пересылаем проглоченный Enter
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
+
+            // точка отката: Break вернёт исходное слово и раскладку
+            _undoPending = true;
+            _undoText = cur.Text;
+            _undoLen = best.Text.Length;
+            _undoHkl = cur.Hkl;
+            _undoHwnd = _fgHwnd;
+            _undoTick = Environment.TickCount;
+            _keysSinceUndoPoint = 0;
+
             FireConverted(cur.Text, best.Text);
             return true;
         }
@@ -468,6 +499,27 @@ namespace OpenSwitcher.Core
             if (!S.Paused) _autoLocked = false; // с чистого листа
             Apply(S); // обновит тултип трея
             FireInfo(S.Paused ? "Автоисправление выключено" : "Автоисправление включено");
+        }
+
+        /// <summary>Отмена последней автозамены: вернуть исходное слово и раскладку.</summary>
+        public void UndoLastConversion()
+        {
+            if (!_undoPending) { FireInfo("Нечего отменять"); return; }
+            // после замены уже печатали — backspace'ами сотрём чужой текст, отказываемся
+            if (_keysSinceUndoPoint > 0) { FireInfo("Уже набран новый текст"); return; }
+            UpdateForeground();
+            if (_undoHwnd != _fgHwnd) { FireInfo("Уже в другом окне"); return; }
+            int age = unchecked(Environment.TickCount - _undoTick);
+            if (age < 0 || age > 15000) { FireInfo("Слишком поздно"); return; }
+
+            Suppress(600);
+            TextConverter.SendBackspaces(_undoLen);
+            TextConverter.SendUnicode(_undoText);
+            LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
+            ExpectLayout(_undoHkl);
+            if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
+            FireInfo("Отменено: " + _undoText);
+            _undoPending = false;
         }
 
         public void DoFixLastWord()

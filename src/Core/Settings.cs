@@ -23,6 +23,8 @@ namespace OpenSwitcher.Core
         public double Sensitivity = 1.0;          // 0.7 низкая / 1.0 средняя / 1.5 высокая
 
         // --- хоткеи ---
+        public int HotUndoVk = 0x13;               // Break — отмена последней автозамены
+        public int HotUndoMods = 0;
         public int HotFixWordVk = 0x20;            // Ctrl+Space
         public int HotFixWordMods = HK.CTRL;
         public int HotFixSelVk = 0x20;             // Ctrl+Shift+Space
@@ -31,7 +33,7 @@ namespace OpenSwitcher.Core
         public int HotRuMods = 0;
         public int HotEnVk = 0xA1;        // правый Shift -> ENG
         public int HotEnMods = 0;
-        public int HotAutoToggleVk = 0x13;    // Break — пауза автоперевода, как в Caramba
+        public int HotAutoToggleVk = 0;            // пауза автоперевода — по умолчанию НЕ назначена
         public int HotAutoToggleMods = 0;
         public bool LockAutoAfterManualSwitch = true; // ручной выбор раскладки отключает автодетект до новой сессии
         public bool DoubleShiftSwitch = false;
@@ -43,7 +45,7 @@ namespace OpenSwitcher.Core
         public bool Paused = false;
         public string Exclusions = "";
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
-        public int DefaultsV = 3; // версия дефолтов (3 = хоткеи без Pause/Break)
+        public int DefaultsV = 4; // версия дефолтов (4 = Break отмена автозамены, пауза без клавиши)
     }
 
     public static class SettingsStore
@@ -96,6 +98,19 @@ namespace OpenSwitcher.Core
                 s.DefaultsV = 3;
                 Save(s);
             }
+            // v4: Break = отмена последней автозамены; пауза автоперевода без клавиши по умолчанию
+            if (s.DefaultsV < 4)
+            {
+                if (s.HotAutoToggleVk == 0x13)
+                {
+                    s.HotAutoToggleVk = 0;
+                    s.HotAutoToggleMods = 0;
+                }
+                s.HotUndoVk = 0x13;
+                s.HotUndoMods = 0;
+                s.DefaultsV = 4;
+                Save(s);
+            }
             return s;
         }
 
@@ -126,6 +141,8 @@ namespace OpenSwitcher.Core
                 case "HotEnMods": { int n; if (int.TryParse(v, out n)) s.HotEnMods = n; break; }
                 case "HotAutoToggleVk": { int n; if (int.TryParse(v, out n)) s.HotAutoToggleVk = n; break; }
                 case "HotAutoToggleMods": { int n; if (int.TryParse(v, out n)) s.HotAutoToggleMods = n; break; }
+                case "HotUndoVk": { int n; if (int.TryParse(v, out n)) s.HotUndoVk = n; break; }
+                case "HotUndoMods": { int n; if (int.TryParse(v, out n)) s.HotUndoMods = n; break; }
                 case "LockAutoAfterManualSwitch": s.LockAutoAfterManualSwitch = v == "1"; break;
                 case "Exclusions": s.Exclusions = v; break;
                 case "ThemeMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 2) s.ThemeMode = n; break; }
@@ -158,6 +175,8 @@ namespace OpenSwitcher.Core
                 sb.AppendLine("HotEnMods=" + s.HotEnMods);
                 sb.AppendLine("HotAutoToggleVk=" + s.HotAutoToggleVk);
                 sb.AppendLine("HotAutoToggleMods=" + s.HotAutoToggleMods);
+                sb.AppendLine("HotUndoVk=" + s.HotUndoVk);
+                sb.AppendLine("HotUndoMods=" + s.HotUndoMods);
                 sb.AppendLine("LockAutoAfterManualSwitch=" + (s.LockAutoAfterManualSwitch ? "1" : "0"));
                 sb.AppendLine("Exclusions=" + s.Exclusions);
                 sb.AppendLine("ThemeMode=" + s.ThemeMode);
