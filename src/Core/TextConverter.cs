@@ -10,17 +10,30 @@ namespace OpenSwitcher.Core
     {
         public static void SendKey(int vk, bool extended)
         {
-            var inputs = new Native.INPUT[2];
+            SendKey(vk, extended, false);
+        }
+
+        /// <summary>Нажать клавишу (опционально с Shift) — для пересылки проглоченного разделителя.</summary>
+        public static void SendKey(int vk, bool extended, bool withShift)
+        {
+            var list = new List<Native.INPUT>(withShift ? 4 : 2);
             uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-            inputs[0].type = 1;
-            inputs[0].u.ki.wVk = (ushort)vk;
-            inputs[0].u.ki.wScan = (ushort)sc;
-            inputs[0].u.ki.dwFlags = extended ? Native.KEYEVENTF_EXTENDEDKEY : 0;
-            inputs[1].type = 1;
-            inputs[1].u.ki.wVk = (ushort)vk;
-            inputs[1].u.ki.wScan = (ushort)sc;
-            inputs[1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP | (extended ? Native.KEYEVENTF_EXTENDEDKEY : 0);
-            Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
+            if (withShift)
+            {
+                var sd = new Native.INPUT(); var su = new Native.INPUT();
+                sd.type = 1; su.type = 1;
+                sd.u.ki.wVk = 0x10; su.u.ki.wVk = 0x10;
+                su.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                list.Add(sd); list.Add(su);
+            }
+            var down = new Native.INPUT(); var up = new Native.INPUT();
+            down.type = 1; up.type = 1;
+            down.u.ki.wVk = (ushort)vk; down.u.ki.wScan = (ushort)sc;
+            up.u.ki.wVk = (ushort)vk; up.u.ki.wScan = (ushort)sc;
+            up.u.ki.dwFlags = Native.KEYEVENTF_KEYUP | (extended ? Native.KEYEVENTF_EXTENDEDKEY : 0);
+            down.u.ki.dwFlags = extended ? Native.KEYEVENTF_EXTENDEDKEY : 0;
+            list.Add(down); list.Add(up);
+            Native.SendInput((uint)list.Count, list.ToArray(), System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
         }
 
         public static void SendCombo(int modifierVk, int vk)

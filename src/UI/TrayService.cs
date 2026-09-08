@@ -61,10 +61,7 @@ namespace OpenSwitcher.UI
             var miPause = new ToolStripMenuItem("Пауза");
             miPause.Click += delegate
             {
-                _engine.S.Paused = !_engine.S.Paused;
-                SettingsStore.Save(_engine.S);
-                UpdateTooltip();
-                RefreshMenu();
+                _engine.ToggleAuto(); // сохранение, тултип и статус-карточка обновятся внутри
             };
 
             var miExit = new ToolStripMenuItem("Выход");

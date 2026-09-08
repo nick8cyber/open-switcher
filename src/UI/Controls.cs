@@ -86,6 +86,9 @@ namespace OpenSwitcher.UI
         public int Vk;
         public int Mods;
 
+        /// <summary>Поле сейчас в режиме захвата (чтобы Esc не закрыл всё окно).</summary>
+        public bool Capturing { get { return _capture; } }
+
         public HotkeyBox()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |

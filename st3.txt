@@ -1,0 +1,13 @@
+PASS: 'ghbdtn' (en) -> 'привет' [CONVERT]   cur=-0,59 alt=-0,08  (привет)
+PASS: 'руддщ' (ru) -> 'hello' [CONVERT]   cur=-0,58 alt=0,29  (hello)
+PASS: 'hello' (en) -> 'руддщ' [keep]   cur=0,29 alt=-0,58  (уже английское)
+PASS: 'привет' (ru) -> 'ghbdtn' [keep]   cur=-0,08 alt=-0,59  (уже русское)
+PASS: 'ntcn' (en) -> 'тест' [CONVERT]   cur=-0,23 alt=0,11  (текст)
+PASS: 'црщ' (ru) -> 'who' [CONVERT]   cur=-0,74 alt=0,15  (who)
+PASS: 'world' (en) -> 'цщкдв' [keep]   cur=-0,28 alt=-0,79  (уже английское)
+PASS: 'знает' (ru) -> 'pyftn' [keep]   cur=0,01 alt=-0,65  (уже русское)
+PASS: 'qwerty' (en) -> 'йцукен' [CONVERT]   cur=-0,17 alt=-0,28  (йцукен (клавиатурный ряд))
+PASS: 'qwe' (en) -> 'йцу' [keep]   cur=-0,39 alt=-0,71  (двусмысленно, коротко)
+PASS: 'bd' (en) — короче MinLen, не трогаем: слишком коротко
+PASS: 'quit' (en) -> 'йгше' [keep]   cur=-0,14 alt=-0,72  (настоящее английское слово)
+ALL TESTS PASSED

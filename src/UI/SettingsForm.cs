@@ -473,6 +473,13 @@ namespace OpenSwitcher.UI
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
+            // Esc во время захвата хоткея отменяет захват, а не закрывает окно
+            var hk = ActiveControl as HotkeyBox;
+            if (e.KeyCode == Keys.Escape && hk != null && hk.Capturing)
+            {
+                base.OnKeyDown(e);
+                return;
+            }
             if (e.KeyCode == Keys.Escape) Close();
             base.OnKeyDown(e);
         }

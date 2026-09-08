@@ -1,0 +1,4 @@
+layouts: 2
+  ENG: 'njkl' lang=1 score=-0,750
+  РУС: 'толд' lang=0 score=0,051
+DECISION: convert 'njkl' -> 'толд' (РУС)
