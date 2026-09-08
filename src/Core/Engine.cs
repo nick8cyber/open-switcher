@@ -47,6 +47,15 @@ namespace OpenSwitcher.Core
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
 
+        // обучение: слова, автозамену которых юзер отменил — больше не конвертировать
+        private readonly HashSet<string> _rejected = new HashSet<string>();
+        private const int RejectedCap = 1000;
+
+        private string LearnedPath
+        {
+            get { return System.IO.Path.Combine(SettingsStore.Dir, "learned.txt"); }
+        }
+
         // состояние переднего окна
         private IntPtr _fgHwnd;
         private IntPtr _fgHkl;
@@ -77,6 +86,34 @@ namespace OpenSwitcher.Core
             _winHook = Native.SetWinEventHook(Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
                 IntPtr.Zero, _winProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
             UpdateForeground();
+            LoadRejected();
+        }
+
+        private void LoadRejected()
+        {
+            try
+            {
+                if (!System.IO.File.Exists(LearnedPath)) return;
+                foreach (string line in System.IO.File.ReadAllLines(LearnedPath))
+                {
+                    string w = line.Trim().ToLowerInvariant();
+                    if (w.Length > 0) _rejected.Add(w);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        private void RememberRejected(string typed)
+        {
+            try
+            {
+                if (_rejected.Count >= RejectedCap) return;
+                string w = typed.Trim().ToLowerInvariant();
+                if (w.Length == 0 || !_rejected.Add(w)) return;
+                System.IO.Directory.CreateDirectory(SettingsStore.Dir);
+                System.IO.File.AppendAllText(LearnedPath, w + Environment.NewLine);
+            }
+            catch (Exception) { }
         }
 
         public void Apply(Settings settings)
@@ -477,6 +514,10 @@ namespace OpenSwitcher.Core
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) return false;
 
+            // обучение: это слово юзер уже отменил — автоматически не трогаем
+            // (ручной хоткей в обход: manual=true проверку не проходит)
+            if (!manual && _rejected.Contains(cur.Text.ToLowerInvariant())) return false;
+
             LayoutCandidate best = null;
             foreach (LayoutCandidate c in cands)
             {
@@ -538,6 +579,7 @@ namespace OpenSwitcher.Core
             LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
             ExpectLayout(_undoHkl);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
+            RememberRejected(_undoText); // запоминаем: это слово больше не автозаменяем
             FireInfo("Отменено: " + _undoText);
             _undoPending = false;
         }
