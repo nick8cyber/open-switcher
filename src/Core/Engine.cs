@@ -43,6 +43,7 @@ namespace OpenSwitcher.Core
         private bool _undoPending;
         private string _undoText = "";       // что было набрано (до замены)
         private int _undoLen;                // длина заменённого текста (сколько стирать)
+        private int _undoSep;                // был ли проглочен разделитель (пробел/знак)
         private IntPtr _undoHkl;             // раскладка до замены
         private IntPtr _undoHwnd;            // окно, где была замена
         private int _undoTick;
@@ -51,6 +52,10 @@ namespace OpenSwitcher.Core
         // обучение: слова, автозамену которых юзер отменил — больше не конвертировать
         private readonly HashSet<string> _rejected = new HashSet<string>();
         private const int RejectedCap = 1000;
+
+        // обучение в другую сторону: слова, конвертацию которых юзер принял —
+        // конвертировать даже при сомнительном скоринге
+        private readonly HashSet<string> _accepted = new HashSet<string>();
 
         private string LearnedPath
         {
@@ -87,19 +92,30 @@ namespace OpenSwitcher.Core
             _winHook = Native.SetWinEventHook(Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
                 IntPtr.Zero, _winProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
             UpdateForeground();
-            LoadRejected();
+            LoadLearned();
         }
 
-        private void LoadRejected()
+        private string AcceptedPath
+        {
+            get { return System.IO.Path.Combine(SettingsStore.Dir, "accepted.txt"); }
+        }
+
+        private void LoadLearned()
         {
             try
             {
-                if (!System.IO.File.Exists(LearnedPath)) return;
-                foreach (string line in System.IO.File.ReadAllLines(LearnedPath))
-                {
-                    string w = line.Trim().ToLowerInvariant();
-                    if (w.Length > 0) _rejected.Add(w);
-                }
+                if (System.IO.File.Exists(LearnedPath))
+                    foreach (string line in System.IO.File.ReadAllLines(LearnedPath))
+                    {
+                        string w = line.Trim().ToLowerInvariant();
+                        if (w.Length > 0) _rejected.Add(w);
+                    }
+                if (System.IO.File.Exists(AcceptedPath))
+                    foreach (string line in System.IO.File.ReadAllLines(AcceptedPath))
+                    {
+                        string w = line.Trim().ToLowerInvariant();
+                        if (w.Length > 0) _accepted.Add(w);
+                    }
             }
             catch (Exception) { }
         }
@@ -111,8 +127,35 @@ namespace OpenSwitcher.Core
                 if (_rejected.Count >= RejectedCap) return;
                 string w = typed.Trim().ToLowerInvariant();
                 if (w.Length == 0 || !_rejected.Add(w)) return;
+                _accepted.Remove(w);
                 System.IO.Directory.CreateDirectory(SettingsStore.Dir);
                 System.IO.File.AppendAllText(LearnedPath, w + Environment.NewLine);
+            }
+            catch (Exception) { }
+        }
+
+        private void RememberAccepted(string typed)
+        {
+            try
+            {
+                if (_accepted.Count >= RejectedCap) return;
+                string w = typed.Trim().ToLowerInvariant();
+                if (w.Length == 0 || !_accepted.Add(w)) return;
+                _rejected.Remove(w);
+                System.IO.Directory.CreateDirectory(SettingsStore.Dir);
+                System.IO.File.AppendAllText(AcceptedPath, w + Environment.NewLine);
+            }
+            catch (Exception) { }
+        }
+
+        private void RemoveAccepted(string typed)
+        {
+            try
+            {
+                if (!_accepted.Remove(typed)) return;
+                var keep = new List<string>(_accepted);
+                System.IO.Directory.CreateDirectory(SettingsStore.Dir);
+                System.IO.File.WriteAllLines(AcceptedPath, keep.ToArray());
             }
             catch (Exception) { }
         }
@@ -312,6 +355,30 @@ namespace OpenSwitcher.Core
 
             // ---- ручные действия: работают всегда (и в паузе, и в исключённых приложениях)
 
+            // Backspace сразу после автозамены — отмена как в Caramba:
+            // вернуть слово + разделитель и запомнить слово как отменённое
+            if (vk == 0x08 && _undoPending && _keysSinceUndoPoint == 0 && !heldMods && !S.Paused)
+            {
+                UpdateForeground();
+                int age = unchecked(Environment.TickCount - _undoTick);
+                if (_undoHwnd == _fgHwnd && age >= 0 && age < 15000)
+                {
+                    _undoPending = false;
+                    Suppress(600);
+                    TextConverter.SendBackspaces(_undoLen + _undoSep);
+                    TextConverter.SendUnicode(_undoText + (_undoSep == 1 ? " " : ""));
+                    LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
+                    ExpectLayout(_undoHkl);
+                    if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+                    string w = _undoText.ToLowerInvariant();
+                    _rejected.Add(w);
+                    Defer(delegate { RememberRejected(w); });
+                    RemoveAccepted(w);
+                    FireInfo("Отменено: " + _undoText);
+                    return false; // глотаем Backspace
+                }
+            }
+
             // отмена последней автозамены (Break по умолчанию)
             if (S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))
             {
@@ -361,7 +428,7 @@ namespace OpenSwitcher.Core
                 return true;
             }
 
-            if (vk == 0x08) { _buf.Pop(); return true; } // Backspace
+            if (vk == 0x08) { _buf.Pop(); return true; } // Backspace (обычный забой)
 
             if (vk == 0x0D) // Enter — проверка последнего слова перед отправкой (фича Punto)
             {
@@ -520,9 +587,12 @@ namespace OpenSwitcher.Core
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) return false;
 
+            string typedLow = cur.Text.ToLowerInvariant();
+
             // обучение: это слово юзер уже отменил — автоматически не трогаем
             // (ручной хоткей в обход: manual=true проверку не проходит)
-            if (!manual && _rejected.Contains(cur.Text.ToLowerInvariant())) return false;
+            if (!manual && _rejected.Contains(typedLow)) return false;
+            bool acceptedWord = !manual && _accepted.Contains(typedLow);
 
             LayoutCandidate best = null;
             foreach (LayoutCandidate c in cands)
@@ -532,9 +602,26 @@ namespace OpenSwitcher.Core
             }
             if (best == null) return false;
 
-            if (!LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
-                                              best.Text, best.Lang, best.Score, S.Sensitivity))
-                return false;
+            bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
+                                              best.Text, best.Lang, best.Score, S.Sensitivity);
+            if (!pass && acceptedWord)
+                pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
+
+            // словарная валидация результата
+            if (pass && !acceptedWord)
+            {
+                bool targetInDict = WordDict.Has(best.Text, best.Lang);
+                bool curInDict = WordDict.Has(cur.Text, cur.Lang);
+                if (curInDict && !targetInDict)
+                    pass = false; // текущее — частое слово, результат — нет: не трогаем
+                else if (!targetInDict && !curInDict)
+                {
+                    // оба не словарные — конвертация только с запасом x3
+                    double need = LanguageTables.BaseMargin * 3.0 / Math.Max(0.3, S.Sensitivity);
+                    if (best.Score - cur.Score < need) pass = false;
+                }
+            }
+            if (!pass) return false;
 
             _lastWord = word;
 
@@ -551,10 +638,14 @@ namespace OpenSwitcher.Core
             _undoPending = resendVk != 0x0D;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
+            _undoSep = (resendVk != 0 && resendVk != 0x0D) ? 1 : 0;
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
+
+            string acceptedWord = cur.Text.ToLowerInvariant();
+            Defer(delegate { RememberAccepted(acceptedWord); }); // юзер не отменил в течение 15 с — примем
 
             FireConverted(cur.Text, best.Text);
             return true;
@@ -592,7 +683,7 @@ namespace OpenSwitcher.Core
             ExpectLayout(_undoHkl);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
             string learned = _undoText;
-            Defer(delegate { RememberRejected(learned); }); // запоминаем вне хука: это слово больше не автозаменяем
+            Defer(delegate { RememberRejected(learned); RemoveAccepted(learned); }); // слово больше не автозаменяем
             FireInfo("Отменено: " + _undoText);
             _undoPending = false;
         }
