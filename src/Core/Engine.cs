@@ -644,8 +644,8 @@ namespace OpenSwitcher.Core
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
 
-            string acceptedWord = cur.Text.ToLowerInvariant();
-            Defer(delegate { RememberAccepted(acceptedWord); }); // юзер не отменил в течение 15 с — примем
+            string acceptedTyped = cur.Text.ToLowerInvariant();
+            Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
 
             FireConverted(cur.Text, best.Text);
             return true;
