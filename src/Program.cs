@@ -60,12 +60,19 @@ namespace OpenSwitcher
 
             bool created;
             var mux = new Mutex(true, "OpenSwitcher_7F3A_Mutex", out created);
+            EventWaitHandle showEvent;
             if (!created)
             {
-                MessageBox.Show("OpenSwitcher уже запущен — ищите иконку в трее.",
-                    "OpenSwitcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                // повторный запуск = «открой настройки» у уже работающей копии
+                try
+                {
+                    showEvent = EventWaitHandle.OpenExisting("OpenSwitcher_7F3A_SHOW");
+                    showEvent.Set();
+                }
+                catch (Exception) { }
                 return;
             }
+            showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "OpenSwitcher_7F3A_SHOW");
 
             var settings = SettingsStore.Load();
             UiTheme.ApplyMode(settings.ThemeMode); // тема до создания UI
@@ -78,6 +85,12 @@ namespace OpenSwitcher
             Engine = new Engine(settings);
             Tray = new TrayService(Engine);
             Tray.Init();
+
+            // второй запуск exe → открыть настройки (опрос события на UI-потоке)
+            var showTimer = new System.Windows.Forms.Timer { Interval = 200 };
+            showTimer.Tick += delegate { if (showEvent.WaitOne(0)) Tray.ShowSettings(); };
+            showTimer.Start();
+
             if (showSettings) Tray.ShowSettings();
             Application.Run(new ApplicationContext());
             GC.KeepAlive(mux);
