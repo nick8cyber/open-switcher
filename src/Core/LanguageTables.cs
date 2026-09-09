@@ -145,6 +145,10 @@ namespace OpenSwitcher.Core
             double b = bestScore + RowBoost(bestText, bestLang);
             if (b < curScore + margin) return false;
             if (b < HardFloor) return false;
+            // цель должна быть «живым» словом целевого языка, а не мусором
+            // (класс ложных срабатываний: 'дадут' -> 'lflen')
+            if (bestLang == 1 && bestScore < -0.15) return false;
+            if (bestLang == 0 && bestScore < -0.55) return false;
             if (!HasVowel(bestText, bestLang)) return false;
             return true;
         }

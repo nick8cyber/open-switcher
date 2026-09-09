@@ -635,8 +635,13 @@ namespace OpenSwitcher.Core
                     dictSkip = "cur-in-dict, target-not";
                     pass = false; // текущее — частое слово, результат — нет: не трогаем
                 }
-                // оба не словарные — обычный порог: ошибки теперь дёшево отменять
-                // (Backspace/Break) и они запоминаются
+                else if (!targetInDict && !curInDict)
+                {
+                    // оба не словарные — нужен усиленный запас x2: класс ошибок
+                    // «правильное русское -> латинский мусор» отсюда
+                    double need = LanguageTables.BaseMargin * 2.0 / Math.Max(0.3, S.Sensitivity);
+                    if (best.Score - cur.Score < need) pass = false;
+                }
             }
             if (!pass)
             {
