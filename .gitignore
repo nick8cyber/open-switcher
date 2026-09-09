@@ -5,3 +5,6 @@ selftest_result.txt
 obj/
 bin/
 .vs/
+tools/add-startmenu-run.cmd
+sm.log
+autorun_check.txt
