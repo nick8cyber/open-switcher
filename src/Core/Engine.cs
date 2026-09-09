@@ -858,6 +858,7 @@ namespace OpenSwitcher.Core
         private int _selPhase;               // 0 = ждём отпускания модификаторов, 1 = ждём буфер
         private bool _selFromFixWord;        // выделение слева от каретки (Ctrl+Space) — с ретраем
         private bool _selRetried;
+        private int _selMethod;              // чем копировали: 0 = wm_copy, 1 = Ctrl+C инжекция
         private string _selBaseline;         // буфер до Ctrl+C
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
 
@@ -900,7 +901,8 @@ namespace OpenSwitcher.Core
                 TextConverter.ReleaseModifiers();
                 _selPhase = 1;
                 _selTries = 0;
-                // WM_COPY вместо инжекции Ctrl+C: не блокируется HIPS/антивирусами
+                // сначала WM_COPY (не блокируется HIPS); не сработает — перейдём на Ctrl+C
+                _selMethod = 0;
                 Native.PostMessage(_selFocusHwnd, Native.WM_COPY, IntPtr.Zero, IntPtr.Zero);
                 Log("sel: wm_copy sent");
                 return;
@@ -916,12 +918,22 @@ namespace OpenSwitcher.Core
 
             if (string.IsNullOrEmpty(text) || !seqChanged)
             {
-                // Ctrl+Shift+Left мог не сработать в этом приложении — расширяем до 2 слов
+                // цепочка копирования: wm_copy -> Ctrl+C (инжекция) -> расширить до 2 слов -> сдаёмся
+                if (_selMethod == 0)
+                {
+                    _selMethod = 1; // fallback: инжекция Ctrl+C
+                    _selTries = 0;
+                    TextConverter.ReleaseModifiers();
+                    TextConverter.SendCombo(0x11, 0, 0x43, false);
+                    Log("sel: wm_copy failed -> ctrl+c injection");
+                    return;
+                }
                 if (_selFromFixWord && !_selRetried)
                 {
                     _selRetried = true;
                     _selPhase = 0;
                     _selTries = 0;
+                    _selMethod = 0;
                     TextConverter.SendCombo(0x11, 0x10, 0x25, true);
                     TextConverter.SendCombo(0x11, 0x10, 0x25, true);
                     if (_selTimer != null) _selTimer.Start();
@@ -930,10 +942,10 @@ namespace OpenSwitcher.Core
                 }
                 // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
                 Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
-                FireInfo("Нет выделенного текста");
+                FireInfo("Не удалось скопировать выделение (проверь COMODO/антивирус)");
                 return;
             }
-            Log("sel: got " + text.Length + " chars");
+            Log("sel: got " + text.Length + " chars (method=" + (_selMethod == 0 ? "wm_copy" : "ctrl+c") + ")");
 
             int lang = LanguageTables.LangOf(LanguageTables.LettersOnly(text));
             if (lang < 0)
@@ -944,9 +956,17 @@ namespace OpenSwitcher.Core
             }
             string converted = CharMaps.MapText(text, lang == 1);
             TextConverter.SetClipboardTextSafe(converted);
-            // WM_PASTE вместо инжекции Ctrl+V
-            Native.PostMessage(_selFocusHwnd, Native.WM_PASTE, IntPtr.Zero, IntPtr.Zero);
-            Log("sel: wm_paste sent (" + lang + ")");
+            // вставляем тем же способом, которым удалось скопировать
+            if (_selMethod == 1)
+            {
+                TextConverter.ReleaseModifiers();
+                TextConverter.SendCombo(0x11, 0x56); // Ctrl+V
+            }
+            else
+            {
+                Native.PostMessage(_selFocusHwnd, Native.WM_PASTE, IntPtr.Zero, IntPtr.Zero);
+            }
+            Log("sel: pasted converted (" + lang + ", method=" + (_selMethod == 0 ? "wm" : "inj") + ")");
 
             IntPtr target = LayoutService.FindLayoutByLang(lang == 1 ? 0 : 1);
             if (target != IntPtr.Zero)
