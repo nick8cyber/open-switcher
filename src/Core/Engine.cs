@@ -389,7 +389,7 @@ namespace OpenSwitcher.Core
                     Log("backspace-cancel: " + _undoText);
                     int bs2 = _undoLen + _undoSep + _undoTail.Count;
                     string restore2 = _undoText + (_undoSep == 1 ? " " : "") +
-                                      (_undoTail.Count > 0 ? LayoutService.Render(_undoTail, _undoHkl) : "");
+                                      (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
                     Suppress(600);
                     TextConverter.SendBackspaces(bs2);
                     TextConverter.SendUnicode(restore2);
@@ -795,7 +795,7 @@ namespace OpenSwitcher.Core
             TextConverter.ReleaseModifiers();
             int bs = _undoLen + _undoSep + _undoTail.Count;
             string restore = _undoText + (_undoSep == 1 ? " " : "") +
-                             (_undoTail.Count > 0 ? LayoutService.Render(_undoTail, _undoHkl) : "");
+                             (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
             Suppress(600);
             TextConverter.SendBackspaces(bs);
             TextConverter.SendUnicode(restore);
