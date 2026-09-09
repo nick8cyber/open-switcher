@@ -387,9 +387,11 @@ namespace OpenSwitcher.Core
                 if (_undoHwnd == _fgHwnd && age >= 0 && age < 15000)
                 {
                     _undoPending = false;
-                    TextConverter.ReleaseModifiers();
-                    Log("backspace-cancel: " + _undoText);
-                    int bs2 = _undoLen + _undoSep + _undoTail.Count;
+            TextConverter.ReleaseModifiers();
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+            Log("backspace-cancel: " + _undoText);
+            int bs2 = _undoLen + _undoSep + _undoTail.Count;
                     string restore2 = _undoText + (_undoSep == 1 ? " " : "") +
                                       (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
                     Suppress(600);
@@ -739,6 +741,8 @@ namespace OpenSwitcher.Core
             // юзер мог держать Shift/Ctrl (хоткей же с модификатором) — инжекция
             // с зажатыми модификаторами даёт Ctrl+Shift+C и управляющие символы
             TextConverter.ReleaseModifiers();
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _fgFocus;
 
             Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk + ")");
             _lastWord = word;
@@ -796,6 +800,8 @@ namespace OpenSwitcher.Core
             if (age < 0 || age > 15000) { Log("undo skip: stale " + age); FireInfo("Слишком поздно"); return; }
 
             TextConverter.ReleaseModifiers();
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             int bs = _undoLen + _undoSep + _undoTail.Count;
             string restore = _undoText + (_undoSep == 1 ? " " : "") +
                              (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");

@@ -25,6 +25,8 @@ namespace OpenSwitcher.Core
         public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         public const int HTCAPTION = 0x2;
         public const int WM_NCLBUTTONDOWN = 0xA1;
+        public const int WM_KEYUP_ALT = 0x0101;
+        public const int WM_CHAR = 0x0102;
         public const int WM_COPY = 0x0301;
         public const int WM_PASTE = 0x0302;
         public const int WM_LBUTTONDOWN = 0x0201;

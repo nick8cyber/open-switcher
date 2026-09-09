@@ -5,9 +5,84 @@ using System.Windows.Forms;
 
 namespace OpenSwitcher.Core
 {
-    /// <summary>Синтез ввода: забой, unicode-ввод, Ctrl+C/V, работа с буфером обмена.</summary>
+    /// <summary>Синтез ввода: два канала — SendInput и сообщения окна (WM_KEYDOWN/WM_CHAR).</summary>
     public static class TextConverter
     {
+        /// <summary>0 = SendInput, 1 = сообщения окна в hwndFocus. Задаётся движком.</summary>
+        public static int InjectMode;
+        /// <summary>Куда слать сообщения окна (hwndFocus переднего окна).</summary>
+        public static IntPtr FocusHwnd;
+
+        private static void PostKey(IntPtr hwnd, int vk, bool up)
+        {
+            uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+            uint lp = (sc << 16) | 1u;
+            if (up) lp |= 0xC0000000;
+            Native.PostMessage(hwnd, up ? Native.WM_KEYUP : Native.WM_KEYDOWN, (IntPtr)vk, (IntPtr)lp);
+        }
+
+        private static void PostChar(IntPtr hwnd, char c)
+        {
+            Native.PostMessage(hwnd, Native.WM_CHAR, (IntPtr)c, IntPtr.Zero);
+        }
+
+        private static void SendKeyMessages(IntPtr hwnd, int vk)
+        {
+            PostKey(hwnd, vk, false);
+            PostKey(hwnd, vk, true);
+        }
+
+        private static void BackspaceOnce(IntPtr hwnd, bool useMessages)
+        {
+            if (useMessages && hwnd != IntPtr.Zero)
+            {
+                SendKeyMessages(hwnd, 0x08); // VK_BACK
+            }
+            else
+            {
+                uint sc = Native.MapVirtualKeyEx(8, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+                var inputs = new Native.INPUT[2];
+                inputs[0].type = 1;
+                inputs[0].u.ki.wVk = 8;
+                inputs[0].u.ki.wScan = (ushort)sc;
+                inputs[1].type = 1;
+                inputs[1].u.ki.wVk = 8;
+                inputs[1].u.ki.wScan = (ushort)sc;
+                inputs[1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
+            }
+        }
+
+        /// <summary>Забить n символов backspace'ами.</summary>
+        public static void SendBackspaces(int n)
+        {
+            SendBackspaces(n, IntPtr.Zero);
+        }
+
+        public static void SendBackspaces(int n, IntPtr hwndFocus)
+        {
+            bool useMsg = InjectMode == 1 && hwndFocus != IntPtr.Zero;
+            if (useMsg)
+            {
+                for (int i = 0; i < n; i++) BackspaceOnce(hwndFocus, true);
+            }
+            else
+            {
+                uint sc = Native.MapVirtualKeyEx(8, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+                var inputs = new Native.INPUT[n * 2];
+                for (int i = 0; i < n; i++)
+                {
+                    inputs[2 * i].type = 1;
+                    inputs[2 * i].u.ki.wVk = 8;
+                    inputs[2 * i].u.ki.wScan = (ushort)sc;
+                    inputs[2 * i + 1].type = 1;
+                    inputs[2 * i + 1].u.ki.wVk = 8;
+                    inputs[2 * i + 1].u.ki.wScan = (ushort)sc;
+                    inputs[2 * i + 1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                }
+                Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
+            }
+        }
         public static void SendKey(int vk, bool extended)
         {
             SendKey(vk, extended, false);
@@ -40,6 +115,13 @@ namespace OpenSwitcher.Core
         /// <summary>Нажать клавишу (опционально с Shift) — для пересылки проглоченного разделителя.</summary>
         public static void SendKey(int vk, bool extended, bool withShift)
         {
+            if (InjectMode == 1 && FocusHwnd != IntPtr.Zero)
+            {
+                if (withShift) PostKey(FocusHwnd, 0x10, false);
+                SendKeyMessages(FocusHwnd, vk);
+                if (withShift) PostKey(FocusHwnd, 0x10, true);
+                return;
+            }
             var list = new List<Native.INPUT>(withShift ? 4 : 2);
             uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
             if (withShift)
@@ -100,28 +182,19 @@ namespace OpenSwitcher.Core
             Native.SendInput((uint)list.Count, list.ToArray(), System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
         }
 
-        /// <summary>Забить n символов backspace'ами.</summary>
-        public static void SendBackspaces(int n)
-        {
-            if (n <= 0) return;
-            uint sc = Native.MapVirtualKeyEx(8, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-            var inputs = new Native.INPUT[n * 2];
-            for (int i = 0; i < n; i++)
-            {
-                inputs[2 * i].type = 1;
-                inputs[2 * i].u.ki.wVk = 8;
-                inputs[2 * i].u.ki.wScan = (ushort)sc;
-                inputs[2 * i + 1].type = 1;
-                inputs[2 * i + 1].u.ki.wVk = 8;
-                inputs[2 * i + 1].u.ki.wScan = (ushort)sc;
-                inputs[2 * i + 1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
-            }
-            Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
-        }
-
-        /// <summary>Ввод строки "юникодом" — не зависит от текущей раскладки.</summary>
+        /// <summary>Ввод строки "юникодом" — не зависит от текущей раскладки.
+        /// При InjectMode=1 уходит как WM_CHAR в окно фокуса.</summary>
         public static void SendUnicode(string text)
         {
+            if (InjectMode == 1 && FocusHwnd != IntPtr.Zero)
+            {
+                foreach (char c in text)
+                {
+                    if (c == '\r' || c == '\n' || c == '\t') continue;
+                    PostChar(FocusHwnd, c);
+                }
+                return;
+            }
             var list = new List<Native.INPUT>(text.Length * 2);
             foreach (char c in text)
             {

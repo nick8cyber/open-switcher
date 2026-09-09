@@ -37,6 +37,7 @@ namespace OpenSwitcher.Core
         public int HotAutoToggleMods = 0;
         public bool LockAutoAfterManualSwitch = true; // ручной выбор раскладки отключает автодетект до новой сессии
         public bool DoubleShiftSwitch = true;      // двойной Shift = отмена последней замены (как в Caramba)
+        public int InputMode = 1;                  // 0 = SendInput, 1 = сообщения окна (обход HIPS)      // двойной Shift = отмена последней замены (как в Caramba)
 
         // --- система ---
         public bool ShowPopup = true;
@@ -164,6 +165,7 @@ namespace OpenSwitcher.Core
                 case "HotUndoVk": { int n; if (int.TryParse(v, out n)) s.HotUndoVk = n; break; }
                 case "HotUndoMods": { int n; if (int.TryParse(v, out n)) s.HotUndoMods = n; break; }
                 case "LockAutoAfterManualSwitch": s.LockAutoAfterManualSwitch = v == "1"; break;
+                case "InputMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 1) s.InputMode = n; break; }
                 case "Exclusions": s.Exclusions = v; break;
                 case "ThemeMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 2) s.ThemeMode = n; break; }
                 case "DefaultsV": { int n; if (int.TryParse(v, out n)) s.DefaultsV = n; break; }
@@ -198,6 +200,7 @@ namespace OpenSwitcher.Core
                 sb.AppendLine("HotUndoVk=" + s.HotUndoVk);
                 sb.AppendLine("HotUndoMods=" + s.HotUndoMods);
                 sb.AppendLine("LockAutoAfterManualSwitch=" + (s.LockAutoAfterManualSwitch ? "1" : "0"));
+                sb.AppendLine("InputMode=" + s.InputMode);
                 sb.AppendLine("Exclusions=" + s.Exclusions);
                 sb.AppendLine("ThemeMode=" + s.ThemeMode);
                 sb.AppendLine("DefaultsV=" + s.DefaultsV);
