@@ -190,8 +190,8 @@ namespace OpenSwitcher.UI
 
             // ================= страница «Система»
             Panel pSys = MkPage(w);
-            PageHeader(pSys, "Система", "Буфер обмена и запуск");
-            y = 52;
+            PageHeader(pSys, "Система", "Буфер обмена, запуск и память");
+            y = 46;
             PageCard c5 = MkCard(pSys, y);
             _tClip = new ToggleSwitch();
             _tClip.Checked = _engine.S.RestoreClipboard;
@@ -199,6 +199,12 @@ namespace OpenSwitcher.UI
             _tRun = new ToggleSwitch();
             _tRun.Checked = _engine.S.StartWithWindows;
             c5.AddRow("Запускать при входе в Windows", null, _tRun, 44);
+            RoundedButton btnForget = new RoundedButton();
+            btnForget.Accent = false;
+            btnForget.Text = "Очистить";
+            btnForget.Size = new Size(100, 34);
+            c5.AddRow("Забыть изученные слова", "Очищает списки принятых и отменённых слов", btnForget, 48);
+            btnForget.Click += delegate { _engine.ForgetAllWords(); };
 
             // ================= страница «Исключения»
             Panel pEx = MkPage(w);

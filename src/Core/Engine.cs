@@ -637,9 +637,13 @@ namespace OpenSwitcher.Core
             if (!pass && acceptedWord)
                 pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
 
-            // словарная валидация результата
+            // живое исправление решается посреди набора «вслепую» — запас x2
+            double liveFactor = (resendVk == 0 && !manual) ? 2.0 : 1.0;
+
+            // словарная валидация результата — действует всегда, даже для accepted:
+            // мусорный результат в буфер не вставляем
             string dictSkip = null;
-            if (pass && !acceptedWord)
+            if (pass)
             {
                 bool targetInDict = WordDict.Has(best.Text, best.Lang);
                 bool curInDict = WordDict.Has(cur.Text, cur.Lang);
@@ -650,9 +654,10 @@ namespace OpenSwitcher.Core
                 }
                 else if (!targetInDict && !curInDict)
                 {
-                    // оба не словарные — нужен усиленный запас x2: класс ошибок
-                    // «правильное русское -> латинский мусор» отсюда
-                    double need = LanguageTables.BaseMargin * 2.0 / Math.Max(0.3, S.Sensitivity);
+                    // оба не словарные — нужен усиленный запас
+                    double need = LanguageTables.BaseMargin *
+                                  (acceptedWord ? 1.0 : 2.0 * liveFactor) /
+                                  Math.Max(0.3, S.Sensitivity);
                     if (best.Score - cur.Score < need) pass = false;
                 }
             }
@@ -735,6 +740,21 @@ namespace OpenSwitcher.Core
             _undoPending = false;
         }
 
+        /// <summary>Забыть изученные слова (accepted/rejected).</summary>
+        public void ForgetAllWords()
+        {
+            _rejected.Clear();
+            _accepted.Clear();
+            try
+            {
+                System.IO.Directory.CreateDirectory(SettingsStore.Dir);
+                System.IO.File.WriteAllText(LearnedPath, "");
+                System.IO.File.WriteAllText(AcceptedPath, "");
+            }
+            catch (Exception) { }
+            FireInfo("Память слов очищена");
+        }
+
         public void DoFixLastWord()
         {
             UpdateForeground();
@@ -755,7 +775,7 @@ namespace OpenSwitcher.Core
             // клик сразу после слова → Ctrl+Space)
             Log("fix-last-word: select-left path (keysSince=" + _keysSinceUndoPoint + ")");
             TextConverter.SendCombo(0x11, 0x10, 0x25, true); // Ctrl+Shift+Left
-            BeginFixSelection();
+            BeginFixSelection(true);
         }
 
         // --- двухфазная конвертация выделенного текста ---
@@ -767,13 +787,22 @@ namespace OpenSwitcher.Core
         private IntPtr _selFgHwnd;
         private int _selTries;
         private int _selPhase;               // 0 = ждём отпускания модификаторов, 1 = ждём буфер
+        private bool _selFromFixWord;        // выделение слева от каретки (Ctrl+Space) — с ретраем
+        private bool _selRetried;
         private string _selBaseline;         // буфер до Ctrl+C
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
 
         public void BeginFixSelection()
         {
+            BeginFixSelection(false);
+        }
+
+        public void BeginFixSelection(bool fromFixWord)
+        {
             UpdateForeground();
             _selFgHwnd = _fgHwnd;
+            _selFromFixWord = fromFixWord;
+            _selRetried = false;
             _selBaseline = TextConverter.GetClipboardTextOnce();
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
@@ -816,6 +845,18 @@ namespace OpenSwitcher.Core
 
             if (string.IsNullOrEmpty(text) || !seqChanged)
             {
+                // Ctrl+Shift+Left мог не сработать в этом приложении — расширяем до 2 слов
+                if (_selFromFixWord && !_selRetried)
+                {
+                    _selRetried = true;
+                    _selPhase = 0;
+                    _selTries = 0;
+                    TextConverter.SendCombo(0x11, 0x10, 0x25, true);
+                    TextConverter.SendCombo(0x11, 0x10, 0x25, true);
+                    if (_selTimer != null) _selTimer.Start();
+                    Log("sel: retry with 2 words left");
+                    return;
+                }
                 // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
                 Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
                 FireInfo("Нет выделенного текста");
