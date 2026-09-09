@@ -16,9 +16,9 @@ namespace OpenSwitcher.Core
 
     public class Settings
     {
-        // --- автоисправление (по умолчанию ВЫКЛЮЧЕНО: ручные хоткеи работают всегда) ---
-        public bool FixOnEnter = false;           // проверять слово при голом Enter (как в Punto)
-        public bool AutoConvertOnWordEnd = false; // проверять слово при пробеле / знаке препинания
+        // --- автоправка (по умолчанию ВКЛ — как в Punto/Caramba; ручные хоткеи работают всегда) ---
+        public bool FixOnEnter = true;            // проверять слово при голом Enter (как в Punto)
+        public bool AutoConvertOnWordEnd = true;  // проверять слово при пробеле / знаке препинания
         public int MinWordLen = 3;
         public double Sensitivity = 1.0;          // 0.7 низкая / 1.0 средняя / 1.5 высокая
 
@@ -45,7 +45,7 @@ namespace OpenSwitcher.Core
         public bool Paused = false;
         public string Exclusions = "";
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
-        public int DefaultsV = 5; // версия дефолтов (5 = Shift+Break конвертация выделенного)
+        public int DefaultsV = 6; // версия дефолтов (6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
     }
 
     public static class SettingsStore
@@ -120,6 +120,15 @@ namespace OpenSwitcher.Core
                     s.HotFixSelMods = HK.SHIFT;
                 }
                 s.DefaultsV = 5;
+                Save(s);
+            }
+            // v6: автоправка включена по умолчанию — как в Punto/Caramba (однократно; кто выключил
+            // в настройках после миграции — остаётся выключенной)
+            if (s.DefaultsV < 6)
+            {
+                s.FixOnEnter = true;
+                s.AutoConvertOnWordEnd = true;
+                s.DefaultsV = 6;
                 Save(s);
             }
             return s;
