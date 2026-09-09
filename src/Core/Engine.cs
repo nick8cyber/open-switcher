@@ -48,6 +48,14 @@ namespace OpenSwitcher.Core
         private IntPtr _undoHwnd;            // окно, где была замена
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
+        private List<KeyRec> _undoTail = new List<KeyRec>(); // хвост: что юзер напечатал после замены
+        private bool _undoTailBroken;        // хвост испорчен (enter/cap) — откат запрещён
+
+        // компенсация лага смены раскладки после тапа Shift
+        private bool _gapActive;
+        private IntPtr _gapHkl;              // целевая раскладка
+        private readonly List<KeyRec> _gapBuf = new List<KeyRec>();
+        private int _gapDeadline;
 
         // обучение: слова, автозамену которых юзер отменил — больше не конвертировать
         private readonly HashSet<string> _rejected = new HashSet<string>();
@@ -289,6 +297,16 @@ namespace OpenSwitcher.Core
             return Native.CallNextHookEx(_kbHook, code, wParam, lParam);
         }
 
+        private void FlushGap()
+        {
+            if (_gapBuf.Count == 0) return;
+            TextConverter.ReleaseModifiers();
+            string s = LayoutService.Render(_gapHkl, _gapBuf);
+            TextConverter.SendUnicode(s);
+            Log("gap: flushed " + _gapBuf.Count + " keys as '" + s + "'");
+            _gapBuf.Clear();
+        }
+
         /// <summary>Это нажатие — хоткей отката? (сам Break не должен ломить счётчик)</summary>
         private bool IsUndoHotkey(Native.KBDLLHOOKSTRUCT k)
         {
@@ -369,9 +387,12 @@ namespace OpenSwitcher.Core
                     _undoPending = false;
                     TextConverter.ReleaseModifiers();
                     Log("backspace-cancel: " + _undoText);
+                    int bs2 = _undoLen + _undoSep + _undoTail.Count;
+                    string restore2 = _undoText + (_undoSep == 1 ? " " : "") +
+                                      (_undoTail.Count > 0 ? LayoutService.Render(_undoTail, _undoHkl) : "");
                     Suppress(600);
-                    TextConverter.SendBackspaces(_undoLen + _undoSep);
-                    TextConverter.SendUnicode(_undoText + (_undoSep == 1 ? " " : ""));
+                    TextConverter.SendBackspaces(bs2);
+                    TextConverter.SendUnicode(restore2);
                     LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
                     ExpectLayout(_undoHkl);
                     if (S.LockAutoAfterManualSwitch) _autoLocked = true;
@@ -379,7 +400,7 @@ namespace OpenSwitcher.Core
                     _rejected.Add(w);
                     Defer(delegate { RememberRejected(w); });
                     RemoveAccepted(w);
-                    FireInfo("Отменено: " + _undoText);
+                    FireInfo("Отменено: " + restore2);
                     return false; // глотаем Backspace
                 }
             }
@@ -430,12 +451,39 @@ namespace OpenSwitcher.Core
                 return !IsSwallowableTap(vk); // не-модификаторы глотаем, чтобы не делали своего
             }
 
+            // ---- компенсация лага смены раскладки: буквы, набранные в просвете
+            // до применения смены, перехватываем и доставим уже в целевой раскладке
+            if (_gapActive)
+            {
+                if (_fgHkl == _gapHkl || unchecked(Environment.TickCount - _gapDeadline) >= 0)
+                {
+                    FlushGap();
+                    _gapActive = false;
+                }
+                else
+                {
+                    if (vk >= 0x41 && vk <= 0x5A)
+                    {
+                        _gapBuf.Add(new KeyRec(vk, shift, caps));
+                        return false; // глотаем: доставим после применения раскладки
+                    }
+                    if (vk == 0x08)
+                    {
+                        if (_gapBuf.Count > 0) _gapBuf.RemoveAt(_gapBuf.Count - 1);
+                        return false;
+                    }
+                    FlushGap();
+                    return true; // остальное (пробел и т.п.) — как есть, после отложенных букв
+                }
+            }
+
             // ---- дальше — только авто-логика; в исключённых приложениях глушим
             if (IsExcludedHere()) { _buf.Clear(); return true; }
 
             if (vk >= 0x41 && vk <= 0x5A)
             {
-                _buf.Push(new KeyRec(vk, shift, caps));
+                KeyRec rec = new KeyRec(vk, shift, caps);
+                _buf.Push(rec);
 
                 // ЖИВОЕ ИСПРАВЛЕНИЕ (базовая механика Caramba): слово переворачивается
                 // сразу, как только набрано достаточно букв — юзер не видит целое слово
@@ -444,7 +492,17 @@ namespace OpenSwitcher.Core
                 {
                     List<KeyRec> word = _buf.Snapshot();
                     if (TryConvertWord(word, 0, false, false))
+                    {
                         _buf.Clear(); // дальше юзер печатает уже в новой раскладке
+                        if (_undoPending) { _undoTail.Clear(); _undoTailBroken = false; }
+                    }
+                }
+
+                // хвост отката: запоминаем, что юзер напечатал после замены
+                if (_undoPending && !_undoTailBroken && !ctrl && !alt && !win)
+                {
+                    if (_undoTail.Count < 16) _undoTail.Add(rec);
+                    else _undoTailBroken = true;
                 }
                 return true;
             }
@@ -466,6 +524,8 @@ namespace OpenSwitcher.Core
                     converted = TryConvertWord(word, 0x0D, false, false);
                 // ВАЖНО: Enter лок НЕ снимает — в длинном тексте энтеры подряд,
                 // а сессия ввода (окно) не сменилась. Лок держится до смены окна.
+                // хвост отката после Enter восстановить нельзя
+                _undoTailBroken = true;
                 _buf.Clear();
                 return !converted; // проглотить Enter, если конвертнули (перешлём свой)
             }
@@ -527,6 +587,8 @@ namespace OpenSwitcher.Core
             _anyKeySinceShift = true;
             _tapAlone = false;
             _undoPending = false; // сменилось окно — откатывать нечего/небезопасно
+            _undoTailBroken = true;
+            _gapActive = false; _gapBuf.Clear(); // буквы из другого окна не переносим
             // новое окно — новая сессия ввода: лок снимается
             _autoLocked = false;
             _expectedValid = false;
@@ -577,6 +639,9 @@ namespace OpenSwitcher.Core
             ExpectLayout(target);
             // юзер выбрал язык явно — автодетект молчит до смены окна / Enter
             if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+            // компенсация лага: буквы в просвете доставим в целевой раскладке
+            _gapActive = true; _gapHkl = target; _gapBuf.Clear();
+            _gapDeadline = Environment.TickCount + 800;
             FireInfo(lang == 0 ? "РУС" : "ENG");
         }
 
@@ -728,15 +793,18 @@ namespace OpenSwitcher.Core
             if (age < 0 || age > 15000) { Log("undo skip: stale " + age); FireInfo("Слишком поздно"); return; }
 
             TextConverter.ReleaseModifiers();
+            int bs = _undoLen + _undoSep + _undoTail.Count;
+            string restore = _undoText + (_undoSep == 1 ? " " : "") +
+                             (_undoTail.Count > 0 ? LayoutService.Render(_undoTail, _undoHkl) : "");
             Suppress(600);
-            TextConverter.SendBackspaces(_undoLen);
-            TextConverter.SendUnicode(_undoText);
+            TextConverter.SendBackspaces(bs);
+            TextConverter.SendUnicode(restore);
             LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
             ExpectLayout(_undoHkl);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
             string learned = _undoText;
             Defer(delegate { RememberRejected(learned); RemoveAccepted(learned); }); // слово больше не автозаменяем
-            FireInfo("Отменено: " + _undoText);
+            FireInfo("Отменено: " + restore);
             _undoPending = false;
         }
 
@@ -927,6 +995,9 @@ namespace OpenSwitcher.Core
             LayoutService.SwitchForegroundTo(_fgHwnd, other);
             ExpectLayout(other);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+            // компенсация лага: буквы в просвете доставим в целевой раскладке
+            _gapActive = true; _gapHkl = other; _gapBuf.Clear();
+            _gapDeadline = Environment.TickCount + 800;
             FireInfo("Раскладка: " + name);
         }
 
