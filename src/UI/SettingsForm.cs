@@ -109,8 +109,8 @@ namespace OpenSwitcher.UI
             PageCard c1 = MkCard(pMain, y);
             _tAuto = new ToggleSwitch();
             _tAuto.Checked = _engine.S.AutoConvertOnWordEnd;
-            c1.AddRow("Автоисправление по пробелу и знакам",
-                "Проверять слово в конце ввода: пробел, запятая, точка…", _tAuto, 56);
+            c1.AddRow("Живое автоисправление",
+                "Слово переворачивается прямо при наборе, не дожидаясь пробела", _tAuto, 56);
             _tEnter = new ToggleSwitch();            _tEnter.Checked = _engine.S.FixOnEnter;
             c1.AddRow("Исправлять слово перед Enter",
                 "Enter перехватывается, слово правится до отправки", _tEnter, 56);
