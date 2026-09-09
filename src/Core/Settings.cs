@@ -36,7 +36,7 @@ namespace OpenSwitcher.Core
         public int HotAutoToggleVk = 0;            // пауза автоперевода — по умолчанию НЕ назначена
         public int HotAutoToggleMods = 0;
         public bool LockAutoAfterManualSwitch = true; // ручной выбор раскладки отключает автодетект до новой сессии
-        public bool DoubleShiftSwitch = false;
+        public bool DoubleShiftSwitch = true;      // двойной Shift = отмена последней замены (как в Caramba)
 
         // --- система ---
         public bool ShowPopup = true;

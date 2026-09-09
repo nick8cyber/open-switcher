@@ -267,8 +267,11 @@ namespace OpenSwitcher.Core
                 bool injected = (k.flags & 0x10) != 0;
 
                 // guard отката: считаем ЛЮБЫЕ реальные нажатия — даже в suppress-окне
-                // после автозамены (иначе Break после быстрой печати портит текст)
-                if (msg == Native.WM_KEYDOWN && !injected && !IsUndoHotkey(k))
+                // после автозамены (иначе Break после быстрой печати портит текст).
+                // Исключения: сам хоткей отката И Backspace при ожидающемся откате
+                // (иначе Backspace-отмена никогда не срабатывает)
+                if (msg == Native.WM_KEYDOWN && !injected && !IsUndoHotkey(k) &&
+                    !(_undoPending && (k.vkCode & 0xFF) == 0x08))
                     _keysSinceUndoPoint++;
 
                 if (Environment.TickCount >= _suppressUntil)
@@ -315,14 +318,15 @@ namespace OpenSwitcher.Core
             if (vk == 0xA0 || vk == 0xA1) // левый / правый Shift
             {
                 int now = Environment.TickCount;
-                // двойной Shift — смена на другую раскладку (опционально)
+                // двойной Shift — отмена последней автозамены (как в Caramba)
                 if (!_anyKeySinceShift && unchecked(now - _lastShiftDown) >= 0 &&
                     unchecked(now - _lastShiftDown) < 400 && S.DoubleShiftSwitch)
                 {
                     _lastShiftDown = 0;
                     _anyKeySinceShift = true;
                     _tapAlone = false;
-                    SwitchToOtherLayout();
+                    Log("double-shift: undo last conversion");
+                    UndoLastConversion();
                     return true;
                 }
                 _lastShiftDown = now;
@@ -433,6 +437,16 @@ namespace OpenSwitcher.Core
             if (vk >= 0x41 && vk <= 0x5A)
             {
                 _buf.Push(new KeyRec(vk, shift, caps));
+
+                // ЖИВОЕ ИСПРАВЛЕНИЕ (базовая механика Caramba): слово переворачивается
+                // сразу, как только набрано достаточно букв — юзер не видит целое слово
+                // не в той раскладке. Shift при наборе заглавных — норма, Ctrl/Alt — нет.
+                if (!ctrl && !alt && !win && S.AutoConvertOnWordEnd && _buf.Count >= S.MinWordLen)
+                {
+                    List<KeyRec> word = _buf.Snapshot();
+                    if (TryConvertWord(word, 0, false, false))
+                        _buf.Clear(); // дальше юзер печатает уже в новой раскладке
+                }
                 return true;
             }
 
