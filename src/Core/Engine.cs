@@ -853,6 +853,7 @@ namespace OpenSwitcher.Core
 
         private System.Windows.Forms.Timer _selTimer;
         private IntPtr _selFgHwnd;
+        private IntPtr _selFocusHwnd;        // окно с фокусом ввода — ему шлём WM_COPY/WM_PASTE
         private int _selTries;
         private int _selPhase;               // 0 = ждём отпускания модификаторов, 1 = ждём буфер
         private bool _selFromFixWord;        // выделение слева от каретки (Ctrl+Space) — с ретраем
@@ -869,6 +870,7 @@ namespace OpenSwitcher.Core
         {
             UpdateForeground();
             _selFgHwnd = _fgHwnd;
+            _selFocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             _selFromFixWord = fromFixWord;
             _selRetried = false;
             _selBaseline = TextConverter.GetClipboardTextOnce();
@@ -898,8 +900,9 @@ namespace OpenSwitcher.Core
                 TextConverter.ReleaseModifiers();
                 _selPhase = 1;
                 _selTries = 0;
-                TextConverter.SendCombo(0x11, 0, 0x43, false); // чистый Ctrl+C
-                Log("sel: ctrl+c sent (phase 1)");
+                // WM_COPY вместо инжекции Ctrl+C: не блокируется HIPS/антивирусами
+                Native.PostMessage(_selFocusHwnd, Native.WM_COPY, IntPtr.Zero, IntPtr.Zero);
+                Log("sel: wm_copy sent");
                 return;
             }
 
@@ -941,9 +944,9 @@ namespace OpenSwitcher.Core
             }
             string converted = CharMaps.MapText(text, lang == 1);
             TextConverter.SetClipboardTextSafe(converted);
-            TextConverter.ReleaseModifiers();
-            TextConverter.SendCombo(0x11, 0x56); // Ctrl+V
-            Log("sel: pasted converted (" + lang + ")");
+            // WM_PASTE вместо инжекции Ctrl+V
+            Native.PostMessage(_selFocusHwnd, Native.WM_PASTE, IntPtr.Zero, IntPtr.Zero);
+            Log("sel: wm_paste sent (" + lang + ")");
 
             IntPtr target = LayoutService.FindLayoutByLang(lang == 1 ? 0 : 1);
             if (target != IntPtr.Zero)
