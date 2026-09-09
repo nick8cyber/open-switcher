@@ -37,6 +37,7 @@ namespace OpenSwitcher.Core
         private IntPtr _expectedHkl;         // раскладка, которую ожидаем в переднем окне
         private IntPtr _expectedHwnd;        // окно, для которого ожидаем _expectedHkl
         private bool _expectedValid;
+        private int _expectGraceUntil;       // до этого тиканта смену HKL считаем «догоняет» PostMessage
 
         // точка отката последней автозамены
         private bool _undoPending;
@@ -153,8 +154,12 @@ namespace OpenSwitcher.Core
 
             // раскладка поменялась вне движка (Alt+Shift / Win+Space / тап Shift) —
             // юзер задал язык явно: запираем автодетект до новой сессии ввода.
-            // Сверяем только в том же окне, где ожидали раскладку — иначе ложный лок
-            if (_expectedValid && _fgHwnd == _expectedHwnd && _fgHkl != _expectedHkl && S.LockAutoAfterManualSwitch)
+            // Сверяем только в том же окне, где ожидали раскладку — иначе ложный лок.
+            // И только после grace-окна: сразу после нашего PostMessage старый HKL
+            // читается ещё мгновение — нельзя лочить, пока «догоняет».
+            if (_expectedValid && _fgHwnd == _expectedHwnd && _fgHkl != _expectedHkl
+                && S.LockAutoAfterManualSwitch
+                && unchecked(Environment.TickCount - _expectGraceUntil) >= 0)
                 _autoLocked = true;
             _expectedHkl = _fgHkl;
             _expectedHwnd = _fgHwnd;
@@ -167,6 +172,7 @@ namespace OpenSwitcher.Core
             _expectedHkl = hkl;
             _expectedHwnd = _fgHwnd;
             _expectedValid = true;
+            _expectGraceUntil = Environment.TickCount + 1200;
         }
 
         private static string ProcessNameOf(uint pid)
@@ -539,8 +545,10 @@ namespace OpenSwitcher.Core
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
 
-            // точка отката: Break вернёт исходное слово и раскладку
-            _undoPending = true;
+            // точка отката: Break вернёт исходное слово и раскладку.
+            // Только для замен по разделителю — после Enter строка уже ушла в
+            // приложение, откат стирал бы переносы
+            _undoPending = resendVk != 0x0D;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
             _undoHkl = cur.Hkl;
@@ -556,10 +564,14 @@ namespace OpenSwitcher.Core
         public void ToggleAuto()
         {
             S.Paused = !S.Paused;
-            SettingsStore.Save(S);
             if (!S.Paused) _autoLocked = false; // с чистого листа
-            Apply(S); // обновит тултип трея
-            FireInfo(S.Paused ? "Автоисправление выключено" : "Автоисправление включено");
+            bool paused = S.Paused;
+            Defer(delegate
+            {
+                SettingsStore.Save(S);
+                Apply(S); // обновит тултип трея и статус-карточку
+            });
+            FireInfo(paused ? "Автоисправление выключено" : "Автоисправление включено");
         }
 
         /// <summary>Отмена последней автозамены: вернуть исходное слово и раскладку.</summary>
@@ -579,7 +591,8 @@ namespace OpenSwitcher.Core
             LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
             ExpectLayout(_undoHkl);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
-            RememberRejected(_undoText); // запоминаем: это слово больше не автозаменяем
+            string learned = _undoText;
+            Defer(delegate { RememberRejected(learned); }); // запоминаем вне хука: это слово больше не автозаменяем
             FireInfo("Отменено: " + _undoText);
             _undoPending = false;
         }
@@ -738,16 +751,49 @@ namespace OpenSwitcher.Core
             return Cursor.Position;
         }
 
+        // отложенная очередь: хук не должен заниматься плашками/файлами/сохранением,
+        // иначе Windows режет события клавиатуры («работает через раз»)
+        private readonly Queue<Action> _deferred = new Queue<Action>();
+        private System.Windows.Forms.Timer _deferTimer;
+
+        private void Defer(Action action)
+        {
+            _deferred.Enqueue(action);
+            if (_deferTimer == null)
+            {
+                _deferTimer = new System.Windows.Forms.Timer { Interval = 50 };
+                _deferTimer.Tick += delegate { FlushDeferred(); };
+                _deferTimer.Start();
+            }
+        }
+
+        private void FlushDeferred()
+        {
+            while (_deferred.Count > 0)
+            {
+                Action a = _deferred.Dequeue();
+                try { a(); }
+                catch (Exception) { }
+            }
+        }
+
         private void FireConverted(string oldText, string newText)
         {
-            var d = Converted;
-            if (d != null) d(oldText, newText);
+            string o = oldText, n = newText;
+            Defer(delegate
+            {
+                var d = Converted;
+                if (d != null) d(o, n);
+            });
         }
 
         private void FireInfo(string msg)
         {
-            var d = Info;
-            if (d != null) d(msg);
+            Defer(delegate
+            {
+                var d = Info;
+                if (d != null) d(msg);
+            });
         }
     }
 }
