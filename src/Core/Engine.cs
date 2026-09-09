@@ -364,6 +364,7 @@ namespace OpenSwitcher.Core
                 if (_undoHwnd == _fgHwnd && age >= 0 && age < 15000)
                 {
                     _undoPending = false;
+                    Log("backspace-cancel: " + _undoText);
                     Suppress(600);
                     TextConverter.SendBackspaces(_undoLen + _undoSep);
                     TextConverter.SendUnicode(_undoText + (_undoSep == 1 ? " " : ""));
@@ -382,27 +383,32 @@ namespace OpenSwitcher.Core
             // отмена последней автозамены (Break по умолчанию)
             if (S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))
             {
+                Log("hotkey: undo");
                 UndoLastConversion();
                 return false;
             }
             if (S.HotFixWordVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixWordVk, S.HotFixWordMods))
             {
+                Log("hotkey: fix-last-word");
                 DoFixLastWord();
                 return false;
             }
             if (S.HotFixSelVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixSelVk, S.HotFixSelMods))
             {
+                Log("hotkey: fix-selection");
                 BeginFixSelection();
                 return false;
             }
             // клавиши раскладок: сочетания с модификаторами — срабатывают по нажатию
             if (S.HotRuMods != 0 && S.HotRuVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotRuVk, S.HotRuMods))
             {
+                Log("hotkey: layout RU (combo)");
                 SwitchToLanguage(0);
                 return false;
             }
             if (S.HotEnMods != 0 && S.HotEnVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotEnVk, S.HotEnMods))
             {
+                Log("hotkey: layout EN (combo)");
                 SwitchToLanguage(1);
                 return false;
             }
@@ -416,6 +422,7 @@ namespace OpenSwitcher.Core
                 _tapTarget = (S.HotRuMods == 0 && vk == S.HotRuVk) ? 0 : 1;
                 _tapDownTick = Environment.TickCount;
                 _tapAlone = true;
+                Log("tap armed: vk=" + vk + " lang=" + _tapTarget);
                 return !IsSwallowableTap(vk); // не-модификаторы глотаем, чтобы не делали своего
             }
 
@@ -535,6 +542,7 @@ namespace OpenSwitcher.Core
             _tapAlone = false;
             if (alone)
             {
+                Log("tap fired: lang=" + _tapTarget);
                 UpdateForeground();
                 SwitchToLanguage(_tapTarget);
             }
@@ -574,24 +582,32 @@ namespace OpenSwitcher.Core
         /// resendVk — проглоченный разделитель (пробел/OEM) или Enter, который надо дослать после.</summary>
         private bool TryConvertWord(List<KeyRec> word, int resendVk, bool resendShift, bool manual)
         {
-            if (S.Paused || word == null || word.Count < S.MinWordLen) return false;
-            if (!manual && S.LockAutoAfterManualSwitch && _autoLocked) return false;
+            string why = null;
+            if (S.Paused) why = "paused";
+            else if (word == null || word.Count < S.MinWordLen) why = "too-short (" + (word == null ? 0 : word.Count) + ")";
+            else if (!manual && S.LockAutoAfterManualSwitch && _autoLocked) why = "locked";
+            if (why != null) { Log("convert skip: " + why); return false; }
+
             UpdateForeground();
-            if (IsExcludedHere()) return false;
+            if (IsExcludedHere()) { Log("convert skip: excluded app"); return false; }
 
             List<IntPtr> layouts = LayoutService.GetLayouts();
-            if (layouts.Count < 2) return false;
+            if (layouts.Count < 2) { Log("convert skip: one layout"); return false; }
             List<LayoutCandidate> cands = LayoutService.RenderAll(word, layouts);
 
             LayoutCandidate cur = null;
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
-            if (cur == null || cur.Lang < 0) return false;
+            if (cur == null || cur.Lang < 0) { Log("convert skip: cur unknown"); return false; }
 
             string typedLow = cur.Text.ToLowerInvariant();
 
             // обучение: это слово юзер уже отменил — автоматически не трогаем
             // (ручной хоткей в обход: manual=true проверку не проходит)
-            if (!manual && _rejected.Contains(typedLow)) return false;
+            if (!manual && _rejected.Contains(typedLow))
+            {
+                Log("convert skip: learned-rejected '" + cur.Text + "'");
+                return false;
+            }
             bool acceptedWord = !manual && _accepted.Contains(typedLow);
 
             LayoutCandidate best = null;
@@ -600,7 +616,7 @@ namespace OpenSwitcher.Core
                 if (c.Hkl == _fgHkl || c.Lang < 0) continue;
                 if (best == null || c.Score > best.Score) best = c;
             }
-            if (best == null) return false;
+            if (best == null) { Log("convert skip: no candidate"); return false; }
 
             bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
                                               best.Text, best.Lang, best.Score, S.Sensitivity);
@@ -608,17 +624,28 @@ namespace OpenSwitcher.Core
                 pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
 
             // словарная валидация результата
+            string dictSkip = null;
             if (pass && !acceptedWord)
             {
                 bool targetInDict = WordDict.Has(best.Text, best.Lang);
                 bool curInDict = WordDict.Has(cur.Text, cur.Lang);
                 if (curInDict && !targetInDict)
+                {
+                    dictSkip = "cur-in-dict, target-not";
                     pass = false; // текущее — частое слово, результат — нет: не трогаем
+                }
                 // оба не словарные — обычный порог: ошибки теперь дёшево отменять
                 // (Backspace/Break) и они запоминаются
             }
-            if (!pass) return false;
+            if (!pass)
+            {
+                Log("convert skip: scoring '" + cur.Text + "'(" + cur.Score.ToString("F2") + ") vs '" +
+                    (best != null ? best.Text : "?") + "'(" + (best != null ? best.Score : 0).ToString("F2") + ")" +
+                    (dictSkip != null ? " [" + dictSkip + "]" : ""));
+                return false;
+            }
 
+            Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk + ")");
             _lastWord = word;
 
             Suppress(600);
@@ -664,13 +691,13 @@ namespace OpenSwitcher.Core
         /// <summary>Отмена последней автозамены: вернуть исходное слово и раскладку.</summary>
         public void UndoLastConversion()
         {
-            if (!_undoPending) { FireInfo("Нечего отменять"); return; }
+            if (!_undoPending) { Log("undo skip: nothing pending"); FireInfo("Нечего отменять"); return; }
             // после замены уже печатали — backspace'ами сотрём чужой текст, отказываемся
-            if (_keysSinceUndoPoint > 0) { FireInfo("Уже набран новый текст"); return; }
+            if (_keysSinceUndoPoint > 0) { Log("undo skip: typed " + _keysSinceUndoPoint); FireInfo("Уже набран новый текст"); return; }
             UpdateForeground();
-            if (_undoHwnd != _fgHwnd) { FireInfo("Уже в другом окне"); return; }
+            if (_undoHwnd != _fgHwnd) { Log("undo skip: other window"); FireInfo("Уже в другом окне"); return; }
             int age = unchecked(Environment.TickCount - _undoTick);
-            if (age < 0 || age > 15000) { FireInfo("Слишком поздно"); return; }
+            if (age < 0 || age > 15000) { Log("undo skip: stale " + age); FireInfo("Слишком поздно"); return; }
 
             Suppress(600);
             TextConverter.SendBackspaces(_undoLen);
@@ -692,6 +719,7 @@ namespace OpenSwitcher.Core
             // точный путь: backspace'ы + перенабор
             if (_keysSinceUndoPoint == 0 && _lastWord.Count > 0)
             {
+                Log("fix-last-word: exact path");
                 var word = new List<KeyRec>(_lastWord);
                 if (!TryConvertWord(word, 0, false, true))
                     FireInfo("Раскладка уже верная");
@@ -701,6 +729,7 @@ namespace OpenSwitcher.Core
             // каретка уже ушла вперёд — выделяем слово слева от каретки
             // и конвертируем его как выделенный текст (сценарий «красное слово»:
             // клик сразу после слова → Ctrl+Space)
+            Log("fix-last-word: select-left path (keysSince=" + _keysSinceUndoPoint + ")");
             TextConverter.SendCombo(0x11, 0x10, 0x25, true); // Ctrl+Shift+Left
             BeginFixSelection();
         }
@@ -718,6 +747,7 @@ namespace OpenSwitcher.Core
         {
             UpdateForeground();
             _selFgHwnd = _fgHwnd;
+            Log("sel: Ctrl+C sent (fg=" + _selFgHwnd + ")");
             TextConverter.SendCombo(0x11, 0x43); // Ctrl+C
             _selTries = 0;
             if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); }
@@ -737,19 +767,23 @@ namespace OpenSwitcher.Core
 
             if (string.IsNullOrEmpty(text))
             {
+                Log("sel: no text in clipboard");
                 FireInfo("Нет выделенного текста");
                 return;
             }
+            Log("sel: got " + text.Length + " chars");
 
             int lang = LanguageTables.LangOf(LanguageTables.LettersOnly(text));
             if (lang < 0)
             {
+                Log("sel: lang unknown");
                 FireInfo("Не удалось определить язык");
                 return;
             }
             string converted = CharMaps.MapText(text, lang == 1);
             TextConverter.SetClipboardTextSafe(converted);
             TextConverter.SendCombo(0x11, 0x56); // Ctrl+V
+            Log("sel: pasted converted (" + lang + ")");
 
             IntPtr target = LayoutService.FindLayoutByLang(lang == 1 ? 0 : 1);
             if (target != IntPtr.Zero)
@@ -881,6 +915,30 @@ namespace OpenSwitcher.Core
                 var d = Info;
                 if (d != null) d(msg);
             });
+        }
+
+        // --- диагностика: журнал решений (пишется вне хука) ---
+        private readonly List<string> _logBuf = new List<string>();
+
+        private void Log(string line)
+        {
+            _logBuf.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line);
+            Defer(FlushLog);
+        }
+
+        private void FlushLog()
+        {
+            if (_logBuf.Count == 0) return;
+            try
+            {
+                System.IO.Directory.CreateDirectory(SettingsStore.Dir);
+                string p = System.IO.Path.Combine(SettingsStore.Dir, "log.txt");
+                if (System.IO.File.Exists(p) && new System.IO.FileInfo(p).Length > 512 * 1024)
+                    System.IO.File.WriteAllText(p, "");
+                System.IO.File.AppendAllLines(p, _logBuf);
+            }
+            catch (Exception) { }
+            _logBuf.Clear();
         }
     }
 }
