@@ -159,7 +159,7 @@ namespace OpenSwitcher.UI
             c3.AddRow("Исправить выделенный текст", "Конвертирует выделение и переключает раскладку", _hkSel, 52);
             _tDouble = new ToggleSwitch();
             _tDouble.Checked = _engine.S.DoubleShiftSwitch;
-            c3.AddRow("Двойной Shift — отменить замену", "Как в Caramba: возвращает последнее исправление", _tDouble, 44);
+            c3.AddRow("Двойной Shift — сменить раскладку", "Двойной тап любого Shift переключает на другую", _tDouble, 44);
             _hkUndo = new HotkeyBox();
             _hkUndo.Vk = _engine.S.HotUndoVk;
             _hkUndo.Mods = _engine.S.HotUndoMods;

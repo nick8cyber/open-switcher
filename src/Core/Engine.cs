@@ -318,15 +318,14 @@ namespace OpenSwitcher.Core
             if (vk == 0xA0 || vk == 0xA1) // левый / правый Shift
             {
                 int now = Environment.TickCount;
-                // двойной Shift — отмена последней автозамены (как в Caramba)
+                // двойной Shift — сменить раскладку
                 if (!_anyKeySinceShift && unchecked(now - _lastShiftDown) >= 0 &&
                     unchecked(now - _lastShiftDown) < 400 && S.DoubleShiftSwitch)
                 {
                     _lastShiftDown = 0;
                     _anyKeySinceShift = true;
                     _tapAlone = false;
-                    Log("double-shift: undo last conversion");
-                    UndoLastConversion();
+                    SwitchToOtherLayout();
                     return true;
                 }
                 _lastShiftDown = now;
