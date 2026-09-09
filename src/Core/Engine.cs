@@ -364,6 +364,7 @@ namespace OpenSwitcher.Core
                 if (_undoHwnd == _fgHwnd && age >= 0 && age < 15000)
                 {
                     _undoPending = false;
+                    TextConverter.ReleaseModifiers();
                     Log("backspace-cancel: " + _undoText);
                     Suppress(600);
                     TextConverter.SendBackspaces(_undoLen + _undoSep);
@@ -645,6 +646,10 @@ namespace OpenSwitcher.Core
                 return false;
             }
 
+            // юзер мог держать Shift/Ctrl (хоткей же с модификатором) — инжекция
+            // с зажатыми модификаторами даёт Ctrl+Shift+C и управляющие символы
+            TextConverter.ReleaseModifiers();
+
             Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk + ")");
             _lastWord = word;
 
@@ -699,6 +704,7 @@ namespace OpenSwitcher.Core
             int age = unchecked(Environment.TickCount - _undoTick);
             if (age < 0 || age > 15000) { Log("undo skip: stale " + age); FireInfo("Слишком поздно"); return; }
 
+            TextConverter.ReleaseModifiers();
             Suppress(600);
             TextConverter.SendBackspaces(_undoLen);
             TextConverter.SendUnicode(_undoText);
@@ -742,32 +748,58 @@ namespace OpenSwitcher.Core
         private System.Windows.Forms.Timer _selTimer;
         private IntPtr _selFgHwnd;
         private int _selTries;
+        private int _selPhase;               // 0 = ждём отпускания модификаторов, 1 = ждём буфер
+        private string _selBaseline;         // буфер до Ctrl+C
+        private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
 
         public void BeginFixSelection()
         {
             UpdateForeground();
             _selFgHwnd = _fgHwnd;
-            Log("sel: Ctrl+C sent (fg=" + _selFgHwnd + ")");
-            TextConverter.SendCombo(0x11, 0x43); // Ctrl+C
+            _selBaseline = TextConverter.GetClipboardTextOnce();
+            _selBaseSeq = Native.GetClipboardSequenceNumber();
+            _selPhase = 0;
             _selTries = 0;
             if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); }
             _selTimer = new System.Windows.Forms.Timer();
             _selTimer.Interval = 60;
             _selTimer.Tick += SelPollTick;
             _selTimer.Start();
+            Log("sel: started (baseline " + (_selBaseline != null ? _selBaseline.Length + " ch" : "empty") + ")");
         }
 
         private void SelPollTick(object sender, EventArgs e)
         {
+            if (_selPhase == 0)
+            {
+                // ждём, пока юзер отпустит модификаторы хоткея (иначе будет
+                // Ctrl+Shift+C вместо Ctrl+C — «копирование форматирования»)
+                bool shift = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+                bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
+                bool alt = (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
+                bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+                _selTries++;
+                if ((shift || ctrl || alt || win) && _selTries < 10) return; // до ~0.6 c
+                TextConverter.ReleaseModifiers();
+                _selPhase = 1;
+                _selTries = 0;
+                TextConverter.SendCombo(0x11, 0, 0x43, false); // чистый Ctrl+C
+                Log("sel: ctrl+c sent (phase 1)");
+                return;
+            }
+
             string text = TextConverter.GetClipboardTextOnce();
+            bool seqChanged = Native.GetClipboardSequenceNumber() != _selBaseSeq;
             _selTries++;
-            if (string.IsNullOrEmpty(text) && _selTries < 20) return; // ждём до ~1.2 c
+            bool isNew = !string.IsNullOrEmpty(text) && (seqChanged || text != _selBaseline);
+            if (!isNew && _selTries < 20) return; // ждём до ~1.2 c
 
             if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); _selTimer = null; }
 
-            if (string.IsNullOrEmpty(text))
+            if (string.IsNullOrEmpty(text) || !seqChanged)
             {
-                Log("sel: no text in clipboard");
+                // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
+                Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
                 FireInfo("Нет выделенного текста");
                 return;
             }
@@ -782,6 +814,7 @@ namespace OpenSwitcher.Core
             }
             string converted = CharMaps.MapText(text, lang == 1);
             TextConverter.SetClipboardTextSafe(converted);
+            TextConverter.ReleaseModifiers();
             TextConverter.SendCombo(0x11, 0x56); // Ctrl+V
             Log("sel: pasted converted (" + lang + ")");
 

@@ -122,6 +122,7 @@ namespace OpenSwitcher.Core
         [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+        [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
         [DllImport("user32.dll")] public static extern int SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);

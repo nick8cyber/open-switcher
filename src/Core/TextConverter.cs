@@ -13,6 +13,30 @@ namespace OpenSwitcher.Core
             SendKey(vk, extended, false);
         }
 
+        /// <summary>Принудительно «отпустить» зажатые модификаторы. Без этого инжекция
+        /// при удерживаемом Shift/Ctrl даёт Ctrl+Shift+C вместо Ctrl+C и управляющие
+        /// символы вместо букв.</summary>
+        public static void ReleaseModifiers()
+        {
+            var list = new List<Native.INPUT>();
+            int[] vks = { 0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C };
+            foreach (int vk in vks)
+            {
+                if ((Native.GetAsyncKeyState(vk) & 0x8000) != 0)
+                {
+                    var u = new Native.INPUT();
+                    u.type = 1;
+                    u.u.ki.wVk = (ushort)vk;
+                    u.u.ki.wScan = (ushort)Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+                    u.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                    list.Add(u);
+                }
+            }
+            if (list.Count > 0)
+                Native.SendInput((uint)list.Count, list.ToArray(),
+                    System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
+        }
+
         /// <summary>Нажать клавишу (опционально с Shift) — для пересылки проглоченного разделителя.</summary>
         public static void SendKey(int vk, bool extended, bool withShift)
         {
