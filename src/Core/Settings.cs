@@ -27,8 +27,8 @@ namespace OpenSwitcher.Core
         public int HotUndoMods = 0;
         public int HotFixWordVk = 0x20;            // Ctrl+Space
         public int HotFixWordMods = HK.CTRL;
-        public int HotFixSelVk = 0x20;             // Ctrl+Shift+Space
-        public int HotFixSelMods = HK.CTRL | HK.SHIFT;
+        public int HotFixSelVk = 0x13;             // Shift+Break — как в Caramba
+        public int HotFixSelMods = HK.SHIFT;
         public int HotRuVk = 0xA0;        // левый Shift -> РУС
         public int HotRuMods = 0;
         public int HotEnVk = 0xA1;        // правый Shift -> ENG
@@ -45,7 +45,7 @@ namespace OpenSwitcher.Core
         public bool Paused = false;
         public string Exclusions = "";
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
-        public int DefaultsV = 4; // версия дефолтов (4 = Break отмена автозамены, пауза без клавиши)
+        public int DefaultsV = 5; // версия дефолтов (5 = Shift+Break конвертация выделенного)
     }
 
     public static class SettingsStore
@@ -109,6 +109,17 @@ namespace OpenSwitcher.Core
                 s.HotUndoVk = 0x13;
                 s.HotUndoMods = 0;
                 s.DefaultsV = 4;
+                Save(s);
+            }
+            // v5: конвертация выделенного — Shift+Break (как в Caramba); кастомные хоткеи не трогаем
+            if (s.DefaultsV < 5)
+            {
+                if (s.HotFixSelVk == 0x20 && s.HotFixSelMods == (HK.CTRL | HK.SHIFT))
+                {
+                    s.HotFixSelVk = 0x13;
+                    s.HotFixSelMods = HK.SHIFT;
+                }
+                s.DefaultsV = 5;
                 Save(s);
             }
             return s;
