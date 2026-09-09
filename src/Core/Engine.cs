@@ -614,12 +614,8 @@ namespace OpenSwitcher.Core
                 bool curInDict = WordDict.Has(cur.Text, cur.Lang);
                 if (curInDict && !targetInDict)
                     pass = false; // текущее — частое слово, результат — нет: не трогаем
-                else if (!targetInDict && !curInDict)
-                {
-                    // оба не словарные — конвертация только с запасом x3
-                    double need = LanguageTables.BaseMargin * 3.0 / Math.Max(0.3, S.Sensitivity);
-                    if (best.Score - cur.Score < need) pass = false;
-                }
+                // оба не словарные — обычный порог: ошибки теперь дёшево отменять
+                // (Backspace/Break) и они запоминаются
             }
             if (!pass) return false;
 
@@ -691,22 +687,22 @@ namespace OpenSwitcher.Core
         public void DoFixLastWord()
         {
             UpdateForeground();
-            if (_lastWord.Count == 0)
+
+            // каретка сразу после слова (после пробела ничего не нажимали) —
+            // точный путь: backspace'ы + перенабор
+            if (_keysSinceUndoPoint == 0 && _lastWord.Count > 0)
             {
-                FireInfo("Нет слова для исправления");
+                var word = new List<KeyRec>(_lastWord);
+                if (!TryConvertWord(word, 0, false, true))
+                    FireInfo("Раскладка уже верная");
                 return;
             }
-            // протухший снимок конвертировать опасно: каретка уже в другом месте,
-            // backspace'ы сотрут чужой текст
-            int age = unchecked(Environment.TickCount - _lastWordAt);
-            if (age < 0 || age > 3000)
-            {
-                FireInfo("Слово уже устарело");
-                return;
-            }
-            var word = new List<KeyRec>(_lastWord);
-            if (!TryConvertWord(word, 0, false, true))
-                FireInfo("Раскладка уже верная");
+
+            // каретка уже ушла вперёд — выделяем слово слева от каретки
+            // и конвертируем его как выделенный текст (сценарий «красное слово»:
+            // клик сразу после слова → Ctrl+Space)
+            TextConverter.SendCombo(0x11, 0x10, 0x25, true); // Ctrl+Shift+Left
+            BeginFixSelection();
         }
 
         // --- двухфазная конвертация выделенного текста ---

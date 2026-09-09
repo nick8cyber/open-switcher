@@ -38,15 +38,42 @@ namespace OpenSwitcher.Core
 
         public static void SendCombo(int modifierVk, int vk)
         {
-            uint scM = Native.MapVirtualKeyEx((uint)modifierVk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-            uint scK = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-            var inputs = new Native.INPUT[4];
-            for (int i = 0; i < 4; i++) inputs[i].type = 1;
-            inputs[0].u.ki.wVk = (ushort)modifierVk; inputs[0].u.ki.wScan = (ushort)scM;
-            inputs[1].u.ki.wVk = (ushort)vk; inputs[1].u.ki.wScan = (ushort)scK;
-            inputs[2].u.ki.wVk = (ushort)vk; inputs[2].u.ki.wScan = (ushort)scK; inputs[2].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
-            inputs[3].u.ki.wVk = (ushort)modifierVk; inputs[3].u.ki.wScan = (ushort)scM; inputs[3].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
-            Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
+            SendCombo(modifierVk, 0, vk, false);
+        }
+
+        /// <summary>Сочетание с двумя модификаторами (напр. Ctrl+Shift+Left для выделения слова).</summary>
+        public static void SendCombo(int modifierVk1, int modifierVk2, int vk, bool extended)
+        {
+            var list = new List<Native.INPUT>(8);
+            foreach (int m in new[] { modifierVk1, modifierVk2 })
+            {
+                if (m == 0) continue;
+                var d = new Native.INPUT(); var u = new Native.INPUT();
+                d.type = 1; u.type = 1;
+                d.u.ki.wVk = (ushort)m; d.u.ki.wScan = (ushort)Native.MapVirtualKeyEx((uint)m, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+                u.u.ki.wVk = (ushort)m; u.u.ki.wScan = d.u.ki.wScan;
+                u.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                list.Add(d); list.Add(u);
+            }
+            var kd = new Native.INPUT(); var ku = new Native.INPUT();
+            kd.type = 1; ku.type = 1;
+            uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
+            kd.u.ki.wVk = (ushort)vk; kd.u.ki.wScan = (ushort)sc;
+            ku.u.ki.wVk = (ushort)vk; ku.u.ki.wScan = (ushort)sc;
+            kd.u.ki.dwFlags = extended ? Native.KEYEVENTF_EXTENDEDKEY : 0;
+            ku.u.ki.dwFlags = Native.KEYEVENTF_KEYUP | (extended ? Native.KEYEVENTF_EXTENDEDKEY : 0);
+            list.Add(kd); list.Add(ku);
+            // модификаторы отпускаем в обратном порядке
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                Native.INPUT ev = list[i];
+                if ((ev.u.ki.dwFlags & Native.KEYEVENTF_KEYUP) == 0 && ev.u.ki.wVk != vk)
+                {
+                    ev.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                    list.Add(ev);
+                }
+            }
+            Native.SendInput((uint)list.Count, list.ToArray(), System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.INPUT)));
         }
 
         /// <summary>Забить n символов backspace'ами.</summary>
