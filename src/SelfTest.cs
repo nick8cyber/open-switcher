@@ -18,10 +18,11 @@ namespace OpenSwitcher
             public bool TypedIsRu;    // раскладка, в которой это набрано
             public bool ExpectConvert;
             public string Note;
+            public bool Live;         // живое исправление (до пробела): цель обязана быть в словаре
 
-            public Case(string typed, bool isRu, bool expect, string note)
+            public Case(string typed, bool isRu, bool expect, string note, bool live = false)
             {
-                Typed = typed; TypedIsRu = isRu; ExpectConvert = expect; Note = note;
+                Typed = typed; TypedIsRu = isRu; ExpectConvert = expect; Note = note; Live = live;
             }
         }
 
@@ -92,7 +93,10 @@ namespace OpenSwitcher
                 new Case("qwerty", false, true,  "йцукен (клавиатурный ряд)"),
                 new Case("qwe",    false, false, "двусмысленно, коротко"),
                 new Case("bd",     false, false, "слишком коротко"),
-                new Case("quit",   false, false, "настоящее английское слово")
+                new Case("quit",   false, false, "настоящее английское слово"),
+                new Case("дадут",  true,  false, "русское слово не превращать в lflen"),
+                new Case("муд",    true,  false, "живое: 'vel' не словарное — не трогаем", true),
+                new Case("ghbdtn", false, true,  "живое: привет в словаре — перевернём", true)
             };
 
             var sb = new StringBuilder();
@@ -114,8 +118,20 @@ namespace OpenSwitcher
                 int altLang = c.TypedIsRu ? 1 : 0;
                 double curScore = LanguageTables.Score(LanguageTables.LettersOnly(curText), curLang);
                 double altScore = LanguageTables.Score(LanguageTables.LettersOnly(altText), altLang);
-                bool convert = LanguageTables.ShouldConvert(curText, curLang, curScore,
+                bool convert;
+                if (c.Live && !WordDict.Has(altText, altLang))
+                {
+                    convert = false; // живое исправление — только в словарные слова
+                }
+                else
+                {
+                    convert = LanguageTables.ShouldConvert(curText, curLang, curScore,
                                                             altText, altLang, altScore, 1.0);
+                    bool targetInDict = WordDict.Has(altText, altLang);
+                    bool curInDict = WordDict.Has(curText, curLang);
+                    if (convert && curInDict && !targetInDict) convert = false;
+                    if (!convert && targetInDict && !curInDict) convert = true;
+                }
                 bool pass = convert == c.ExpectConvert;
                 if (!pass) fails++;
                 sb.AppendLine(string.Format("{0}: '{1}' ({2}) -> '{3}' [{4}] {5}  cur={6:F2} alt={7:F2}  ({8})",

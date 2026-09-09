@@ -48,6 +48,7 @@ namespace OpenSwitcher.Core
         private IntPtr _undoHwnd;            // окно, где была замена
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
+        public static bool TestInjectMode;   // ВРЕМЕННО: трактовать инжектированный ввод как настоящий
         private List<KeyRec> _undoTail = new List<KeyRec>(); // хвост: что юзер напечатал после замены
         private bool _undoTailBroken;        // хвост испорчен (enter/cap) — откат запрещён
 
@@ -273,12 +274,13 @@ namespace OpenSwitcher.Core
                 var k = (Native.KBDLLHOOKSTRUCT)System.Runtime.InteropServices.Marshal.PtrToStructure(
                     lParam, typeof(Native.KBDLLHOOKSTRUCT));
                 bool injected = (k.flags & 0x10) != 0;
+                bool testMode = TestInjectMode; // ВРЕМЕННО: для диагностики пропускаем синтетический ввод
 
                 // guard отката: считаем ЛЮБЫЕ реальные нажатия — даже в suppress-окне
                 // после автозамены (иначе Break после быстрой печати портит текст).
                 // Исключения: сам хоткей отката И Backspace при ожидающемся откате
                 // (иначе Backspace-отмена никогда не срабатывает)
-                if (msg == Native.WM_KEYDOWN && !injected && !IsUndoHotkey(k) &&
+                if (msg == Native.WM_KEYDOWN && (!injected || testMode) && !IsUndoHotkey(k) &&
                     !(_undoPending && (k.vkCode & 0xFF) == 0x08))
                     _keysSinceUndoPoint++;
 
@@ -286,11 +288,11 @@ namespace OpenSwitcher.Core
                 {
                     if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                     {
-                        if (!injected && !OnKeyDown(k)) return IntPtr.Zero; // проглотить
+                        if ((!injected || testMode) && !OnKeyDown(k)) return IntPtr.Zero; // проглотить
                     }
                     else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
                     {
-                        if (!injected && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
+                        if ((!injected || testMode) && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
                     }
                 }
             }
@@ -697,13 +699,20 @@ namespace OpenSwitcher.Core
             }
             if (best == null) { Log("convert skip: no candidate"); return false; }
 
+            // ЖИВОЙ режим: переворачиваем только если результат — знакомое слово.
+            // Посреди набора частотный скоринг шумит ('муд'->'vel' на правильном «мудаке»),
+            // поэтому уверенность = слово есть в словаре.
+            bool live = resendVk == 0 && !manual;
+            if (live && !WordDict.Has(best.Text, best.Lang))
+            {
+                Log("convert skip: live, target not in dict ('" + best.Text + "')");
+                return false;
+            }
+
             bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
                                               best.Text, best.Lang, best.Score, S.Sensitivity);
             if (!pass && acceptedWord)
                 pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
-
-            // живое исправление решается посреди набора «вслепую» — запас x2
-            double liveFactor = (resendVk == 0 && !manual) ? 2.0 : 1.0;
 
             // словарная валидация результата — действует всегда, даже для accepted:
             // мусорный результат в буфер не вставляем
@@ -721,17 +730,10 @@ namespace OpenSwitcher.Core
                 {
                     // оба не словарные — нужен усиленный запас
                     double need = LanguageTables.BaseMargin *
-                                  (acceptedWord ? 1.0 : 2.0 * liveFactor) /
+                                  (acceptedWord ? 1.0 : 2.0) /
                                   Math.Max(0.3, S.Sensitivity);
                     if (best.Score - cur.Score < need) pass = false;
                 }
-            }
-            if (!pass)
-            {
-                Log("convert skip: scoring '" + cur.Text + "'(" + cur.Score.ToString("F2") + ") vs '" +
-                    (best != null ? best.Text : "?") + "'(" + (best != null ? best.Score : 0).ToString("F2") + ")" +
-                    (dictSkip != null ? " [" + dictSkip + "]" : ""));
-                return false;
             }
 
             // юзер мог держать Shift/Ctrl (хоткей же с модификатором) — инжекция
@@ -785,8 +787,9 @@ namespace OpenSwitcher.Core
         public void UndoLastConversion()
         {
             if (!_undoPending) { Log("undo skip: nothing pending"); FireInfo("Нечего отменять"); return; }
-            // после замены уже печатали — backspace'ами сотрём чужой текст, отказываемся
-            if (_keysSinceUndoPoint > 0) { Log("undo skip: typed " + _keysSinceUndoPoint); FireInfo("Уже набран новый текст"); return; }
+            // хвост знает всё, что напечатано после замены (до 16 клавиш) —
+            // откат корректен, пока хвост не «сломан» (Enter/переполнение)
+            if (_undoTailBroken) { Log("undo skip: tail broken"); FireInfo("Слишком много набрано после"); return; }
             UpdateForeground();
             if (_undoHwnd != _fgHwnd) { Log("undo skip: other window"); FireInfo("Уже в другом окне"); return; }
             int age = unchecked(Environment.TickCount - _undoTick);

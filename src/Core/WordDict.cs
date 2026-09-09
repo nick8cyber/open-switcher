@@ -34,7 +34,9 @@ namespace OpenSwitcher.Core
             "хороший плохой быстрый медленный красный белый черный синий зеленый желтый " +
             "первый второй третий последний лучший худший простой сложный серьезный смешной " +
             "умный глупый сильный слабый сегодня вчера завтра утром вечером сразу снова " +
-            "опять обязательно вообще именно реально естественно";
+            "опять обязательно вообще именно реально естественно йцукен йцукенг мудак " +
+            "мудила дадут дадим дайте понял понятно сейчас короче согласен жаль бывает " +
+            "проверка проверить проверю тест тесты чел крч щас изи спасибо еще нормально";
 
         private const string EnSrc =
             "the of and to in is are was were be been being have has had do does did will " +
@@ -52,7 +54,8 @@ namespace OpenSwitcher.Core
             "girl name money water food room door table chair book page learn study play " +
             "watch send nice cool crazy funny boring easy hard real true false sure maybe " +
             "probably actually right wrong now later today tomorrow yesterday morning " +
-            "evening just like know really";
+            "evening just like know really qwerty iban who test tests ban tan win fail " +
+            "fixed fixer bugfix";
 
         private static readonly HashSet<string> Ru = Make(RuSrc);
         private static readonly HashSet<string> En = Make(EnSrc);

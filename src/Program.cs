@@ -83,6 +83,8 @@ namespace OpenSwitcher
             };
 
             Engine = new Engine(settings);
+            if (Environment.GetEnvironmentVariable("OS_TEST_INJECT") == "1")
+                Engine.TestInjectMode = true;
             Tray = new TrayService(Engine);
             Tray.Init();
 
