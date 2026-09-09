@@ -24,6 +24,10 @@ if errorlevel 1 (
     echo BUILD FAILED
     exit /b 1
 )
+
+rem --- подпись стабильным сертификатом (чтобы COMODO не сбрасывал рейтинг на каждом ребилде)
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\sign.ps1
+
 echo BUILD OK: OpenSwitcher.exe
 
 rem --- self-test детектора раскладки (вывод в stdout) ---
