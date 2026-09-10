@@ -43,9 +43,16 @@ namespace OpenSwitcher.Core
             return sb.ToString();
         }
 
-        /// <summary>Все установленные раскладки (уникальные HKL).</summary>
+        private static List<IntPtr> _cache;
+        private static int _cacheAt;
+
+        /// <summary>Все установленные раскладки (уникальные HKL), кэш 30 с.</summary>
         public static List<IntPtr> GetLayouts()
         {
+            if (_cache != null && _cache.Count > 0 &&
+                unchecked(Environment.TickCount - _cacheAt) >= 0 &&
+                unchecked(Environment.TickCount - _cacheAt) < 30000)
+                return new List<IntPtr>(_cache);
             var list = new List<IntPtr>();
             try
             {
@@ -57,6 +64,8 @@ namespace OpenSwitcher.Core
                     if (!list.Contains(arr[i])) list.Add(arr[i]);
             }
             catch (Exception) { }
+            _cache = new List<IntPtr>(list);
+            _cacheAt = Environment.TickCount;
             return list;
         }
 

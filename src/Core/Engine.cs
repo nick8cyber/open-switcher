@@ -60,6 +60,7 @@ namespace OpenSwitcher.Core
         private IntPtr _gapHkl;              // целевая раскладка
         private readonly List<KeyRec> _gapBuf = new List<KeyRec>();
         private int _gapDeadline;
+        private System.Threading.Timer _hookWatchdog; // переустановка LL-хуков: Windows молча снимает их при таймаутах колбэка
 
         // обучение: слова, автозамену которых юзер отменил — больше не конвертировать
         private readonly HashSet<string> _rejected = new HashSet<string>();
@@ -105,6 +106,22 @@ namespace OpenSwitcher.Core
                 IntPtr.Zero, _winProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
             UpdateForeground();
             LoadLearned();
+
+            // watchdog: раз в 60 с переустанавливаем LL-хуки — Windows молча снимает их,
+            // если колбэк хоть раз сработал медленнее таймаута (типичная «внезапная смерть»)
+            _hookWatchdog = new System.Threading.Timer(delegate
+            {
+                try { ReinstallHooks(); Log("watchdog: hooks reinstalled"); }
+                catch (Exception) { }
+            }, null, 60000, 60000);
+        }
+
+        private void ReinstallHooks()
+        {
+            if (_kbHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_kbHook);
+            if (_mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_mouseHook);
+            _kbHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _kbProc, IntPtr.Zero, 0);
+            _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
         }
 
         private string AcceptedPath
