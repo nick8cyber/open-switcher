@@ -96,7 +96,9 @@ namespace OpenSwitcher
                 new Case("quit",   false, false, "настоящее английское слово"),
                 new Case("дадут",  true,  false, "русское слово не превращать в lflen"),
                 new Case("муд",    true,  false, "живое: 'vel' не словарное — не трогаем", true),
-                new Case("ghbdtn", false, true,  "живое: привет в словаре — перевернём", true)
+                new Case("ghbdtn", false, true,  "живое: привет в словаре — перевернём", true),
+                new Case("что",    true,  false, "частое русское: цель 'xnj' не словарная, не трогаем"),
+                new Case("xnj",    false, true,  "цель 'что' словарная, набранное нет — словарь сильнее скоринга")
             };
 
             var sb = new StringBuilder();

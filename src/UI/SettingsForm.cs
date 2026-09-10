@@ -25,7 +25,7 @@ namespace OpenSwitcher.UI
         private Panel[] _pages;
         private PageCard[] _cards;
 
-        private ToggleSwitch _tEnter, _tAuto, _tDouble, _tPopup, _tClip, _tRun, _tLock;
+        private ToggleSwitch _tEnter, _tAuto, _tDouble, _tPopup, _tClip, _tRun, _tLock, _tInputMode;
         private HotkeyBox _hkWord, _hkSel, _hkRu, _hkEn, _hkAuto, _hkUndo;
         private NumBox _numLen;
         private ChoiceSeg _segSens, _segTheme;
@@ -190,9 +190,14 @@ namespace OpenSwitcher.UI
 
             // ================= страница «Система»
             Panel pSys = MkPage(w);
-            PageHeader(pSys, "Система", "Буфер обмена, запуск и память");
+            PageHeader(pSys, "Система", "Буфер обмена, ввод, запуск и память");
             y = 46;
             PageCard c5 = MkCard(pSys, y);
+            _tInputMode = new ToggleSwitch();
+            _tInputMode.Checked = _engine.S.InputMode == 1;
+            c5.AddRow("Ввод сообщениями окна (обход HIPS)",
+                "Буквы и Backspace шлются напрямую в окно ввода (WM_CHAR), минуя SendInput. Включено по умолчанию: антивирусы с защитой от эмуляции ввода (COMODO HIPS и т.п.) глушат SendInput — тогда замена «проходит», но текст не меняется. Выключите, если исправленный текст появляется не в том месте или не появляется вовсе в вашем редакторе",
+                _tInputMode, 56);
             _tClip = new ToggleSwitch();
             _tClip.Checked = _engine.S.RestoreClipboard;
             c5.AddRow("Восстанавливать буфер обмена", "Вернуть прежнее содержимое после конвертации выделения", _tClip, 56);
@@ -406,6 +411,7 @@ namespace OpenSwitcher.UI
             _tDouble.Checked = s.DoubleShiftSwitch;
             _segTheme.SelectedIndex = s.ThemeMode;
             _tPopup.Checked = s.ShowPopup;
+            _tInputMode.Checked = s.InputMode == 1;
             _tClip.Checked = s.RestoreClipboard;
             _tRun.Checked = s.StartWithWindows;
             _tbExcl.Text = s.Exclusions;
@@ -435,6 +441,7 @@ namespace OpenSwitcher.UI
             s.DoubleShiftSwitch = _tDouble.Checked;
             s.ThemeMode = _segTheme.SelectedIndex;
             s.ShowPopup = _tPopup.Checked;
+            s.InputMode = _tInputMode.Checked ? 1 : 0;
             s.RestoreClipboard = _tClip.Checked;
             s.StartWithWindows = _tRun.Checked;
             s.Exclusions = _tbExcl.Text.Trim();

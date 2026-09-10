@@ -48,7 +48,10 @@ namespace OpenSwitcher.Core
         private IntPtr _undoHwnd;            // окно, где была замена
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
+        private int _lastBufTick;            // тикант предыдущей буквы буфера (пауза для live)
         public static bool TestInjectMode;   // ВРЕМЕННО: трактовать инжектированный ввод как настоящий
+        /// <summary>Пауза набора (мс), после которой разрешена live-конвертация слова.</summary>
+        internal const int LivePauseMs = 500;
         private List<KeyRec> _undoTail = new List<KeyRec>(); // хвост: что юзер напечатал после замены
         private bool _undoTailBroken;        // хвост испорчен (enter/cap) — откат запрещён
 
@@ -187,7 +190,26 @@ namespace OpenSwitcher.Core
 
         private void UpdateForeground()
         {
+            IntPtr prevHwnd = _fgHwnd;
             _fgHwnd = Native.GetForegroundWindow();
+
+            // Окно сменилось, а WinEvent мог не дойти (доставка EVENT_SYSTEM_FOREGROUND
+            // ненадёжна: события теряются, когда система занята или хук отключён по
+            // таймауту). Детектим смену окна сами — это та же «новая сессия ввода»:
+            // снимаем лок автодетекта и сбрасываем состояние, как в WinEventProcHandler.
+            if (_expectedValid && _fgHwnd != IntPtr.Zero && prevHwnd != IntPtr.Zero && prevHwnd != _fgHwnd)
+            {
+                if (TestInjectMode)
+                    Log("window-switch: " + _fgHwnd.ToInt64().ToString("X") + " (was " + prevHwnd.ToInt64().ToString("X") + ")");
+                _autoLocked = false;
+                _undoPending = false;
+                _undoTailBroken = true;
+                _buf.Clear();
+                _tapAlone = false;
+                _anyKeySinceShift = true;
+                _gapActive = false; _gapBuf.Clear();
+                _expectedValid = false;
+            }
             uint pid;
             uint tid = Native.GetWindowThreadProcessId(_fgHwnd, out pid);
             _fgHkl = tid != 0 ? Native.GetKeyboardLayout(tid) : Native.GetKeyboardLayout(0);
@@ -212,7 +234,13 @@ namespace OpenSwitcher.Core
             if (_expectedValid && _fgHwnd == _expectedHwnd && _fgHkl != _expectedHkl
                 && S.LockAutoAfterManualSwitch
                 && unchecked(Environment.TickCount - _expectGraceUntil) >= 0)
+            {
                 _autoLocked = true;
+                if (TestInjectMode)
+                    Log("auto-lock: hkl=" + _fgHkl.ToInt64().ToString("X8") +
+                        " expected=" + _expectedHkl.ToInt64().ToString("X8") +
+                        " hwnd=" + _fgHwnd.ToInt64().ToString("X"));
+            }
             _expectedHkl = _fgHkl;
             _expectedHwnd = _fgHwnd;
             _expectedValid = true;
@@ -274,25 +302,37 @@ namespace OpenSwitcher.Core
                 var k = (Native.KBDLLHOOKSTRUCT)System.Runtime.InteropServices.Marshal.PtrToStructure(
                     lParam, typeof(Native.KBDLLHOOKSTRUCT));
                 bool injected = (k.flags & 0x10) != 0;
-                bool testMode = TestInjectMode; // ВРЕМЕННО: для диагностики пропускаем синтетический ввод
+                // Три класса ввода:
+                //  1) реальный пользовательский — обрабатываем всегда;
+                //  2) в тест-режиме (OS_TEST_INJECT) инжектированный ИЗВНЕ — обрабатываем
+                //     как настоящий (иначе тест не может гонять движок без человека);
+                //  3) СОБСТВЕННАЯ инжекция движка (SendCombo/SendUnicode/...) — игнорируем
+                //     даже в тест-режиме, иначе движок реагирует на себя: фантомные тапы
+                //     от Shift в комбинациях, захват собственных клавиш gap-буфером.
+                bool selfInject = TestInjectMode && TextConverter.SelfInjectDepth > 0;
+                bool treatAsReal = !selfInject && (!injected || TestInjectMode);
 
                 // guard отката: считаем ЛЮБЫЕ реальные нажатия — даже в suppress-окне
                 // после автозамены (иначе Break после быстрой печати портит текст).
-                // Исключения: сам хоткей отката И Backspace при ожидающемся откате
-                // (иначе Backspace-отмена никогда не срабатывает)
-                if (msg == Native.WM_KEYDOWN && (!injected || testMode) && !IsUndoHotkey(k) &&
-                    !(_undoPending && (k.vkCode & 0xFF) == 0x08))
+                // Исключения: модификаторы (они не «набор»), сам хоткей отката,
+                // хоткей «исправить слово» и Backspace при ожидающемся откате
+                // (иначе Backspace-отмена никогда не срабатывает). Без исключения
+                // хоткея Ctrl+Space его собственное нажатие засчитывалось как
+                // «набор после слова», и точный путь (каретка сразу после слова)
+                // никогда не срабатывал — всегда шло выделение слева.
+                if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) && !IsUndoHotkey(k) &&
+                    !IsFixWordHotkey(k) && !(_undoPending && (k.vkCode & 0xFF) == 0x08))
                     _keysSinceUndoPoint++;
 
                 if (Environment.TickCount >= _suppressUntil)
                 {
                     if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                     {
-                        if ((!injected || testMode) && !OnKeyDown(k)) return IntPtr.Zero; // проглотить
+                        if (treatAsReal && !OnKeyDown(k)) return IntPtr.Zero; // проглотить
                     }
                     else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
                     {
-                        if ((!injected || testMode) && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
+                        if (treatAsReal && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
                     }
                 }
             }
@@ -302,11 +342,23 @@ namespace OpenSwitcher.Core
         private void FlushGap()
         {
             if (_gapBuf.Count == 0) return;
+            // режим и окно фокуса обязаны выставляться в точке инжекции — иначе
+            // тут остаются значения с прошлой замены (чужое окно / SendInput)
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             TextConverter.ReleaseModifiers();
             string s = LayoutService.Render(_gapHkl, _gapBuf);
             TextConverter.SendUnicode(s);
             Log("gap: flushed " + _gapBuf.Count + " keys as '" + s + "'");
             _gapBuf.Clear();
+        }
+
+        /// <summary>Модификатор ли это (не считаем модификаторы «набором после слова»).</summary>
+        private static bool IsModifierVk(uint vkRaw)
+        {
+            int vk = (int)(vkRaw & 0xFF);
+            return vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x5B || vk == 0x5C ||
+                   (vk >= 0xA0 && vk <= 0xA5);
         }
 
         /// <summary>Это нажатие — хоткей отката? (сам Break не должен ломить счётчик)</summary>
@@ -319,6 +371,19 @@ namespace OpenSwitcher.Core
             bool alt = (k.flags & Native.LLKHF_ALTDOWN) != 0 || (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
             bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
             return MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods);
+        }
+
+        /// <summary>Это нажатие — хоткей «исправить последнее слово»? (само нажатие
+        /// не должно засчитываться как набор после слова)</summary>
+        private bool IsFixWordHotkey(Native.KBDLLHOOKSTRUCT k)
+        {
+            int vk = (int)(k.vkCode & 0xFF);
+            if (S.HotFixWordVk == 0 || vk != S.HotFixWordVk) return false;
+            bool shift = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+            bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
+            bool alt = (k.flags & Native.LLKHF_ALTDOWN) != 0 || (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
+            bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+            return MatchHot(vk, ctrl, shift, alt, win, S.HotFixWordVk, S.HotFixWordMods);
         }
 
         // OnKeyDown возвращает true — пропустить клавишу дальше, false — проглотить.
@@ -486,24 +551,34 @@ namespace OpenSwitcher.Core
 
             if (vk >= 0x41 && vk <= 0x5A)
             {
+                int nowTick = Environment.TickCount;
+                // live-конвертация уместна только после ПАУЗЫ в наборе: непрерывный поток
+                // букв — это ещё не законченное слово, и переворот словарного ПРЕФИКСА
+                // («ghb»->«при» внутри «ghbdtn») давал «приветвте» вместо «привет».
+                // Требуем >= LivePauseMs от предыдущей буквы; при непрерывном наборе
+                // слово честно ловится по разделителю (пробел/Enter).
+                bool livePause = _buf.Count == 0 ||
+                    (unchecked(nowTick - _lastBufTick) >= 0 && unchecked(nowTick - _lastBufTick) >= LivePauseMs);
                 KeyRec rec = new KeyRec(vk, shift, caps);
                 _buf.Push(rec);
+                _lastBufTick = nowTick;
+                bool liveConverted = false;
 
                 // ЖИВОЕ ИСПРАВЛЕНИЕ (базовая механика Caramba): слово переворачивается
                 // сразу, как только набрано достаточно букв — юзер не видит целое слово
                 // не в той раскладке. Shift при наборе заглавных — норма, Ctrl/Alt — нет.
-                if (!ctrl && !alt && !win && S.AutoConvertOnWordEnd && _buf.Count >= S.MinWordLen)
+                if (livePause && !ctrl && !alt && !win && S.AutoConvertOnWordEnd && _buf.Count >= S.MinWordLen)
                 {
                     List<KeyRec> word = _buf.Snapshot();
                     if (TryConvertWord(word, 0, false, false))
                     {
-                        _buf.Clear(); // дальше юзер печатает уже в новой раскладке
-                        if (_undoPending) { _undoTail.Clear(); _undoTailBroken = false; }
+                        _buf.Clear();
+                        liveConverted = true; // эта буква уже внутри заменённого слова — в хвост ей нельзя
                     }
                 }
 
                 // хвост отката: запоминаем, что юзер напечатал после замены
-                if (_undoPending && !_undoTailBroken && !ctrl && !alt && !win)
+                if (!liveConverted && _undoPending && !_undoTailBroken && !ctrl && !alt && !win)
                 {
                     if (_undoTail.Count < 16) _undoTail.Add(rec);
                     else _undoTailBroken = true;
@@ -511,7 +586,22 @@ namespace OpenSwitcher.Core
                 return true;
             }
 
-            if (vk == 0x08) { _buf.Pop(); return true; } // Backspace (обычный забой)
+            if (vk == 0x08) // Backspace: обычный забой — правим и хвост отката
+            {
+                if (ctrl || alt || win) // Ctrl+Backspace = удалить слово — откат небезопасен
+                {
+                    _buf.Clear();
+                    if (_undoPending) _undoTailBroken = true;
+                    return true;
+                }
+                _buf.Pop();
+                if (_undoPending && !_undoTailBroken)
+                {
+                    if (_undoTail.Count > 0) _undoTail.RemoveAt(_undoTail.Count - 1);
+                    else _undoTailBroken = true; // стёрли сам заменённый текст — откат больше не воспроизведёт историю
+                }
+                return true;
+            }
 
             if (vk == 0x0D) // Enter — проверка последнего слова перед отправкой (фича Punto)
             {
@@ -554,6 +644,13 @@ namespace OpenSwitcher.Core
                     _lastWord = _buf.Snapshot();
                     _lastWordAt = Environment.TickCount;
                 }
+                // цифры/знаки после замены — тоже хвост, иначе Break вернёт слово
+                // ПОВЕРХ них с перепутанным порядком символов
+                if (!modified && !converted && _undoPending && !_undoTailBroken && vk != 0x09)
+                {
+                    if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
+                    else _undoTailBroken = true;
+                }
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }
@@ -562,6 +659,8 @@ namespace OpenSwitcher.Core
                 vk == 0x2D || vk == 0x2E) // F-клавиши, навигация, Ins/Del
             {
                 _buf.Clear();
+                // навигация/Del сдвигают каретку или правят текст — хвост отката невоспроизводим
+                if (_undoPending) _undoTailBroken = true;
                 return true;
             }
 
@@ -575,10 +674,11 @@ namespace OpenSwitcher.Core
                 int msg = wParam.ToInt32();
                 if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN)
                 {
-                    if (_buf.Count > 0) _lastWord = _buf.Snapshot();
-                    _buf.Clear();
-                    _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
-                    _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
+                if (_buf.Count > 0) _lastWord = _buf.Snapshot();
+                _buf.Clear();
+                _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
+                _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
+                if (_undoPending) _undoTailBroken = true; // клик ломает откат (контракт)
                 }
             }
             return Native.CallNextHookEx(_mouseHook, code, wParam, lParam);
@@ -586,6 +686,8 @@ namespace OpenSwitcher.Core
 
         private void WinEventProcHandler(IntPtr hHook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
         {
+            if (TestInjectMode)
+                Log("fg-event: hwnd=" + hwnd.ToInt64().ToString("X") + " (was " + _fgHwnd.ToInt64().ToString("X") + ")");
             if (_buf.Count > 0) _lastWord = _buf.Snapshot();
             _buf.Clear();
             _anyKeySinceShift = true;
@@ -611,6 +713,12 @@ namespace OpenSwitcher.Core
             int vk = (int)(k.vkCode & 0xFF);
             if (_tapVk == 0 || vk != _tapVk) return true;
 
+            // тап одноразовый: после отпускания клавиши disarm, иначе осиротевший
+            // KEYUP той же клавиши (Alt+Tab, инжекция, гонка с двойным Shift)
+            // спровоцирует повторное переключение раскладки
+            int armedVk = _tapVk;
+            _tapVk = 0;
+
             bool swallow = IsSwallowableTap(vk);
             int now = Environment.TickCount;
             // тап засчитывается только «голой» клавишей: Ctrl/Alt/Win рядом — чужое сочетание
@@ -619,14 +727,13 @@ namespace OpenSwitcher.Core
             bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
             bool alone = _tapAlone && !ctrl && !alt && !win &&
                          unchecked(now - _tapDownTick) >= 0 && unchecked(now - _tapDownTick) < 700;
-            _tapAlone = false;
             if (alone)
             {
                 Log("tap fired: lang=" + _tapTarget);
                 UpdateForeground();
                 SwitchToLanguage(_tapTarget);
             }
-            return !swallow;
+            return !IsSwallowableTap(armedVk);
         }
 
         /// <summary>Переключить раскладку переднего окна на конкретный язык (0 ру, 1 эн).</summary>
@@ -668,7 +775,8 @@ namespace OpenSwitcher.Core
             string why = null;
             if (S.Paused) why = "paused";
             else if (word == null || word.Count < S.MinWordLen) why = "too-short (" + (word == null ? 0 : word.Count) + ")";
-            else if (!manual && S.LockAutoAfterManualSwitch && _autoLocked) why = "locked";
+            else if (!manual && S.LockAutoAfterManualSwitch && _autoLocked)
+                why = "locked (hkl=" + _fgHkl.ToInt64().ToString("X8") + " hwnd=" + _fgHwnd.ToInt64().ToString("X") + ")";
             if (why != null) { Log("convert skip: " + why); return false; }
 
             UpdateForeground();
@@ -716,6 +824,17 @@ namespace OpenSwitcher.Core
             if (!pass && acceptedWord)
                 pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
 
+            // Частотный пол цели (EN -0.05 / RU -0.55) режет и настоящие слова с редкими
+            // биграммами ('что' ниже пола: пары 'чт' нет в таблице). Если цель — словарное
+            // слово, а набранное — нет, скорингу верить нельзя: словарь перевешивает
+            // (selftest давно ожидал это правило — в движке его не было).
+            if (!pass && !acceptedWord && WordDict.Has(best.Text, best.Lang) &&
+                !WordDict.Has(cur.Text, cur.Lang))
+            {
+                pass = true;
+                Log("convert: dict-over-score ('" + cur.Text + "' -> '" + best.Text + "')");
+            }
+
             // словарная валидация результата — действует всегда, даже для accepted:
             // мусорный результат в буфер не вставляем
             string dictSkip = null;
@@ -734,22 +853,45 @@ namespace OpenSwitcher.Core
                     double need = LanguageTables.BaseMargin *
                                   (acceptedWord ? 1.0 : 2.0) /
                                   Math.Max(0.3, S.Sensitivity);
-                    if (best.Score - cur.Score < need) pass = false;
+                    if (best.Score - cur.Score < need)
+                    {
+                        dictSkip = "both-not-in-dict, margin";
+                        pass = false;
+                    }
                 }
+            }
+            // СТРОП: решение обязано быть положительным, иначе конвертируем МУСОР.
+            // (раньше pass вычислялся, но не проверялся — из-за этого в журнал
+            // попадали «convert OK: 'так' -> 'nfr'», которых не должно быть)
+            if (!pass)
+            {
+                Log("convert skip: score" + (dictSkip != null ? "/" + dictSkip : "") +
+                    " ('" + cur.Text + "' -> '" + best.Text + "')");
+                return false;
             }
 
             // юзер мог держать Shift/Ctrl (хоткей же с модификатором) — инжекция
             // с зажатыми модификаторами даёт Ctrl+Shift+C и управляющие символы
             TextConverter.ReleaseModifiers();
             TextConverter.InjectMode = S.InputMode;
-            TextConverter.FocusHwnd = _fgFocus;
+            // ВАЖНО: без fallback на _fgHwnd (когда GetGUIThreadInfo не дал hwndFocus)
+            // FocusHwnd оставался Zero — канал сообщений молча отключался, и всё
+            // уходило через SendInput, который гасит COMODO HIPS.
+            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+            if (_fgFocus == IntPtr.Zero)
+                Log("convert warn: no hwndFocus, messages go to fg window");
 
-            Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk + ")");
+            Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk +
+                ", mode=" + (TextConverter.InjectMode == 1 ? "msg" : "sendinput") + ")");
             _lastWord = word;
 
             Suppress(600);
             TextConverter.SendBackspaces(word.Count);
             TextConverter.SendUnicode(best.Text);
+            if (TextConverter.LastSendInputRequested > 0)
+                Log("inj: sendinput accepted " + TextConverter.LastSendInputResult + "/" +
+                    TextConverter.LastSendInputRequested +
+                    (TextConverter.LastSendInputResult == 0 ? " — BLOCKED (HIPS/антивирус?)" : ""));
             if (resendVk != 0) TextConverter.SendKey(resendVk, false, resendShift); // досылаем проглоченный разделитель/Enter
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
@@ -765,6 +907,10 @@ namespace OpenSwitcher.Core
             _undoHwnd = _fgHwnd;
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
+            // новая точка отката — хвост от ПРЕДЫДУЩЕЙ замены не имеет права
+            // сюда попасть, иначе Break стирал/возвращал чужие символы
+            _undoTail.Clear();
+            _undoTailBroken = false;
 
             string acceptedTyped = cur.Text.ToLowerInvariant();
             Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
@@ -851,7 +997,13 @@ namespace OpenSwitcher.Core
             // и конвертируем его как выделенный текст (сценарий «красное слово»:
             // клик сразу после слова → Ctrl+Space)
             Log("fix-last-word: select-left path (keysSince=" + _keysSinceUndoPoint + ")");
-            TextConverter.SendCombo(0x11, 0x10, 0x25, true); // Ctrl+Shift+Left
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+            // ТОЛЬКО SendInput (allowMessages=false): posted-комбинации модификаторов
+            // чужие приложения обрабатывают нестабильно (WinUI-блокнот то выделяет,
+            // то двигает каретку) — а без выделения copy/paste цепочка ломается.
+            // Для стрелок это безопасно даже при блокировке SendInput.
+            TextConverter.SendCombo(0x11, 0x10, 0x25, true, false);
             BeginFixSelection(true);
         }
 
@@ -887,12 +1039,25 @@ namespace OpenSwitcher.Core
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
             _selTries = 0;
-            if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); }
+            RestartSelTimer();
+            Log("sel: started (baseline " + (_selBaseline != null ? _selBaseline.Length + " ch" : "empty") + ")");
+        }
+
+        private void StopSelTimer()
+        {
+            if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); _selTimer = null; }
+        }
+
+        /// <summary>Перезапуск опроса буфера. Обязателен после каждого fallback-шага:
+        /// раньше таймер уничтожался ДО fallback-веток, и цепочка
+        /// wm_copy -> Ctrl+C -> ретрай умирала молча (Shift+Break не работал вовсе).</summary>
+        private void RestartSelTimer()
+        {
+            StopSelTimer();
             _selTimer = new System.Windows.Forms.Timer();
             _selTimer.Interval = 60;
             _selTimer.Tick += SelPollTick;
             _selTimer.Start();
-            Log("sel: started (baseline " + (_selBaseline != null ? _selBaseline.Length + " ch" : "empty") + ")");
         }
 
         private void SelPollTick(object sender, EventArgs e)
@@ -922,8 +1087,7 @@ namespace OpenSwitcher.Core
             _selTries++;
             bool isNew = !string.IsNullOrEmpty(text) && (seqChanged || text != _selBaseline);
             if (!isNew && _selTries < 20) return; // ждём до ~1.2 c
-
-            if (_selTimer != null) { _selTimer.Stop(); _selTimer.Dispose(); _selTimer = null; }
+            StopSelTimer(); // опрос завершён (успех или срок); fallback-ветки перезапустят
 
             if (string.IsNullOrEmpty(text) || !seqChanged)
             {
@@ -933,7 +1097,13 @@ namespace OpenSwitcher.Core
                     _selMethod = 1; // fallback: инжекция Ctrl+C
                     _selTries = 0;
                     TextConverter.ReleaseModifiers();
-                    TextConverter.SendCombo(0x11, 0, 0x43, false);
+                    TextConverter.InjectMode = S.InputMode;
+                    TextConverter.FocusHwnd = _selFocusHwnd;
+                    // буквенное сочетание шлём ТОЛЬКО SendInput (allowMessages=false):
+                    // posted Ctrl+C без обновлённого key-state чужое приложение может
+                    // прочитать как букву 'c' поверх выделения
+                    TextConverter.SendCombo(0x11, 0, 0x43, false, false);
+                    RestartSelTimer();
                     Log("sel: wm_copy failed -> ctrl+c injection");
                     return;
                 }
@@ -943,9 +1113,12 @@ namespace OpenSwitcher.Core
                     _selPhase = 0;
                     _selTries = 0;
                     _selMethod = 0;
-                    TextConverter.SendCombo(0x11, 0x10, 0x25, true);
-                    TextConverter.SendCombo(0x11, 0x10, 0x25, true);
-                    if (_selTimer != null) _selTimer.Start();
+                    TextConverter.InjectMode = S.InputMode;
+                    TextConverter.FocusHwnd = _selFocusHwnd;
+                    // как и первая попытка — только SendInput (posted-комбо нестабильны)
+                    TextConverter.SendCombo(0x11, 0x10, 0x25, true, false);
+                    TextConverter.SendCombo(0x11, 0x10, 0x25, true, false);
+                    RestartSelTimer();
                     Log("sel: retry with 2 words left");
                     return;
                 }
@@ -969,7 +1142,9 @@ namespace OpenSwitcher.Core
             if (_selMethod == 1)
             {
                 TextConverter.ReleaseModifiers();
-                TextConverter.SendCombo(0x11, 0x56); // Ctrl+V
+                TextConverter.InjectMode = S.InputMode;
+                TextConverter.FocusHwnd = _selFocusHwnd;
+                TextConverter.SendCombo(0x11, 0, 0x56, false, false); // Ctrl+V (только SendInput)
             }
             else
             {

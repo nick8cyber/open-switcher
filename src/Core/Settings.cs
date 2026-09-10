@@ -37,7 +37,7 @@ namespace OpenSwitcher.Core
         public int HotAutoToggleMods = 0;
         public bool LockAutoAfterManualSwitch = true; // ручной выбор раскладки отключает автодетект до новой сессии
         public bool DoubleShiftSwitch = true;      // двойной Shift = отмена последней замены (как в Caramba)
-        public int InputMode = 1;                  // 0 = SendInput, 1 = сообщения окна (обход HIPS)      // двойной Shift = отмена последней замены (как в Caramba)
+        public int InputMode = 1;                  // 0 = SendInput, 1 = сообщения окна (обход HIPS)
 
         // --- система ---
         public bool ShowPopup = true;
@@ -46,7 +46,7 @@ namespace OpenSwitcher.Core
         public bool Paused = false;
         public string Exclusions = "";
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
-        public int DefaultsV = 6; // версия дефолтов (6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
+        public int DefaultsV = 7; // версия дефолтов (7 = ввод сообщениями окна включён; 6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
     }
 
     public static class SettingsStore
@@ -130,6 +130,16 @@ namespace OpenSwitcher.Core
                 s.FixOnEnter = true;
                 s.AutoConvertOnWordEnd = true;
                 s.DefaultsV = 6;
+                Save(s);
+            }
+            // v7: ввод сообщениями окна (обход HIPS-блокировки SendInput) включён по умолчанию.
+            // COMODO/антивирусы глушат SendInput от неподписанных процессов — замена
+            // «логировалась как успешная, а текст не менялся». Кто выключил тумблер
+            // после миграции — остаётся на SendInput.
+            if (s.DefaultsV < 7)
+            {
+                s.InputMode = 1;
+                s.DefaultsV = 7;
                 Save(s);
             }
             return s;

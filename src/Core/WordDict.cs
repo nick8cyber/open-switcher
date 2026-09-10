@@ -36,7 +36,15 @@ namespace OpenSwitcher.Core
             "умный глупый сильный слабый сегодня вчера завтра утром вечером сразу снова " +
             "опять обязательно вообще именно реально естественно йцукен йцукенг мудак " +
             "мудила дадут дадим дайте понял понятно сейчас короче согласен жаль бывает " +
-            "проверка проверить проверю тест тесты чел крч щас изи спасибо еще нормально";
+            "проверка проверить проверю тест тесты чел крч щас изи спасибо еще нормально " +
+            // топ частотных слов, отсутствие которых давало ложные конвертации
+            // ('что'->'xnj', 'твоему'->'ndjtve'): защита cur-in-dict их не спасала
+            "что это тебе тобой твой твоя твое твоего твоему моего моей которого которые " +
+            "такого какого моему вашему нашего вашего никакого никакого каждого любого " +
+            "него неё ними мочь могла могло делу деле года году годы лет дело поэтому " +
+            "почему значит кстати давай давайте сколько зато однако либо буквально " +
+            "подожди слушай молодец отлично супер жесть обидно ясно ура поздравляю " +
+            "удачи здорово страшно интересно";
 
         private const string EnSrc =
             "the of and to in is are was were be been being have has had do does did will " +
@@ -55,7 +63,15 @@ namespace OpenSwitcher.Core
             "watch send nice cool crazy funny boring easy hard real true false sure maybe " +
             "probably actually right wrong now later today tomorrow yesterday morning " +
             "evening just like know really qwerty iban who test tests ban tan win fail " +
-            "fixed fixer bugfix";
+            "fixed fixer bugfix " +
+            // частотные, без которых не срабатывало исправление в обратную сторону
+            // (живой режим требует, чтобы цель была словарной)
+            "what they them their which your yours whose whom mine ours myself himself " +
+            "herself themselves done doing going getting saying week month year years " +
+            "hour minutes seconds welcome awesome perfect excellent amazing terrible " +
+            "horrible beautiful interesting important available document documents " +
+            "project projects issue issues ticket commit branch merge release update " +
+            "updates error errors better well done";
 
         private static readonly HashSet<string> Ru = Make(RuSrc);
         private static readonly HashSet<string> En = Make(EnSrc);
