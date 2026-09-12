@@ -241,12 +241,13 @@ namespace OpenSwitcher.Core
             foreach (int m in new[] { modifierVk1, modifierVk2 })
             {
                 if (m == 0) continue;
-                var d = new Native.INPUT(); var u = new Native.INPUT();
-                d.type = 1; u.type = 1;
+                // только DOWN: модификатор должен быть зажат в момент нажатия vk,
+                // отпускание допишет финальный цикл (иначе Ctrl успевает отпуститься
+                // до 'C' — хромиум видит тап Ctrl и голую букву, копирования нет)
+                var d = new Native.INPUT();
+                d.type = 1;
                 d.u.ki.wVk = (ushort)m; d.u.ki.wScan = (ushort)Native.MapVirtualKeyEx((uint)m, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-                u.u.ki.wVk = (ushort)m; u.u.ki.wScan = d.u.ki.wScan;
-                u.u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
-                list.Add(d); list.Add(u);
+                list.Add(d);
             }
             var kd = new Native.INPUT(); var ku = new Native.INPUT();
             kd.type = 1; ku.type = 1;
