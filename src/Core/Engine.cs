@@ -1154,9 +1154,16 @@ namespace OpenSwitcher.Core
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            string learned = cur.Text.ToLowerInvariant();
-            Defer(delegate { RememberAccepted(learned); });
-            FireInfo("Заучено: " + cur.Text + " → " + best.Text);
+            // самообучение только безопасное: слова короче MinWordLen (одиночные буквы
+            // не несут сигнала — «заученное» будет портить каждый нормальный ввод) и
+            // уже словарные слова (их переворот — почти наверняка случайный Break по
+            // нормальному тексту, так было заражено «что»→xnj) не заучиваем
+            if (cur.Text.Length >= S.MinWordLen && !WordDict.Has(cur.Text, cur.Lang))
+            {
+                string learned = cur.Text.ToLowerInvariant();
+                Defer(delegate { RememberAccepted(learned); });
+                FireInfo("Заучено: " + cur.Text + " → " + best.Text);
+            }
             return true;
         }
 
@@ -1331,9 +1338,9 @@ namespace OpenSwitcher.Core
             Log("sel: pasted converted (" + lang + ", method=" + (_selMethod == 0 ? "wm" : "inj") + ")");
 
             // самообучение (Ctrl+Space / Break-flip): одно слово из букв — выучиваем пару,
-            // автодетект в следующий раз перевернёт его сам
-            if (_selFromFixWord && text.Length >= 2 && text.Length <= 24 &&
-                text == LanguageTables.LettersOnly(text))
+            // но только не коротыши и не словарные слова (см. комментарий в ForceConvertWord)
+            if (_selFromFixWord && text.Length >= S.MinWordLen && text.Length <= 24 &&
+                text == LanguageTables.LettersOnly(text) && !WordDict.Has(text, lang))
             {
                 string learnedSel = text.ToLowerInvariant();
                 Defer(delegate { RememberAccepted(learnedSel); });
