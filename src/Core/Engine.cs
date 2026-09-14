@@ -37,6 +37,9 @@ namespace OpenSwitcher.Core
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
+        private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
+        private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
+        private int _lastConvertTick;        // когда была последняя конвертация
         private IntPtr _expectedHkl;         // раскладка, которую ожидаем в переднем окне
         private IntPtr _expectedHwnd;        // окно, для которого ожидаем _expectedHkl
         private bool _expectedValid;
@@ -337,6 +340,33 @@ namespace OpenSwitcher.Core
                 //     от Shift в комбинациях, захват собственных клавиш gap-буфером.
                 bool selfInject = TestInjectMode && TextConverter.SelfInjectDepth > 0;
                 bool treatAsReal = !selfInject && (!injected || TestInjectMode);
+
+                // F8 — метка проблемы в журнале: юзер жмёт, когда что-то пошло не так
+                // (лишние символы, кривая замена), в лог падает снимок состояния —
+                // потом кейс ищется по строке USER MARK. Работает всегда, включая
+                // suppress-окно; НЕ глотается — F8 продолжает работать в приложении.
+                if (msg == Native.WM_KEYDOWN && (k.vkCode & 0xFF) == 0x79)
+                {
+                    _markCount++;
+                    UpdateForeground();
+                    string mBuf = _buf.Count > 0 ? LayoutService.Render(_fgHkl, _buf.Snapshot()) : "";
+                    string mLastWord = _lastWord.Count > 0 ? LayoutService.Render(_fgHkl, _lastWord) : "";
+                    Log("================ USER MARK #" + _markCount + " ================");
+                    Log("mark: proc=" + (_fgProc ?? "?") +
+                        " hwnd=" + _fgHwnd.ToInt64().ToString("X") +
+                        " hkl=" + _fgHkl.ToInt64().ToString("X8") +
+                        " buf='" + mBuf + "'" +
+                        " lastWord='" + mLastWord + "' (" + unchecked(Environment.TickCount - _lastWordAt) / 1000.0 + "s ago)" +
+                        " undo=" + (_undoPending
+                            ? "pending (" + unchecked(Environment.TickCount - _undoTick) / 1000.0 + "s, '" + _undoText + "')"
+                            : "no") +
+                        " locked=" + (_autoLocked ? 1 : 0) +
+                        " suppress=" + (Environment.TickCount < _suppressUntil ? "yes" : "no") +
+                        " mode=" + (TextConverter.InjectMode == 1 ? "msg" : "sendinput") +
+                        " lastConvert=" + _lastConvertInfo +
+                        " (" + unchecked(Environment.TickCount - _lastConvertTick) / 1000.0 + "s ago)");
+                    FireInfo("Метка #" + _markCount + " записана в лог");
+                }
 
                 // эхо-пробел: пробел, прилетающий в первые 250 мс после досланного
                 // после замены разделителя, — это второе нажатие/авторепит (юзер не
@@ -954,6 +984,8 @@ namespace OpenSwitcher.Core
 
             Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "' (resend=" + resendVk +
                 ", mode=" + (TextConverter.InjectMode == 1 ? "msg" : "sendinput") + ")");
+            _lastConvertInfo = "'" + cur.Text + "' -> '" + best.Text + "'";
+            _lastConvertTick = Environment.TickCount;
             _lastWord = word;
 
             Suppress(600);
@@ -1134,6 +1166,8 @@ namespace OpenSwitcher.Core
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             Log("force-flip: '" + cur.Text + "' -> '" + best.Text + "'");
+            _lastConvertInfo = "force '" + cur.Text + "' -> '" + best.Text + "'";
+            _lastConvertTick = Environment.TickCount;
 
             Suppress(600);
             TextConverter.SendBackspaces(word.Count);
@@ -1336,6 +1370,8 @@ namespace OpenSwitcher.Core
                 Native.PostMessage(_selFocusHwnd, Native.WM_PASTE, IntPtr.Zero, IntPtr.Zero);
             }
             Log("sel: pasted converted (" + lang + ", method=" + (_selMethod == 0 ? "wm" : "inj") + ")");
+            _lastConvertInfo = "sel '" + text + "' -> '" + converted + "'";
+            _lastConvertTick = Environment.TickCount;
 
             // самообучение (Ctrl+Space / Break-flip): одно слово из букв — выучиваем пару,
             // но только не коротыши и не словарные слова (см. комментарий в ForceConvertWord)
@@ -1497,7 +1533,7 @@ namespace OpenSwitcher.Core
             {
                 System.IO.Directory.CreateDirectory(SettingsStore.Dir);
                 string p = System.IO.Path.Combine(SettingsStore.Dir, "log.txt");
-                if (System.IO.File.Exists(p) && new System.IO.FileInfo(p).Length > 512 * 1024)
+                if (System.IO.File.Exists(p) && new System.IO.FileInfo(p).Length > 2 * 1024 * 1024)
                     System.IO.File.WriteAllText(p, "");
                 System.IO.File.AppendAllLines(p, _logBuf);
             }
