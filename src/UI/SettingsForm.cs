@@ -27,7 +27,6 @@ namespace OpenSwitcher.UI
 
         private ToggleSwitch _tEnter, _tAuto, _tDouble, _tPopup, _tClip, _tRun, _tLock, _tInputMode;
         private HotkeyBox _hkWord, _hkSel, _hkRu, _hkEn, _hkAuto, _hkUndo;
-        private NumBox _numLen;
         private ChoiceSeg _segSens, _segTheme;
         private TextBox _tbExcl, _tbSandbox;
 
@@ -118,9 +117,9 @@ namespace OpenSwitcher.UI
             _tLock.Checked = _engine.S.LockAutoAfterManualSwitch;
             c1.AddRow("Не трогать после ручного выбора языка",
                 "Автодетект молчит до смены окна или приложения", _tLock, 56);
-            _numLen = new NumBox();
-            _numLen.Min = 2; _numLen.Max = 8; _numLen.Value = _engine.S.MinWordLen;
-            c1.AddRow("Минимальная длина слова", null, _numLen, 44);
+            // «Минимальная длина слова» из UI убрана: слова от 2 букв конвертятся
+            // через словарные ворота (целевое словарное + набранное нет), порог
+            // длины в решении больше не участвует
             _segSens = new ChoiceSeg();
             _segSens.Items = new[] { "Низкая", "Средняя", "Высокая" };
             _segSens.SelectedIndex = _engine.S.Sensitivity <= 0.85 ? 0 : (_engine.S.Sensitivity >= 1.25 ? 2 : 1);
@@ -400,7 +399,6 @@ namespace OpenSwitcher.UI
             _tAuto.Checked = s.AutoConvertOnWordEnd;
             _tEnter.Checked = s.FixOnEnter;
             _tLock.Checked = s.LockAutoAfterManualSwitch;
-            _numLen.Value = s.MinWordLen;
             _segSens.SelectedIndex = s.Sensitivity <= 0.85 ? 0 : (s.Sensitivity >= 1.25 ? 2 : 1);
             _hkWord.Vk = s.HotFixWordVk; _hkWord.Mods = s.HotFixWordMods;
             _hkSel.Vk = s.HotFixSelVk; _hkSel.Mods = s.HotFixSelMods;
@@ -424,7 +422,6 @@ namespace OpenSwitcher.UI
             s.AutoConvertOnWordEnd = _tAuto.Checked;
             s.FixOnEnter = _tEnter.Checked;
             s.LockAutoAfterManualSwitch = _tLock.Checked;
-            s.MinWordLen = _numLen.Value;
             s.Sensitivity = _segSens.SelectedIndex == 0 ? 0.7 : (_segSens.SelectedIndex == 2 ? 1.5 : 1.0);
             s.HotFixWordVk = _hkWord.Vk;
             s.HotFixWordMods = _hkWord.Mods;

@@ -52,6 +52,7 @@ namespace OpenSwitcher.Core
         private string _undoSepText = "";    // разделитель после слова, как его напечатал юзер (в старой раскладке)
         private IntPtr _undoHkl;             // раскладка до замены
         private IntPtr _undoHwnd;            // окно, где была замена
+        private IntPtr _undoFocus;           // поле ввода, где была замена (фокус внутри окна)
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
         public static bool TestInjectMode;   // ВРЕМЕННО: трактовать инжектированный ввод как настоящий
@@ -320,7 +321,7 @@ namespace OpenSwitcher.Core
             {
                 string p = part.Trim();
                 if (p.Length == 0) continue;
-                if (_fgProc == p || _fgProc.EndsWith(p) || _fgProc.Contains(p)) return true;
+                if (_fgProc == p) return true;
             }
             return false;
         }
@@ -427,6 +428,21 @@ namespace OpenSwitcher.Core
                     else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
                     {
                         if (treatAsReal && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
+                    }
+                }
+                else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
+                         IsLetterVk((int)(k.vkCode & 0xFF)))
+                {
+                    // suppress-окно: конвертация запрещена, но БУФЕР синхронизируем —
+                    // иначе следующая конвертация сотрёт меньше, чем юзер успел набрать тут
+                    bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+                    bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
+                    var recS = new KeyRec((int)(k.vkCode & 0xFF), sh, cp);
+                    _buf.Push(recS);
+                    if (_undoPending && !_undoTailBroken)
+                    {
+                        if (_undoTail.Count < 16) _undoTail.Add(recS);
+                        else _undoTailBroken = true;
                     }
                 }
             }
@@ -1037,7 +1053,11 @@ namespace OpenSwitcher.Core
             // точка отката: Break вернёт исходное слово и раскладку.
             // Только для замен по разделителю — после Enter строка уже ушла в
             // приложение, откат стирал бы переносы
-            _undoPending = resendVk != 0x0D;
+            // точка отката ставится только если замена реально доставлена: при
+            // полностью погашенной инжекции (HIPS) текст не изменился — армng отката
+            // стирал бы РЕАЛЬНЫЕ символы юзера при последующем Break
+            bool injOk = TextConverter.LastSendInputRequested == 0 || TextConverter.LastSendInputResult > 0;
+            _undoPending = resendVk != 0x0D && injOk;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
             _undoSepText = (resendVk != 0 && resendVk != 0x0D)
@@ -1045,6 +1065,7 @@ namespace OpenSwitcher.Core
                 : "";
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
+            _undoFocus = _fgFocus;
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
             // новая точка отката — хвост от ПРЕДЫДУЩЕЙ замены не имеет права
@@ -1055,7 +1076,7 @@ namespace OpenSwitcher.Core
             // авто-заучивание только от 3 букв: коротыш ('су'->'ce' по запятой) не имеет
             // права вечно портить ввод из-за одного случайного переворота. Коротким
             // парам — осознанное обучение через Break (ForceConvertWord)
-            if (cur.Text.Length >= 3)
+            if (injOk && cur.Text.Length >= 3)
             {
                 string acceptedTyped = cur.Text.ToLowerInvariant();
                 Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
@@ -1088,6 +1109,9 @@ namespace OpenSwitcher.Core
             if (_undoTailBroken) { Log("undo skip: tail broken"); FireInfo("Слишком много набрано после"); return; }
             UpdateForeground();
             if (_undoHwnd != _fgHwnd) { Log("undo skip: other window"); FireInfo("Уже в другом окне"); return; }
+            // то же окно, но другой фокус ввода (второе поле формы) — откат уйдёт в чужое поле
+            if (_undoFocus != IntPtr.Zero && _fgFocus != IntPtr.Zero && _undoFocus != _fgFocus)
+            { Log("undo skip: other focus"); FireInfo("Уже в другом поле"); return; }
             int age = unchecked(Environment.TickCount - _undoTick);
             if (age < 0 || age > 15000) { Log("undo skip: stale " + age); FireInfo("Слишком поздно"); return; }
 
@@ -1225,6 +1249,7 @@ namespace OpenSwitcher.Core
             _undoSepText = "";
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
+            _undoFocus = _fgFocus;
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
             _undoTail.Clear();
