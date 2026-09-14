@@ -341,11 +341,11 @@ namespace OpenSwitcher.Core
                 bool selfInject = TestInjectMode && TextConverter.SelfInjectDepth > 0;
                 bool treatAsReal = !selfInject && (!injected || TestInjectMode);
 
-                // F8 — метка проблемы в журнале: юзер жмёт, когда что-то пошло не так
+                // F8 (VK_F8 = 0x77) — метка проблемы в журнале: юзер жмёт, когда что-то пошло не так
                 // (лишние символы, кривая замена), в лог падает снимок состояния —
                 // потом кейс ищется по строке USER MARK. Работает всегда, включая
                 // suppress-окно; НЕ глотается — F8 продолжает работать в приложении.
-                if (msg == Native.WM_KEYDOWN && (k.vkCode & 0xFF) == 0x79)
+                if (msg == Native.WM_KEYDOWN && (k.vkCode & 0xFF) == 0x77)
                 {
                     _markCount++;
                     UpdateForeground();
@@ -363,8 +363,9 @@ namespace OpenSwitcher.Core
                         " locked=" + (_autoLocked ? 1 : 0) +
                         " suppress=" + (Environment.TickCount < _suppressUntil ? "yes" : "no") +
                         " mode=" + (TextConverter.InjectMode == 1 ? "msg" : "sendinput") +
-                        " lastConvert=" + _lastConvertInfo +
-                        " (" + unchecked(Environment.TickCount - _lastConvertTick) / 1000.0 + "s ago)");
+                        " lastConvert=" + (_lastConvertInfo == "-"
+                            ? "none"
+                            : _lastConvertInfo + " (" + unchecked(Environment.TickCount - _lastConvertTick) / 1000.0 + "s ago)"));
                     FireInfo("Метка #" + _markCount + " записана в лог");
                 }
 
