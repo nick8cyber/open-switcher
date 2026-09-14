@@ -37,6 +37,8 @@ namespace OpenSwitcher.Core
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
+        private int _lastPassedSepVk;        // разделитель, прошедший в текст при пустом буфере (начало слова в чужой раскладке)
+        private int _lastPassedSepTick;      // когда он прошёл — для ретрофита (',лять' -> 'блять')
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
         private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
         private int _lastConvertTick;        // когда была последняя конвертация
@@ -657,34 +659,17 @@ namespace OpenSwitcher.Core
 
             if (vk >= 0x41 && vk <= 0x5A)
             {
-                int nowTick = Environment.TickCount;
-                // live-конвертация уместна только после ПАУЗЫ в наборе: непрерывный поток
-                // букв — это ещё не законченное слово, и переворот словарного ПРЕФИКСА
-                // («ghb»->«при» внутри «ghbdtn») давал «приветвте» вместо «привет».
-                // Требуем >= LivePauseMs от предыдущей буквы; при непрерывном наборе
-                // слово честно ловится по разделителю (пробел/Enter).
-                bool livePause = _buf.Count == 0 ||
-                    (unchecked(nowTick - _lastBufTick) >= 0 && unchecked(nowTick - _lastBufTick) >= LivePauseMs);
                 KeyRec rec = new KeyRec(vk, shift, caps);
                 _buf.Push(rec);
-                _lastBufTick = nowTick;
-                bool liveConverted = false;
+                _lastBufTick = Environment.TickCount;
 
-                // ЖИВОЕ ИСПРАВЛЕНИЕ (базовая механика Caramba): слово переворачивается
-                // сразу, как только набрано достаточно букв — юзер не видит целое слово
-                // не в той раскладке. Shift при наборе заглавных — норма, Ctrl/Alt — нет.
-                if (livePause && !ctrl && !alt && !win && S.AutoConvertOnWordEnd && _buf.Count >= S.MinWordLen)
-                {
-                    List<KeyRec> word = _buf.Snapshot();
-                    if (TryConvertWord(word, 0, false, false))
-                    {
-                        _buf.Clear();
-                        liveConverted = true; // эта буква уже внутри заменённого слова — в хвост ей нельзя
-                    }
-                }
+                // ЖИВОЕ ИСПРАВЛЕНИЕ УДАЛЕНО: переворот до разделителя — это конвертация
+                // недопечатанного слова прямо под пальцами (юзер жмёт дальше, инжекция
+                // вклинивается — получаются 'ce,,fuента'). Слово ловится строго по
+                // разделителю (пробел/знак/Enter).
 
                 // хвост отката: запоминаем, что юзер напечатал после замены
-                if (!liveConverted && _undoPending && !_undoTailBroken && !ctrl && !alt && !win)
+                if (_undoPending && !_undoTailBroken && !ctrl && !alt && !win)
                 {
                     if (_undoTail.Count < 16) _undoTail.Add(rec);
                     else _undoTailBroken = true;
@@ -757,6 +742,14 @@ namespace OpenSwitcher.Core
                     if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
                     else _undoTailBroken = true;
                 }
+                // разделитель, прошедший в текст при пустом буфере (начало слова в
+                // чужой раскладке: 'б'-книга даёт ',' мгновенно), запоминаем —
+                // если следом конвертнётся слово, ретрофитнем его в новую раскладку
+                if (!converted && !modified && !S.Paused)
+                {
+                    if (_buf.Count == 0) { _lastPassedSepVk = vk; _lastPassedSepTick = Environment.TickCount; }
+                }
+                else _lastPassedSepVk = 0;
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }
@@ -874,6 +867,16 @@ namespace OpenSwitcher.Core
 
         // ------------------------------------------------------------------ Действия
 
+        /// <summary>Что печатает клавиша в данной раскладке (для ретрофита разделителей).</summary>
+        private static string RenderKeyChar(int vk, IntPtr hkl)
+        {
+            var ks = new byte[256];
+            var sb = new System.Text.StringBuilder(8);
+            uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, hkl);
+            int n = Native.ToUnicodeEx((uint)vk, sc, ks, sb, sb.Capacity, 0, hkl);
+            return n > 0 ? sb.ToString(0, n) : "";
+        }
+
         /// <summary>Попытка конвертации слова; manual=true — вызов явным хоткеем (игнорирует лок).
         /// resendVk — проглоченный разделитель (пробел/OEM) или Enter, который надо дослать после.</summary>
         private bool TryConvertWord(List<KeyRec> word, int resendVk, bool resendShift, bool manual)
@@ -961,14 +964,24 @@ namespace OpenSwitcher.Core
                 }
                 else if (!targetInDict && !curInDict)
                 {
-                    // оба не словарные — нужен усиленный запас
-                    double need = LanguageTables.BaseMargin *
-                                  (acceptedWord ? 1.0 : 2.0) /
-                                  Math.Max(0.3, S.Sensitivity);
-                    if (best.Score - cur.Score < need)
+                    // оба не словарные: для коротких слов (<=3) переворота не бывает вовсе —
+                    // скоринг слишком легко пропускал мусор ('ще'->'ot', 'djj'->'воо',
+                    // 'rffz'->'каая'); такое только руками (Break + самообучение).
+                    // Длинным нужен усиленный запас
+                    if (best.Text.Length <= 3)
                     {
-                        dictSkip = "both-not-in-dict, margin";
+                        dictSkip = "both-not-in-dict, short";
                         pass = false;
+                    }
+                    else
+                    {
+                        double need = LanguageTables.BaseMargin /
+                                      Math.Max(0.3, S.Sensitivity);
+                        if (best.Score - cur.Score < need)
+                        {
+                            dictSkip = "both-not-in-dict, margin";
+                            pass = false;
+                        }
                     }
                 }
             }
@@ -999,8 +1012,23 @@ namespace OpenSwitcher.Core
             _lastConvertTick = Environment.TickCount;
             _lastWord = word;
 
+            // ретрофит разделителя перед словом (',kznm' -> 'блять'): если прямо перед
+            // конвертнутым словом прошёл разделитель, который в старой раскладке
+            // печатает не то, что в новой (',' : EN=',', RU='б'), — доедаем его
+            // бэкспейсом и перепечатываем в уже переключенной раскладке
+            int retroSepVk = 0;
+            if (_lastPassedSepVk != 0 && resendVk != _lastPassedSepVk &&
+                unchecked(Environment.TickCount - _lastPassedSepTick) < 3000)
+            {
+                string oldR = RenderKeyChar(_lastPassedSepVk, _fgHkl);
+                string newR = RenderKeyChar(_lastPassedSepVk, best.Hkl);
+                if (!string.IsNullOrEmpty(newR) && oldR != newR) retroSepVk = _lastPassedSepVk;
+            }
+            _lastPassedSepVk = 0;
+
             Suppress(600);
-            TextConverter.SendBackspaces(word.Count);
+            TextConverter.SendBackspaces(word.Count + (retroSepVk != 0 ? 1 : 0));
+            if (retroSepVk != 0) TextConverter.SendKey(retroSepVk, false, false); // разделитель в новом языке
             TextConverter.SendUnicode(best.Text);
             if (TextConverter.LastSendInputRequested > 0)
                 Log("inj: sendinput accepted " + TextConverter.LastSendInputResult + "/" +
@@ -1027,8 +1055,14 @@ namespace OpenSwitcher.Core
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            string acceptedTyped = cur.Text.ToLowerInvariant();
-            Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
+            // авто-заучивание только от 3 букв: коротыш ('су'->'ce' по запятой) не имеет
+            // права вечно портить ввод из-за одного случайного переворота. Коротким
+            // парам — осознанное обучение через Break (ForceConvertWord)
+            if (cur.Text.Length >= 3)
+            {
+                string acceptedTyped = cur.Text.ToLowerInvariant();
+                Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
+            }
 
             FireConverted(cur.Text, best.Text);
             return true;
@@ -1199,11 +1233,12 @@ namespace OpenSwitcher.Core
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            // самообучение только безопасное: слова короче MinWordLen (одиночные буквы
+            // самообучение безопасное: слова короче 2 букв (одиночные буквы
             // не несут сигнала — «заученное» будет портить каждый нормальный ввод) и
             // уже словарные слова (их переворот — почти наверняка случайный Break по
-            // нормальному тексту, так было заражено «что»→xnj) не заучиваем
-            if (cur.Text.Length >= S.MinWordLen && !WordDict.Has(cur.Text, cur.Lang))
+            // нормальному тексту, так было заражено «что»→xnj) не заучиваем.
+            // 2-буквенные ЗАУЧИВАЕМ: юзер сам учит сленг ('et'->'уе')
+            if (cur.Text.Length >= 2 && !WordDict.Has(cur.Text, cur.Lang))
             {
                 string learned = cur.Text.ToLowerInvariant();
                 Defer(delegate { RememberAccepted(learned); });
