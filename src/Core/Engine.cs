@@ -37,8 +37,6 @@ namespace OpenSwitcher.Core
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
-        private int _lastPassedSepVk;        // разделитель, прошедший в текст при пустом буфере (начало слова в чужой раскладке)
-        private int _lastPassedSepTick;      // когда он прошёл — для ретрофита (',лять' -> 'блять')
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
         private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
         private int _lastConvertTick;        // когда была последняя конвертация
@@ -51,15 +49,12 @@ namespace OpenSwitcher.Core
         private bool _undoPending;
         private string _undoText = "";       // что было набрано (до замены)
         private int _undoLen;                // длина заменённого текста (сколько стирать)
-        private int _undoSep;                // был ли проглочен разделитель (пробел/знак)
+        private string _undoSepText = "";    // разделитель после слова, как его напечатал юзер (в старой раскладке)
         private IntPtr _undoHkl;             // раскладка до замены
         private IntPtr _undoHwnd;            // окно, где была замена
         private int _undoTick;
         private int _keysSinceUndoPoint;     // нажатий после замены: >0 — откат небезопасен
-        private int _lastBufTick;            // тикант предыдущей буквы буфера (пауза для live)
         public static bool TestInjectMode;   // ВРЕМЕННО: трактовать инжектированный ввод как настоящий
-        /// <summary>Пауза набора (мс), после которой разрешена live-конвертация слова.</summary>
-        internal const int LivePauseMs = 500;
         private List<KeyRec> _undoTail = new List<KeyRec>(); // хвост: что юзер напечатал после замены
         private bool _undoTailBroken;        // хвост испорчен (enter/cap) — откат запрещён
 
@@ -239,6 +234,7 @@ namespace OpenSwitcher.Core
                 if (TestInjectMode)
                     Log("window-switch: " + _fgHwnd.ToInt64().ToString("X") + " (was " + prevHwnd.ToInt64().ToString("X") + ")");
                 _autoLocked = false;
+                _lastResendSpaceTick = 0; // окно эха пробела не переносится в другое окно
                 _undoPending = false;
                 _undoTailBroken = true;
                 _buf.Clear();
@@ -554,8 +550,8 @@ namespace OpenSwitcher.Core
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             Log("backspace-cancel: " + _undoText);
-            int bs2 = _undoLen + _undoSep + _undoTail.Count;
-                    string restore2 = _undoText + (_undoSep == 1 ? " " : "") +
+            int bs2 = _undoLen + _undoSepText.Length + _undoTail.Count;
+                    string restore2 = _undoText + _undoSepText +
                                       (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
                     Suppress(600);
                     TextConverter.SendBackspaces(bs2);
@@ -639,14 +635,15 @@ namespace OpenSwitcher.Core
                 }
                 else
                 {
-                    if (vk >= 0x41 && vk <= 0x5A)
+                    if (IsLetterVk(vk))
                     {
                         _gapBuf.Add(new KeyRec(vk, shift, caps));
                         return false; // глотаем: доставим после применения раскладки
                     }
                     if (vk == 0x08)
                     {
-                        if (_gapBuf.Count > 0) _gapBuf.RemoveAt(_gapBuf.Count - 1);
+                        if (_gapBuf.Count == 0) return true; // откладывать нечего — backspace проходит как есть
+                        _gapBuf.RemoveAt(_gapBuf.Count - 1);
                         return false;
                     }
                     FlushGap();
@@ -657,11 +654,11 @@ namespace OpenSwitcher.Core
             // ---- дальше — только авто-логика; в исключённых приложениях глушим
             if (IsExcludedHere()) { _buf.Clear(); return true; }
 
-            if (vk >= 0x41 && vk <= 0x5A)
+            if (IsLetterVk(vk))
             {
                 KeyRec rec = new KeyRec(vk, shift, caps);
                 _buf.Push(rec);
-                _lastBufTick = Environment.TickCount;
+
 
                 // ЖИВОЕ ИСПРАВЛЕНИЕ УДАЛЕНО: переворот до разделителя — это конвертация
                 // недопечатанного слова прямо под пальцами (юзер жмёт дальше, инжекция
@@ -717,8 +714,10 @@ namespace OpenSwitcher.Core
 
             if (vk == 0x09 || vk == 0x1B) { _buf.Clear(); return true; } // Tab / Esc
 
+            // настоящие разделители — знаки В ОБОИХ раскладках (пробел, цифры, '=', '.', '\').
+            // б/ю/ж/э/х/ъ/ё-клавиши — буквы (IsLetterVk), слово они не заканчивают
             if (vk == 0x20 || (vk >= 0x30 && vk <= 0x39) ||
-                (vk >= 0xBA && vk <= 0xC0) || (vk >= 0xDB && vk <= 0xDF)) // пробел, цифры, OEM-знаки
+                vk == 0xBB || vk == 0xBF || vk == 0xDD)
             {
                 // при зажатых модификаторах (шорткаты) не вмешиваемся
                 bool modified = ctrl || alt || win || shift;
@@ -742,14 +741,6 @@ namespace OpenSwitcher.Core
                     if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
                     else _undoTailBroken = true;
                 }
-                // разделитель, прошедший в текст при пустом буфере (начало слова в
-                // чужой раскладке: 'б'-книга даёт ',' мгновенно), запоминаем —
-                // если следом конвертнётся слово, ретрофитнем его в новую раскладку
-                if (!converted && !modified && !S.Paused)
-                {
-                    if (_buf.Count == 0) { _lastPassedSepVk = vk; _lastPassedSepTick = Environment.TickCount; }
-                }
-                else _lastPassedSepVk = 0;
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }
@@ -867,10 +858,22 @@ namespace OpenSwitcher.Core
 
         // ------------------------------------------------------------------ Действия
 
-        /// <summary>Что печатает клавиша в данной раскладке (для ретрофита разделителей).</summary>
-        private static string RenderKeyChar(int vk, IntPtr hkl)
+        /// <summary>Буквенная ли клавиша: латиница + РУССКИЕ БУКВЫ НА ЗНАКОВЫХ КЛАВИШАХ
+        /// (б=0xBC ',', ю=0xBD '.', ж=0xBA ';', э=0xDE ''', х=0xDB '[', ъ=0xDC ']', ё=0xC0 '`').
+        /// В чужой раскладке они выглядят разделителями и рвут слово посередине
+        /// («вообще» = "djj,ot" разваливалось на «воо» + б + "ot"); по решению — буквы,
+        /// рендер по фактической раскладке (как в Caramba: пунктуация в языковой модели).</summary>
+        private static bool IsLetterVk(int vk)
+        {
+            return (vk >= 0x41 && vk <= 0x5A) || vk == 0xBA || vk == 0xBC || vk == 0xBD ||
+                   vk == 0xC0 || vk == 0xDB || vk == 0xDC || vk == 0xDE;
+        }
+
+        /// <summary>Что печатает клавиша в данной раскладке (для досылки/отката разделителей).</summary>
+        private static string RenderKeyChar(int vk, IntPtr hkl, bool shift)
         {
             var ks = new byte[256];
+            if (shift) ks[0x10] = 0x80;
             var sb = new System.Text.StringBuilder(8);
             uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, hkl);
             int n = Native.ToUnicodeEx((uint)vk, sc, ks, sb, sb.Capacity, 0, hkl);
@@ -1012,29 +1015,21 @@ namespace OpenSwitcher.Core
             _lastConvertTick = Environment.TickCount;
             _lastWord = word;
 
-            // ретрофит разделителя перед словом (',kznm' -> 'блять'): если прямо перед
-            // конвертнутым словом прошёл разделитель, который в старой раскладке
-            // печатает не то, что в новой (',' : EN=',', RU='б'), — доедаем его
-            // бэкспейсом и перепечатываем в уже переключенной раскладке
-            int retroSepVk = 0;
-            if (_lastPassedSepVk != 0 && resendVk != _lastPassedSepVk &&
-                unchecked(Environment.TickCount - _lastPassedSepTick) < 3000)
-            {
-                string oldR = RenderKeyChar(_lastPassedSepVk, _fgHkl);
-                string newR = RenderKeyChar(_lastPassedSepVk, best.Hkl);
-                if (!string.IsNullOrEmpty(newR) && oldR != newR) retroSepVk = _lastPassedSepVk;
-            }
-            _lastPassedSepVk = 0;
-
             Suppress(600);
-            TextConverter.SendBackspaces(word.Count + (retroSepVk != 0 ? 1 : 0));
-            if (retroSepVk != 0) TextConverter.SendKey(retroSepVk, false, false); // разделитель в новом языке
+            TextConverter.SendBackspaces(word.Count);
             TextConverter.SendUnicode(best.Text);
             if (TextConverter.LastSendInputRequested > 0)
                 Log("inj: sendinput accepted " + TextConverter.LastSendInputResult + "/" +
                     TextConverter.LastSendInputRequested +
                     (TextConverter.LastSendInputResult == 0 ? " — BLOCKED (HIPS/антивирус?)" : ""));
-            if (resendVk != 0) TextConverter.SendKey(resendVk, false, resendShift); // досылаем проглоченный разделитель/Enter
+            // досылаем проглоченный разделитель СИМВОЛОМ, как его напечатал юзер в
+            // СТАРОЙ раскладке (',' остаётся ',', а не «б» от новой), Enter — клавишей,
+            // т.к. SendUnicode не передаёт \r
+            if (resendVk != 0)
+            {
+                if (resendVk == 0x0D) TextConverter.SendKey(0x0D, false, false);
+                else TextConverter.SendUnicode(RenderKeyChar(resendVk, _fgHkl, resendShift));
+            }
             if (resendVk == 0x20) _lastResendSpaceTick = Environment.TickCount; // окно глотания «эха» пробела
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
@@ -1045,7 +1040,9 @@ namespace OpenSwitcher.Core
             _undoPending = resendVk != 0x0D;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
-            _undoSep = (resendVk != 0 && resendVk != 0x0D) ? 1 : 0;
+            _undoSepText = (resendVk != 0 && resendVk != 0x0D)
+                ? RenderKeyChar(resendVk, _fgHkl, resendShift)
+                : "";
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoTick = Environment.TickCount;
@@ -1097,8 +1094,8 @@ namespace OpenSwitcher.Core
             TextConverter.ReleaseModifiers();
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-            int bs = _undoLen + _undoSep + _undoTail.Count;
-            string restore = _undoText + (_undoSep == 1 ? " " : "") +
+            int bs = _undoLen + _undoSepText.Length + _undoTail.Count;
+            string restore = _undoText + _undoSepText +
                              (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
             Suppress(600);
             TextConverter.SendBackspaces(bs);
@@ -1225,7 +1222,7 @@ namespace OpenSwitcher.Core
             _undoPending = true;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
-            _undoSep = 0;
+            _undoSepText = "";
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoTick = Environment.TickCount;
