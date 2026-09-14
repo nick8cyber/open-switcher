@@ -117,10 +117,16 @@ namespace OpenSwitcher.Core
 
             // watchdog: раз в 60 с переустанавливаем LL-хуки — Windows молча снимает их,
             // если колбэк хоть раз сработал медленнее таймаута (типичная «внезапная смерть»)
-            _hookWatchdog = new System.Windows.Forms.Timer { Interval = 60000 };
+            _hookWatchdog = new System.Windows.Forms.Timer { Interval = 10000 };
             _hookWatchdog.Tick += delegate
             {
-                try { ReinstallHooks(); Log("watchdog: hooks reinstalled"); }
+                try
+                {
+                    bool wasDead = _kbHook == IntPtr.Zero;
+                    ReinstallHooks();
+                    if (wasDead) Log("hook REVIVED after death"); // слепое окно было — события не доставлялись
+                    Log("watchdog: hooks reinstalled");
+                }
                 catch (Exception) { }
             };
             _hookWatchdog.Start();
