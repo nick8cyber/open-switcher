@@ -879,8 +879,12 @@ namespace OpenSwitcher.Core
         private bool TryConvertWord(List<KeyRec> word, int resendVk, bool resendShift, bool manual)
         {
             string why = null;
+            // пол в 2 буквы (а не MinWordLen): 2-буквенные слова идут через обычные
+            // словарные ворота — переворот только если цель словарная, а набранное
+            // нет ('ye'->'ну', 'yt'->'не'); словарные 'to','ok','he' защищены
+            // cur-in-dict. Одиночные буквы не обрабатываем вовсе — сигнала ноль.
             if (S.Paused) why = "paused";
-            else if (word == null || word.Count < S.MinWordLen) why = "too-short (" + (word == null ? 0 : word.Count) + ")";
+            else if (word == null || word.Count < 2) why = "too-short (" + (word == null ? 0 : word.Count) + ")";
             else if (!manual && S.LockAutoAfterManualSwitch && _autoLocked)
                 why = "locked (hkl=" + _fgHkl.ToInt64().ToString("X8") + " hwnd=" + _fgHwnd.ToInt64().ToString("X") + ")";
             if (why != null) { Log("convert skip: " + why); return false; }

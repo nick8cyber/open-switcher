@@ -64,6 +64,9 @@ namespace OpenSwitcher.Core
             "probably actually right wrong now later today tomorrow yesterday morning " +
             "evening just like know really qwerty iban who test tests ban tan win fail " +
             "fixed fixer bugfix " +
+            // двухбуквенные местоимения/предлоги/союзы: без них 2-буквенный порог
+            // переворачивал бы 'he'->'не', 'me'->'ьу', 'we'->'це' при нормальном EN
+            "an as am we he me my us if or ah oh eh " +
             // частотные, без которых не срабатывало исправление в обратную сторону
             // (живой режим требует, чтобы цель была словарной)
             "what they them their which your yours whose whom mine ours myself himself " +
