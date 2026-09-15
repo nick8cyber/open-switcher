@@ -37,6 +37,7 @@ namespace OpenSwitcher.Core
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
+        private int _wdTicks;                // счётчик тиков watchdog'а (heartbeat раз в 10 тиков)
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
         private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
         private int _lastConvertTick;        // когда была последняя конвертация
@@ -122,8 +123,8 @@ namespace OpenSwitcher.Core
                 {
                     bool wasDead = _kbHook == IntPtr.Zero;
                     ReinstallHooks();
-                    if (wasDead) Log("hook REVIVED after death"); // слепое окно было — события не доставлялись
-                    Log("watchdog: hooks reinstalled");
+                    if (wasDead) Log("hook REVIVED after death");
+                    else if (++_wdTicks % 10 == 0) Log("watchdog: heartbeat ok"); // раз в 100 с, не спамим
                 }
                 catch (Exception) { }
             };
@@ -940,6 +941,16 @@ namespace OpenSwitcher.Core
                 if (best == null || c.Score > best.Score) best = c;
             }
             if (best == null) { Log("convert skip: no candidate"); return false; }
+
+            // цель обязана быть чисто из букв: переворот, вставляющий внутрь слова
+            // запятую/скобку/апостроф ('дубках'->'le,rf[' по Enter, 'сверху'->'cdth[e')
+            // — почти всегда мусор редких биграмм; заодно это защищает все слова
+            // с б/ю/ж/э/х/ъ/ё от переворота в их «знаковое» английское прочтение
+            if (!manual && !acceptedWord && best.Text != LanguageTables.LettersOnly(best.Text))
+            {
+                Log("convert skip: target-not-letters ('" + best.Text + "')");
+                return false;
+            }
 
             // ЖИВОЙ режим: переворачиваем только если результат — знакомое слово.
             // Посреди набора частотный скоринг шумит ('муд'->'vel' на правильном «мудаке»),
