@@ -959,11 +959,19 @@ namespace OpenSwitcher.Core
                     Log("convert skip: target-not-letters ('" + best.Text + "')");
                     return false;
                 }
-                if (!WordDict.Has(best.Text, best.Lang))
+                // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (все пары
+                // букв встречаются в языковой модели) — покрывает формы, не вошедшие в
+                // словарь ('нажимал', 'изучи'); 2-буквенные цели — только словарь
+                if (!WordDict.Has(best.Text, best.Lang) &&
+                    (best.Text.Length < 3 || !LanguageTables.PossibleWord(best.Text, best.Lang)))
                 {
                     Log("convert skip: target-not-in-dict ('" + best.Text + "')");
                     return false;
                 }
+                // ВНИМАНИЕ: «набранное — возможное русское слово» здесь проверять НЕЛЬЗЯ —
+                // wrong-layout набор ('руддщ', 'ghbdtn') тоже состоит из валидных русских
+                // пар, этим guard'ом убивается ядро программы (ghbdtn->привет).
+                // Дискриминатор правильного текста — мусорность ЧУЖОГО прочтения (ворота выше)
             }
 
             bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,

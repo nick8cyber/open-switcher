@@ -132,6 +132,26 @@ namespace OpenSwitcher.Core
             return false;
         }
 
+        /// <summary>«Возможное» слово языка: чисто из букв и КАЖДАЯ пара соседних букв
+        /// встречается в языковой модели (есть в таблице биграмм с ненулевой частотой).
+        /// Позитивная морфология: покрывает формы, не вошедшие в словарь ('нажимал':
+        /// на-аж-жи-им-ма-ал — все валидны), и отсекает мусор ('каая' — «аа», 'воо' — «оо»).
+        /// Это «невозможные/возможные сочетания» Punto и «языковая модель» Caramba.</summary>
+        public static bool PossibleWord(string word, int lang)
+        {
+            if (string.IsNullOrEmpty(word)) return false;
+            string w = word.ToLowerInvariant();
+            if (w.Length < 2 || LettersOnly(w) != w) return false;
+            for (int i = 0; i + 1 < w.Length; i++)
+            {
+                double f;
+                if (lang == 0) RuBi.TryGetValue(w.Substring(i, 2), out f);
+                else EnBi.TryGetValue(w.Substring(i, 2), out f);
+                if (f <= 0) return false;
+            }
+            return true;
+        }
+
         /// <summary>
         /// Решение «слово набрано не в той раскладке». cur — как набрано, best — лучший другой вариант.
         /// </summary>
