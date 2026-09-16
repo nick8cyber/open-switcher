@@ -81,6 +81,11 @@ namespace OpenSwitcher.Core
         private static readonly HashSet<string> Ru = Make(RuSrc);
         private static readonly HashSet<string> En = Make(EnSrc);
 
+        // Частотные словари OpenSubtitles (топ-35k RU / топ-20k EN) — сгенерированы
+        // в WordData.cs; покрывают живую разговорную лексику и формы слов
+        private static readonly HashSet<string> RuBig = Make(WordData.RuAll);
+        private static readonly HashSet<string> EnBig = Make(WordData.EnAll);
+
         private static HashSet<string> Make(string src)
         {
             var set = new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
@@ -98,8 +103,8 @@ namespace OpenSwitcher.Core
             if (string.IsNullOrEmpty(word)) return false;
             string w = word.Trim().ToLowerInvariant();
             if (w.Length < 2) return false;
-            if (lang == 0) return Ru.Contains(w);
-            if (lang == 1) return En.Contains(w);
+            if (lang == 0) return Ru.Contains(w) || RuBig.Contains(w);
+            if (lang == 1) return En.Contains(w) || EnBig.Contains(w);
             return false;
         }
     }
