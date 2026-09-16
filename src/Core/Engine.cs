@@ -25,6 +25,7 @@ namespace OpenSwitcher.Core
         private readonly WordBuffer _buf = new WordBuffer();
         private List<KeyRec> _lastWord = new List<KeyRec>();
         private int _lastWordAt;             // тикант снимка последнего слова
+        private int _lastWordSepVk;          // разделитель сразу после последнего слова (0 = неизвестен/Enter)
 
         private int _suppressUntil;          // тикант до которого игнорируем собственную инжекцию
         private int _lastShiftDown;
@@ -718,6 +719,7 @@ namespace OpenSwitcher.Core
                 {
                     _lastWord = word;          // слово запомнится и без проверки (для Ctrl+Space)
                     _lastWordAt = Environment.TickCount;
+                    _lastWordSepVk = 0;        // после слова Enter — точный переворот с хвостом невозможен
                 }
                 if (!modified && S.FixOnEnter)
                     converted = TryConvertWord(word, 0x0D, false, false);
@@ -750,6 +752,7 @@ namespace OpenSwitcher.Core
                 {
                     _lastWord = _buf.Snapshot();
                     _lastWordAt = Environment.TickCount;
+                    _lastWordSepVk = vk;       // разделитель сразу после слова — нужен точному перевороту
                 }
                 // цифры/знаки после замены — тоже хвост, иначе Break вернёт слово
                 // ПОВЕРХ них с перепутанным порядком символов
@@ -781,7 +784,7 @@ namespace OpenSwitcher.Core
                 int msg = wParam.ToInt32();
                 if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN)
                 {
-                if (_buf.Count > 0) _lastWord = _buf.Snapshot();
+                if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); _lastWordSepVk = 0; }
                 _buf.Clear();
                 _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
                 _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
@@ -795,7 +798,7 @@ namespace OpenSwitcher.Core
         {
             if (TestInjectMode)
                 Log("fg-event: hwnd=" + hwnd.ToInt64().ToString("X") + " (was " + _fgHwnd.ToInt64().ToString("X") + ")");
-            if (_buf.Count > 0) _lastWord = _buf.Snapshot();
+            if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); _lastWordSepVk = 0; }
             _buf.Clear();
             _anyKeySinceShift = true;
             _tapAlone = false;
@@ -1011,7 +1014,7 @@ namespace OpenSwitcher.Core
             _lastConvertInfo = "'" + cur.Text + "' -> '" + best.Text + "'";
             _lastConvertTick = Environment.TickCount;
             _lastWord = word;
-
+            _lastWordSepVk = 0;
             Suppress(600);
             TextConverter.SendBackspaces(word.Count);
             TextConverter.SendUnicode(best.Text);
@@ -1159,7 +1162,10 @@ namespace OpenSwitcher.Core
         }
 
         /// <summary>Break при нечего-отменять: детектор слово не сконвертировал, а юзер настаивает.
-        /// Переворачиваем последнее слово принудительно (без словаря и скоринга) и выучиваем пару.</summary>
+        /// Переворачиваем ПОСЛЕДНЕЕ НАБРАННОЕ слово: либо ещё не отправленное (буфер жив),
+        /// либо только что завершённое — с точным учётом разделителя после него.
+        /// Вслепую выделять текст левее каретки НЕЛЬЗЯ: выделение ловило 1-2 символа
+        /// и переворачивало не то слово (жалобы 'sel: got 2 chars' ×5 подряд).</summary>
         public void ForceFlipLastWord()
         {
             UpdateForeground();
@@ -1167,29 +1173,28 @@ namespace OpenSwitcher.Core
             if (_buf.Count >= 2)
             {
                 Log("force-flip: current buffer (" + _buf.Count + " keys)");
-                ForceConvertWord(_buf.Snapshot());
+                ForceConvertWord(_buf.Snapshot(), 0);
                 return;
             }
-            // 2) слово только что завершилось (разделитель уже ушёл в приложение) —
-            //    точный откат по свежему снимку
-            if (_lastWord.Count > 0 && unchecked(Environment.TickCount - _lastWordAt) < 1500)
+            // 2) слово только что завершилось, известен и разделитель после него,
+            //    каретка стоит сразу за разделителем — точный переворот куском [слово+разд]
+            if (_buf.Count == 0 && _lastWord.Count > 0 && _lastWordSepVk != 0 &&
+                unchecked(Environment.TickCount - _lastWordAt) < 10000)
             {
-                Log("force-flip: exact path (last word)");
-                ForceConvertWord(new List<KeyRec>(_lastWord));
+                Log("force-flip: exact path (last word, sep=0x" + _lastWordSepVk.ToString("X") + ")");
+                ForceConvertWord(new List<KeyRec>(_lastWord), _lastWordSepVk);
                 return;
             }
-            // 3) каретка уже ушла — выделяем слово слева и конвертим как выделение
-            Log("force-flip: select-left path");
-            TextConverter.InjectMode = S.InputMode;
-            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-            TextConverter.SendCombo(0x11, 0x10, 0x25, true, false);
-            BeginFixSelection(true);
+            // 3) слово не найти точно — честный отказ вместо порчи текста
+            Log("force-flip skip: no fresh word at caret");
+            FireInfo("Курсор не сразу после слова — выдели его и нажми Shift+Break");
         }
 
-        /// <summary>Безусловный переворот слова:cur -> лучший кандидат другой раскладки.
-        /// Ставит точку отката (повторный Break вернёт как было и занесёт слово в «не трогать»),
-        /// пару запоминает в accepted — автодетект дальше конвертит её сам.</summary>
-        private bool ForceConvertWord(List<KeyRec> word)
+        /// <summary>Безусловный переворот слова: cur -> лучший кандидат другой раскладки.
+        /// trailSepVk — разделитель сразу после слова, уже дошедший до приложения:
+        // его тоже стираем и перепечатываем (иначе переворот съедает пробел/запятую).
+        /// Точка отката: повторный Break вернёт как было; пара запоминается в accepted.</summary>
+        private bool ForceConvertWord(List<KeyRec> word, int trailSepVk)
         {
             UpdateForeground();
             if (IsExcludedHere()) { Log("force-flip skip: excluded app"); return false; }
@@ -1217,8 +1222,13 @@ namespace OpenSwitcher.Core
             _lastConvertTick = Environment.TickCount;
 
             Suppress(600);
-            TextConverter.SendBackspaces(word.Count);
+            // хвост-разделитель после слова уже в тексте приложения — стираем вместе
+            // со словом и перепечатываем (иначе переворот съедает пробел/запятую)
+            int trailLen = trailSepVk != 0 ? 1 : 0;
+            TextConverter.SendBackspaces(word.Count + trailLen);
             TextConverter.SendUnicode(best.Text);
+            if (trailSepVk != 0)
+                TextConverter.SendUnicode(RenderKeyChar(trailSepVk, _fgHkl, false));
             // раскладку переключаем только при перевороте СЛОВА: одиночная буква
             // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
             if (word.Count > 1)
