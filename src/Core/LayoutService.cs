@@ -117,5 +117,13 @@ namespace OpenSwitcher.Core
             if (hwnd == IntPtr.Zero || hkl == IntPtr.Zero) return false;
             return Native.PostMessage(hwnd, Native.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
         }
+
+        /// <summary>Фактическая раскладка потока, владеющего окном (для проверки, применился ли перевод).</summary>
+        public static IntPtr GetForegroundHkl(IntPtr hwnd)
+        {
+            uint pid;
+            uint tid = Native.GetWindowThreadProcessId(hwnd, out pid);
+            return tid != 0 ? Native.GetKeyboardLayout(tid) : Native.GetKeyboardLayout(0);
+        }
     }
 }

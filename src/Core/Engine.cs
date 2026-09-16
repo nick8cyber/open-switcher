@@ -865,6 +865,7 @@ namespace OpenSwitcher.Core
             _gapDeadline = Environment.TickCount + 800;
             FireInfo(lang == 0 ? "РУС" : "ENG");
             VerifySwitch(_fgHwnd, target);
+        }
         /// <summary>Switch lag check: verify layout applied after 400ms,
         /// else synchronous fallback AttachThreadInput + ActivateKeyboardLayout.</summary>
         private void VerifySwitch(IntPtr fgHwnd, IntPtr target)
@@ -879,6 +880,13 @@ namespace OpenSwitcher.Core
                     IntPtr cur = LayoutService.GetForegroundHkl(fgHwnd);
                     if (cur == target) return;
                     Log("switch lag/ignored -> ActivateKeyboardLayout fallback");
+                    // AttachThreadInput к зависшему приложению вешает и наш UI-поток:
+                    // зависшее окно — fallback не делаем
+                    if (Native.IsHungAppWindow(fgHwnd))
+                    {
+                        Log("switch fallback skipped: target hung");
+                        return;
+                    }
                     uint pid;
                     uint tid = Native.GetWindowThreadProcessId(fgHwnd, out pid);
                     uint mine = Native.GetCurrentThreadId();
@@ -886,6 +894,8 @@ namespace OpenSwitcher.Core
                     if (tid != 0 && tid != mine) attached = Native.AttachThreadInput(mine, tid, true);
                     Native.ActivateKeyboardLayout(target, 0);
                     if (attached) Native.AttachThreadInput(mine, tid, false);
+                    IntPtr now = LayoutService.GetForegroundHkl(fgHwnd);
+                    Log("switch fallback: " + (now == target ? "applied" : "did not apply"));
                 }
                 catch (Exception) { }
             };
