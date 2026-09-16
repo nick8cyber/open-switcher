@@ -943,32 +943,32 @@ namespace OpenSwitcher.Core
             }
             if (best == null) { Log("convert skip: no candidate"); return false; }
 
-            // цель обязана быть чисто из букв: переворот, вставляющий внутрь слова
-            // запятую/скобку/апостроф ('дубках'->'le,rf[' по Enter, 'сверху'->'cdth[e')
-            // — почти всегда мусор редких биграмм; заодно это защищает все слова
-            // с б/ю/ж/э/х/ъ/ё от переворота в их «знаковое» английское прочтение
-            if (!manual && !acceptedWord && best.Text != LanguageTables.LettersOnly(best.Text))
+            // ГЛАВНОЕ ПРАВИЛО (как в Punto/Caramba): авто-переворот — только в СЛОВАРНОЕ
+            // слово, чистое от знаков. Это убивает все классы мусора, где скоринг редких
+            // биграмм делал правильное русское слово «хуже» английского набора:
+            // 'сверху'->'cdth[e', 'дубках'->'le,rf[', 'нажимал'->'yf;bvfk', 'ще'->'ot'.
+            // Исключения: ручной путь (Break/Ctrl+Space) и выученные пары (accepted) —
+            // их юзер подтвердил руками.
+            if (!manual && !acceptedWord)
             {
-                Log("convert skip: target-not-letters ('" + best.Text + "')");
-                return false;
-            }
-
-            // ЖИВОЙ режим: переворачиваем только если результат — знакомое слово.
-            // Посреди набора частотный скоринг шумит ('муд'->'vel' на правильном «мудаке»),
-            // поэтому уверенность = слово есть в словаре.
-            bool live = resendVk == 0 && !manual;
-            // выученная пара (accepted) сильнее живого ограничителя: юзер уже
-            // подтвердил эту конвертацию руками — переворачиваем и посреди набора
-            if (live && !acceptedWord && !WordDict.Has(best.Text, best.Lang))
-            {
-                Log("convert skip: live, target not in dict ('" + best.Text + "')");
-                return false;
+                if (best.Text != LanguageTables.LettersOnly(best.Text))
+                {
+                    Log("convert skip: target-not-letters ('" + best.Text + "')");
+                    return false;
+                }
+                if (!WordDict.Has(best.Text, best.Lang))
+                {
+                    Log("convert skip: target-not-in-dict ('" + best.Text + "')");
+                    return false;
+                }
             }
 
             bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
                                               best.Text, best.Lang, best.Score, S.Sensitivity);
-            if (!pass && acceptedWord)
-                pass = true; // такое слово юзер уже принимал — конвертим несмотря на скоринг
+            // выученная пара (accepted) пробивает скоринг, но только если цель —
+            // чистые буквы (пара со знаком внутри не восстанавливается)
+            if (!pass && acceptedWord && best.Text == LanguageTables.LettersOnly(best.Text))
+                pass = true;
 
             // Частотный пол цели (EN -0.05 / RU -0.55) режет и настоящие слова с редкими
             // биграммами ('что' ниже пола: пары 'чт' нет в таблице). Если цель — словарное
@@ -981,48 +981,17 @@ namespace OpenSwitcher.Core
                 Log("convert: dict-over-score ('" + cur.Text + "' -> '" + best.Text + "')");
             }
 
-            // словарная валидация результата — но не для выученных пар: юзер уже
-            // подтвердил эту конвертацию руками, словарь здесь не указ
-            string dictSkip = null;
-            if (pass && !acceptedWord)
+            // последнее предохранительное: набранное — частое слово, цель — нет:
+            // не трогаем (выученные пары не проверяем — юзер настоял)
+            if (pass && !acceptedWord && WordDict.Has(cur.Text, cur.Lang) &&
+                !WordDict.Has(best.Text, best.Lang))
             {
-                bool targetInDict = WordDict.Has(best.Text, best.Lang);
-                bool curInDict = WordDict.Has(cur.Text, cur.Lang);
-                if (curInDict && !targetInDict)
-                {
-                    dictSkip = "cur-in-dict, target-not";
-                    pass = false; // текущее — частое слово, результат — нет: не трогаем
-                }
-                else if (!targetInDict && !curInDict)
-                {
-                    // оба не словарные: для коротких слов (<=3) переворота не бывает вовсе —
-                    // скоринг слишком легко пропускал мусор ('ще'->'ot', 'djj'->'воо',
-                    // 'rffz'->'каая'); такое только руками (Break + самообучение).
-                    // Длинным нужен усиленный запас
-                    if (best.Text.Length <= 3)
-                    {
-                        dictSkip = "both-not-in-dict, short";
-                        pass = false;
-                    }
-                    else
-                    {
-                        double need = LanguageTables.BaseMargin /
-                                      Math.Max(0.3, S.Sensitivity);
-                        if (best.Score - cur.Score < need)
-                        {
-                            dictSkip = "both-not-in-dict, margin";
-                            pass = false;
-                        }
-                    }
-                }
+                Log("convert skip: cur-in-dict, target-not ('" + cur.Text + "' -> '" + best.Text + "')");
+                return false;
             }
-            // СТРОП: решение обязано быть положительным, иначе конвертируем МУСОР.
-            // (раньше pass вычислялся, но не проверялся — из-за этого в журнал
-            // попадали «convert OK: 'так' -> 'nfr'», которых не должно быть)
             if (!pass)
             {
-                Log("convert skip: score" + (dictSkip != null ? "/" + dictSkip : "") +
-                    " ('" + cur.Text + "' -> '" + best.Text + "')");
+                Log("convert skip: score ('" + cur.Text + "' -> '" + best.Text + "')");
                 return false;
             }
 
@@ -1250,8 +1219,13 @@ namespace OpenSwitcher.Core
             Suppress(600);
             TextConverter.SendBackspaces(word.Count);
             TextConverter.SendUnicode(best.Text);
-            LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
-            ExpectLayout(best.Hkl);
+            // раскладку переключаем только при перевороте СЛОВА: одиночная буква
+            // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
+            if (word.Count > 1)
+            {
+                LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
+                ExpectLayout(best.Hkl);
+            }
 
             // точка отката: повторный Break вернёт исходное слово; отмена занесёт
             // его в rejected — «самообучение» сработало в обратную сторону
@@ -1267,12 +1241,13 @@ namespace OpenSwitcher.Core
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            // самообучение безопасное: слова короче 2 букв (одиночные буквы
-            // не несут сигнала — «заученное» будет портить каждый нормальный ввод) и
-            // уже словарные слова (их переворот — почти наверняка случайный Break по
-            // нормальному тексту, так было заражено «что»→xnj) не заучиваем.
-            // 2-буквенные ЗАУЧИВАЕМ: юзер сам учит сленг ('et'->'уе')
-            if (cur.Text.Length >= 2 && !WordDict.Has(cur.Text, cur.Lang))
+            // самообучение безопасное: одиночные буквы (нулевого сигнала), слова
+            // со знаками внутри ('le,rf[' — мусор от редких биграмм) и уже словарные
+            // слова (их переворот — почти наверняка случайный Break по нормальному
+            // тексту, так заражалось «что»→xnj) не заучиваем.
+            // 2-буквенные сленговые пары ('et'->'уе') — заучиваем: юзер сам учит
+            if (cur.Text.Length >= 2 && cur.Text == LanguageTables.LettersOnly(cur.Text) &&
+                !WordDict.Has(cur.Text, cur.Lang))
             {
                 string learned = cur.Text.ToLowerInvariant();
                 Defer(delegate { RememberAccepted(learned); });
