@@ -515,8 +515,12 @@ namespace OpenSwitcher.Core
             if (vk == 0xA0 || vk == 0xA1) // левый / правый Shift
             {
                 int now = Environment.TickCount;
-                // двойной Shift — сменить раскладку
-                if (!_anyKeySinceShift && unchecked(now - _lastShiftDown) >= 0 &&
+                // двойной Shift работает только если тап-переключение НЕ висит на самих
+                // Shift'ах: иначе второй тап съедался двойным срабатыванием (тап -> ENG,
+                // double-shift -> обратно RU) и «правый шифт не отрабатывал как надо»
+                bool shiftIsTapKey = (S.HotRuMods == 0 && (S.HotRuVk == 0xA0 || S.HotRuVk == 0xA1)) ||
+                                     (S.HotEnMods == 0 && (S.HotEnVk == 0xA0 || S.HotEnVk == 0xA1));
+                if (!_anyKeySinceShift && !shiftIsTapKey && unchecked(now - _lastShiftDown) >= 0 &&
                     unchecked(now - _lastShiftDown) < 400 && S.DoubleShiftSwitch)
                 {
                     _lastShiftDown = 0;
