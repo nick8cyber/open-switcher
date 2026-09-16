@@ -39,6 +39,7 @@ namespace OpenSwitcher.Core
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
         private int _wdTicks;                // счётчик тиков watchdog'а (heartbeat раз в 10 тиков)
+        private int _noFlipUntil;            // кулдаун после ручной правки: юзер чинит текст сам — не мешаем
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
         private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
         private int _lastConvertTick;        // когда была последняя конвертация
@@ -572,6 +573,7 @@ namespace OpenSwitcher.Core
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             Log("backspace-cancel: " + _undoText);
+            _noFlipUntil = Environment.TickCount + 5000; // юзер правит сам — движок молчит
             int bs2 = _undoLen + _undoSepText.Length + _undoTail.Count;
                     string restore2 = _undoText + _undoSepText +
                                       (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
@@ -596,6 +598,7 @@ namespace OpenSwitcher.Core
                 if (_undoPending)
                 {
                     Log("hotkey: undo");
+                    _noFlipUntil = Environment.TickCount + 5000; // откат = «не так» — движок молчит 5 с
                     UndoLastConversion();
                 }
                 else
@@ -991,6 +994,16 @@ namespace OpenSwitcher.Core
             // 'сверху'->'cdth[e', 'дубках'->'le,rf[', 'нажимал'->'yf;bvfk', 'ще'->'ot'.
             // Исключения: ручной путь (Break/Ctrl+Space) и выученные пары (accepted) —
             // их юзер подтвердил руками.
+            // кулдаун после ручной правки (backspace-cancel / Break-откат): юзер чинит
+            // текст сам — новые автоперевороты в это время = пинг-понг (бой в 23:57)
+            if (!manual && !acceptedWord)
+            {
+                if (unchecked(Environment.TickCount - _noFlipUntil) < 0)
+                {
+                    Log("convert skip: cool-down after manual fix");
+                    return false;
+                }
+            }
             if (!manual && !acceptedWord)
             {
                 if (best.Text != LanguageTables.LettersOnly(best.Text))
