@@ -864,6 +864,31 @@ namespace OpenSwitcher.Core
             _gapActive = true; _gapHkl = target; _gapBuf.Clear();
             _gapDeadline = Environment.TickCount + 800;
             FireInfo(lang == 0 ? "РУС" : "ENG");
+            VerifySwitch(_fgHwnd, target);
+        /// <summary>Switch lag check: verify layout applied after 400ms,
+        /// else synchronous fallback AttachThreadInput + ActivateKeyboardLayout.</summary>
+        private void VerifySwitch(IntPtr fgHwnd, IntPtr target)
+        {
+            var t = new System.Windows.Forms.Timer { Interval = 400 };
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                try
+                {
+                    IntPtr cur = LayoutService.GetForegroundHkl(fgHwnd);
+                    if (cur == target) return;
+                    Log("switch lag/ignored -> ActivateKeyboardLayout fallback");
+                    uint pid;
+                    uint tid = Native.GetWindowThreadProcessId(fgHwnd, out pid);
+                    uint mine = Native.GetCurrentThreadId();
+                    bool attached = false;
+                    if (tid != 0 && tid != mine) attached = Native.AttachThreadInput(mine, tid, true);
+                    Native.ActivateKeyboardLayout(target, 0);
+                    if (attached) Native.AttachThreadInput(mine, tid, false);
+                }
+                catch (Exception) { }
+            };
         }
 
         private static bool MatchHot(int vkEvent, bool ctrl, bool shift, bool alt, bool win, int vkHot, int modsHot)
