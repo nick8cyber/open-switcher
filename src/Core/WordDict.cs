@@ -114,5 +114,19 @@ namespace OpenSwitcher.Core
             if (lang == 1) return En.Contains(w) || EnBig.Contains(w);
             return false;
         }
+
+        // однобуквенные слова языка (предлоги/союзы/местоимения) — Caramba «неприкасаемые»
+        private const string RuSingles = "аивкосуя";
+        private const string EnSingles = "ai";
+
+        /// <summary>Однобуквенное слово языка: «а», «и», «в»… / "a", "i".
+        /// Главный сигнал для одиночных букв: 'f' — не слово, «а» — слово.</summary>
+        public static bool HasSingleLetterWord(string ch, int lang)
+        {
+            if (string.IsNullOrEmpty(ch) || ch.Length != 1) return false;
+            string c = ch.Trim().ToLowerInvariant();
+            if (c.Length != 1) return false;
+            return lang == 0 ? RuSingles.Contains(c) : EnSingles.Contains(c);
+        }
     }
 }

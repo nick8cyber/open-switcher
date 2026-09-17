@@ -750,42 +750,45 @@ namespace OpenSwitcher.Core
                 bool modified = ctrl || alt || win || shift;
                 bool converted = false;
 
-                // ОДИНОЧНАЯ БУКВА + КОНТЕКСТ (как в Caramba: «'d' + пробел -> 'в'»).
-                // Словарь на одной букве бессилен; направление показывает последняя
-                // конвертация: если юзер только что конвертился в русский, то одинокая
-                // 'f' после этого — это «а» ('фс'->'ac', 'а'->'f' — жалобы из лога)
-                if (!modified && !S.Paused && _buf.Count == 1 && _lastConvertLang >= 0 &&
-                    unchecked(Environment.TickCount - _lastConvertTick) < 10000)
+                // ОДИНОЧНАЯ БУКВА по «словности»: 'f' — не английское слово, «а» — русское
+                // (союз) => 'f'->«а». «а» — русское слово => не переворачивается никогда.
+                // Это единственный сигнал для одной буквы, и его достаточно
+                if (!modified && !S.Paused && _buf.Count == 1)
                 {
-                    IntPtr wantHkl = LayoutService.FindLayoutByLang(_lastConvertLang);
-                    if (wantHkl != IntPtr.Zero && wantHkl != _fgHkl)
+                    string asTyped = LayoutService.Render(_fgHkl, _buf.Snapshot());
+                    int typedLang = LanguageTables.LangOf(asTyped);
+                    if (asTyped.Length == 1 && typedLang >= 0 &&
+                        !WordDict.HasSingleLetterWord(asTyped, typedLang))
                     {
-                        string asTyped = LayoutService.Render(_fgHkl, _buf.Snapshot());
-                        string flipped = LayoutService.Render(wantHkl, _buf.Snapshot());
-                        if (asTyped.Length == 1 && flipped.Length == 1 && asTyped != flipped)
+                        IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
+                        if (otherHkl != IntPtr.Zero)
                         {
-                            converted = true;
-                            TextConverter.ReleaseModifiers();
-                            TextConverter.InjectMode = S.InputMode;
-                            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-                            Log("single-letter: '" + asTyped + "' -> '" + flipped + "' (context)");
-                            Suppress(600);
-                            TextConverter.SendBackspaces(1);
-                            TextConverter.SendUnicode(flipped);
-                            // точка отката: Break вернёт букву и разделитель
-                            _undoPending = true;
-                            _undoText = asTyped;
-                            _undoLen = flipped.Length;
-                            _undoSepText = RenderKeyChar(vk, _fgHkl, shift);
-                            _undoHkl = _fgHkl;
-                            _undoHwnd = _fgHwnd;
-                            _undoFocus = _fgFocus;
-                            _undoTick = Environment.TickCount;
-                            _keysSinceUndoPoint = 0;
-                            _undoTail.Clear();
-                            _undoTailBroken = false;
-                            TextConverter.SendUnicode(_undoSepText); // досылаем разделитель как набрано
-                            if (_undoSepText == " ") _lastResendSpaceTick = Environment.TickCount;
+                            string flipped = LayoutService.Render(otherHkl, _buf.Snapshot());
+                            if (flipped.Length == 1 && WordDict.HasSingleLetterWord(flipped, 1 - typedLang))
+                            {
+                                converted = true;
+                                TextConverter.ReleaseModifiers();
+                                TextConverter.InjectMode = S.InputMode;
+                                TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+                                Log("single-letter: '" + asTyped + "' -> '" + flipped + "'");
+                                Suppress(600);
+                                TextConverter.SendBackspaces(1);
+                                TextConverter.SendUnicode(flipped);
+                                // точка отката: Break вернёт букву и разделитель
+                                _undoPending = true;
+                                _undoText = asTyped;
+                                _undoLen = flipped.Length;
+                                _undoSepText = RenderKeyChar(vk, _fgHkl, shift);
+                                _undoHkl = _fgHkl;
+                                _undoHwnd = _fgHwnd;
+                                _undoFocus = _fgFocus;
+                                _undoTick = Environment.TickCount;
+                                _keysSinceUndoPoint = 0;
+                                _undoTail.Clear();
+                                _undoTailBroken = false;
+                                TextConverter.SendUnicode(_undoSepText); // досылаем разделитель как набрано
+                                if (_undoSepText == " ") _lastResendSpaceTick = Environment.TickCount;
+                            }
                         }
                     }
                 }
