@@ -26,6 +26,7 @@ namespace OpenSwitcher.Core
         private List<KeyRec> _lastWord = new List<KeyRec>();
         private int _lastWordAt;             // тикант снимка последнего слова
         private int _lastWordSepVk;          // разделитель сразу после последнего слова (0 = неизвестен/Enter)
+        private IntPtr _lastWordHwnd;        // окно, где набрано последнее слово (0 = неизвестно)
 
         private int _suppressUntil;          // тикант до которого игнорируем собственную инжекцию
         private int _lastShiftDown;
@@ -389,6 +390,7 @@ namespace OpenSwitcher.Core
                         unchecked(Environment.TickCount - _lastResendSpaceTick) < 600)
                     {
                         Log("space-echo swallowed");
+                        _lastResendSpaceTick = 0; // одноразово: следующий реальный пробел не глотаем
                         return IntPtr.Zero;
                     }
                     _lastResendSpaceTick = 0;
@@ -448,6 +450,19 @@ namespace OpenSwitcher.Core
                         if (_undoTail.Count < 16) _undoTail.Add(recS);
                         else _undoTailBroken = true;
                     }
+                }
+                else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
+                         (k.vkCode & 0xFF) == 0x20)
+                {
+                    // suppress-окно и ПРОБЕЛ: граница слова обязана делить буфер,
+                    // иначе слова слипаются ('чтосправками') и конвертация теряется
+                    if (_buf.Count > 0)
+                    {
+                        _lastWord = _buf.Snapshot();
+                        _lastWordAt = Environment.TickCount;
+                        _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
+                    }
+                    _buf.Clear();
                 }
             }
             return Native.CallNextHookEx(_kbHook, code, wParam, lParam);
@@ -727,7 +742,7 @@ namespace OpenSwitcher.Core
                 {
                     _lastWord = word;          // слово запомнится и без проверки (для Ctrl+Space)
                     _lastWordAt = Environment.TickCount;
-                    _lastWordSepVk = 0;        // после слова Enter — точный переворот с хвостом невозможен
+                    _lastWordHwnd = _fgHwnd; _lastWordSepVk = 0;        // после слова Enter — точный переворот с хвостом невозможен
                 }
                 if (!modified && S.FixOnEnter)
                     converted = TryConvertWord(word, 0x0D, false, false);
@@ -780,9 +795,12 @@ namespace OpenSwitcher.Core
 
                 // ОДИНОЧНАЯ БУКВА по «словности»: 'f' — не английское слово, «а» — русское
                 // (союз) => 'f'->«а». «а» — русское слово => не переворачивается никогда.
-                // Расширение: [буква][знак-двойник] («z,» = «я,» в EN) — буква переворачивается,
-                // знак остаётся знаком («яб» из переклассификации не появляется)
-                if (!modified && !S.Paused && (_buf.Count == 1 ||
+                // Только по ПРОБЕЛУ (буква+цифра = идентификатор), с уважением кулдауна,
+                // лока, rejected и тумблера автоисправления
+                if (!modified && !S.Paused && vk == 0x20 && S.AutoConvertOnWordEnd &&
+                    (!S.LockAutoAfterManualSwitch || !_autoLocked) &&
+                    unchecked(Environment.TickCount - _noFlipUntil) < 0 &&
+                    (_buf.Count == 1 ||
                     (_buf.Count == 2 && IsPunctTwinVk(_buf.Snapshot()[1].Vk))))
                 {
                     var keys1 = _buf.Snapshot();
@@ -792,6 +810,7 @@ namespace OpenSwitcher.Core
                     string tailTxt = tailPunct ? asTyped.Substring(1) : "";
                     int typedLang = LanguageTables.LangOf(coreTyped);
                     if (coreTyped.Length == 1 && tailTxt.Length <= 1 && typedLang >= 0 &&
+                        !_rejected.Contains(coreTyped) &&
                         !WordDict.HasSingleLetterWord(coreTyped, typedLang))
                     {
                         IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
@@ -829,7 +848,7 @@ namespace OpenSwitcher.Core
                     }
                 }
 
-                if (!modified && S.AutoConvertOnWordEnd && _buf.Count > 0)
+                if (!converted && !modified && S.AutoConvertOnWordEnd && _buf.Count > 0)
                 {
                     List<KeyRec> word = _buf.Snapshot();
                     // разделитель проглатывается и досылается ПОСЛЕ замены — иначе он
@@ -840,7 +859,7 @@ namespace OpenSwitcher.Core
                 {
                     _lastWord = _buf.Snapshot();
                     _lastWordAt = Environment.TickCount;
-                    _lastWordSepVk = vk;       // разделитель сразу после слова — нужен точному перевороту
+                    _lastWordHwnd = _fgHwnd; _lastWordSepVk = vk;       // разделитель сразу после слова — нужен точному перевороту
                 }
                 // цифры/знаки после замены — тоже хвост, иначе Break вернёт слово
                 // ПОВЕРХ них с перепутанным порядком символов
@@ -877,7 +896,7 @@ namespace OpenSwitcher.Core
                 int msg = wParam.ToInt32();
                 if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN)
                 {
-                if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); _lastWordSepVk = 0; }
+                if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
                 _buf.Clear();
                 _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
                 _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
@@ -891,7 +910,8 @@ namespace OpenSwitcher.Core
         {
             if (TestInjectMode)
                 Log("fg-event: hwnd=" + hwnd.ToInt64().ToString("X") + " (was " + _fgHwnd.ToInt64().ToString("X") + ")");
-            if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); _lastWordSepVk = 0; }
+            if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
+            _lastResendSpaceTick = 0; // окно эха не переносится в другое окно
             _buf.Clear();
             _anyKeySinceShift = true;
             _tapAlone = false;
@@ -964,6 +984,7 @@ namespace OpenSwitcher.Core
         private void VerifySwitch(IntPtr fgHwnd, IntPtr target)
         {
             var t = new System.Windows.Forms.Timer { Interval = 400 };
+            t.Start();
             t.Tick += delegate
             {
                 t.Stop();
@@ -1023,6 +1044,19 @@ namespace OpenSwitcher.Core
         private static bool IsPunctTwinVk(int vk)
         {
             return vk == 0xBA || vk == 0xBC || vk == 0xBE || vk == 0xDE;
+        }
+
+        /// <summary>Знак, печатаемый клавишей-«двойником» в EN-раскладке (для хвоста переворота).</summary>
+        private static char PunctCharOfVk(int vk)
+        {
+            switch (vk)
+            {
+                case 0xBC: return ',';
+                case 0xBE: return '.';
+                case 0xBA: return ';';
+                case 0xDE: return '\'';
+                default: return '\0';
+            }
         }
 
         /// <summary>Что печатает клавиша в данной раскладке (для досылки/отката разделителей).</summary>
@@ -1087,8 +1121,7 @@ namespace OpenSwitcher.Core
             // 'сверху'->'cdth[e', 'дубках'->'le,rf[', 'нажимал'->'yf;bvfk', 'ще'->'ot'.
             // Исключения: ручной путь (Break/Ctrl+Space) и выученные пары (accepted) —
             // их юзер подтвердил руками.
-            // кулдаун после ручной правки (backspace-cancel / Break-откат): юзер чинит
-            // текст сам — новые автоперевороты в это время = пинг-понг (бой в 23:57)
+            // Кулдаун после ручной правки — первым делом (до рендера раскладок)
             if (!manual && !acceptedWord)
             {
                 if (unchecked(Environment.TickCount - _noFlipUntil) < 0)
@@ -1096,10 +1129,28 @@ namespace OpenSwitcher.Core
                     Log("convert skip: cool-down after manual fix");
                     return false;
                 }
-            }
-            if (!manual && !acceptedWord)
-            {
-                if (best.Text != LanguageTables.LettersOnly(best.Text))
+                // хвостовая клавиша-«двойник» (б/ю/ж/э в конце слова): пробуем трактовать её
+                // как ЗНАК — «ghbdtn,» должно стать «привет,», а не «приветб» (Caramba:
+                // окончание «етб» — невозможность). Если прочтение со знаком валиднее
+                // (словарь/морфология по буквенной части) — целимся в него
+                if (word.Count > 1 && IsPunctTwinVk(word[word.Count - 1].Vk) && best.Text.Length > 1)
+                {
+                    char pc = PunctCharOfVk(word[word.Count - 1].Vk);
+                    if (pc != '\0')
+                    {
+                        string alt = best.Text.Substring(0, best.Text.Length - 1) + pc;
+                        string altCore = LanguageTables.LettersOnly(alt);
+                        string baseCore = LanguageTables.LettersOnly(best.Text);
+                        bool altValid = WordDict.Has(altCore, best.Lang) ||
+                            (altCore.Length >= 3 && LanguageTables.PossibleWord(altCore, best.Lang));
+                        bool baseValid = WordDict.Has(baseCore, best.Lang) ||
+                            (baseCore.Length >= 3 && LanguageTables.PossibleWord(baseCore, best.Lang));
+                        if (altValid && !baseValid) best.Text = alt;
+                    }
+                }
+                string core = LanguageTables.LettersOnly(best.Text);
+                string tail = best.Text.Substring(core.Length);
+                if (core.Length == 0 || tail.Length > 1)
                 {
                     Log("convert skip: target-not-letters ('" + best.Text + "')");
                     return false;
@@ -1107,8 +1158,8 @@ namespace OpenSwitcher.Core
                 // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (все пары
                 // букв встречаются в языковой модели) — покрывает формы, не вошедшие в
                 // словарь ('нажимал', 'изучи'); 2-буквенные цели — только словарь
-                if (!WordDict.Has(best.Text, best.Lang) &&
-                    (best.Text.Length < 3 || !LanguageTables.PossibleWord(best.Text, best.Lang)))
+                if (!WordDict.Has(core, best.Lang) &&
+                    (core.Length < 3 || !LanguageTables.PossibleWord(core, best.Lang)))
                 {
                     Log("convert skip: target-not-in-dict ('" + best.Text + "')");
                     return false;
@@ -1130,7 +1181,9 @@ namespace OpenSwitcher.Core
             // биграммами ('что' ниже пола: пары 'чт' нет в таблице). Если цель — словарное
             // слово, а набранное — нет, скорингу верить нельзя: словарь перевешивает
             // (selftest давно ожидал это правило — в движке его не было).
-            if (!pass && !acceptedWord && WordDict.Has(best.Text, best.Lang) &&
+            // Для целей с хвостовым знаком-двойником («привет,») словарь проверяем
+            // по буквенной части
+            if (!pass && !acceptedWord && WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang) &&
                 !WordDict.Has(cur.Text, cur.Lang))
             {
                 pass = true;
@@ -1140,7 +1193,7 @@ namespace OpenSwitcher.Core
             // последнее предохранительное: набранное — частое слово, цель — нет:
             // не трогаем (выученные пары не проверяем — юзер настоял)
             if (pass && !acceptedWord && WordDict.Has(cur.Text, cur.Lang) &&
-                !WordDict.Has(best.Text, best.Lang))
+                !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
             {
                 Log("convert skip: cur-in-dict, target-not ('" + cur.Text + "' -> '" + best.Text + "')");
                 return false;
@@ -1213,11 +1266,19 @@ namespace OpenSwitcher.Core
 
             // авто-заучивание только от 3 букв: коротыш ('су'->'ce' по запятой) не имеет
             // права вечно портить ввод из-за одного случайного переворота. Коротким
-            // парам — осознанное обучение через Break (ForceConvertWord)
+            // парам — осознанное обучение через Break (ForceConvertWord).
+            // Принятие честное: через 15 с, если юзер не откатил (откат кладёт в rejected)
             if (injOk && cur.Text.Length >= 3)
             {
                 string acceptedTyped = cur.Text.ToLowerInvariant();
-                Defer(delegate { RememberAccepted(acceptedTyped); }); // юзер не отменил в течение 15 с — примем
+                var acceptTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+                acceptTimer.Tick += delegate
+                {
+                    acceptTimer.Stop();
+                    acceptTimer.Dispose();
+                    if (!_rejected.Contains(acceptedTyped)) RememberAccepted(acceptedTyped);
+                };
+                acceptTimer.Start();
             }
 
             FireConverted(cur.Text, best.Text);
@@ -1328,11 +1389,12 @@ namespace OpenSwitcher.Core
             {
                 Log("force-flip: current buffer (" + _buf.Count + " keys)");
                 ForceConvertWord(_buf.Snapshot(), 0);
+                _buf.Clear(); // флип живого буфера — буфер отработал
                 return;
             }
             // 2) слово только что завершилось, известен и разделитель после него,
             //    каретка стоит сразу за разделителем — точный переворот куском [слово+разд]
-            if (_buf.Count == 0 && _lastWord.Count > 0 && _lastWordSepVk != 0 &&
+            if (_buf.Count == 0 && _lastWord.Count > 0 && _lastWordSepVk != 0 && _lastWordHwnd == _fgHwnd &&
                 unchecked(Environment.TickCount - _lastWordAt) < 10000)
             {
                 Log("force-flip: exact path (last word, sep=0x" + _lastWordSepVk.ToString("X") + ")");

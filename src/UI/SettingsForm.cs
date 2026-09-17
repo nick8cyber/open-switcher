@@ -469,7 +469,7 @@ namespace OpenSwitcher.UI
             }
             catch (Exception) { }
             _engine.UiFormHandle = Handle;
-            _engine.SandboxHandle = IntPtr.Zero;
+            _engine.SandboxHandle = _tbSandbox != null && _tbSandbox.IsHandleCreated ? _tbSandbox.Handle : IntPtr.Zero;
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
