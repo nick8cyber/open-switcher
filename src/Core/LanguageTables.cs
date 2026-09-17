@@ -133,23 +133,45 @@ namespace OpenSwitcher.Core
         }
 
         /// <summary>«Возможное» слово языка: чисто из букв и КАЖДАЯ пара соседних букв
-        /// встречается в языковой модели (есть в таблице биграмм с ненулевой частотой).
-        /// Позитивная морфология: покрывает формы, не вошедшие в словарь ('нажимал':
-        /// на-аж-жи-им-ма-ал — все валидны), и отсекает мусор ('каая' — «аа», 'воо' — «оо»).
+        /// встречается хотя бы в одном слове языка (набор биграмм выводится из корпуса
+        /// WordData — 55k слов, поэтому «запусти», «нажимал» валидны даже без словаря).
+        /// Отсекает мусор: «каая» («аа»), «воо» («оо») — таких пар в словах языка нет.
         /// Это «невозможные/возможные сочетания» Punto и «языковая модель» Caramba.</summary>
         public static bool PossibleWord(string word, int lang)
         {
             if (string.IsNullOrEmpty(word)) return false;
             string w = word.ToLowerInvariant();
             if (w.Length < 2 || LettersOnly(w) != w) return false;
+            EnsureBigSets();
+            var set = lang == 0 ? _ruBigAll : _enBigAll;
             for (int i = 0; i + 1 < w.Length; i++)
-            {
-                double f;
-                if (lang == 0) RuBi.TryGetValue(w.Substring(i, 2), out f);
-                else EnBi.TryGetValue(w.Substring(i, 2), out f);
-                if (f <= 0) return false;
-            }
+                if (!set.Contains(w.Substring(i, 2))) return false;
             return true;
+        }
+
+        private static HashSet<string> _ruBigAll;
+        private static HashSet<string> _enBigAll;
+
+        /// <summary>Все пары букв, встречающиеся в корпусе WordData (+ ручные таблицы).</summary>
+        private static void EnsureBigSets()
+        {
+            if (_ruBigAll != null) return;
+            _ruBigAll = BigramsOf(WordData.RuAll);
+            _enBigAll = BigramsOf(WordData.EnAll);
+            foreach (string b in RuBi.Keys) _ruBigAll.Add(b);
+            foreach (string b in EnBi.Keys) _enBigAll.Add(b);
+        }
+
+        private static HashSet<string> BigramsOf(string src)
+        {
+            var set = new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
+            foreach (string w in src.Split(' '))
+            {
+                string t = w.Trim().ToLowerInvariant();
+                if (t.Length < 2 || LettersOnly(t) != t) continue;
+                for (int i = 0; i + 1 < t.Length; i++) set.Add(t.Substring(i, 2));
+            }
+            return set;
         }
 
         /// <summary>
