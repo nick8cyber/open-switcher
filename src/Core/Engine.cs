@@ -780,32 +780,40 @@ namespace OpenSwitcher.Core
 
                 // ОДИНОЧНАЯ БУКВА по «словности»: 'f' — не английское слово, «а» — русское
                 // (союз) => 'f'->«а». «а» — русское слово => не переворачивается никогда.
-                // Это единственный сигнал для одной буквы, и его достаточно
-                if (!modified && !S.Paused && _buf.Count == 1)
+                // Расширение: [буква][знак-двойник] («z,» = «я,» в EN) — буква переворачивается,
+                // знак остаётся знаком («яб» из переклассификации не появляется)
+                if (!modified && !S.Paused && (_buf.Count == 1 ||
+                    (_buf.Count == 2 && IsPunctTwinVk(_buf.Snapshot()[1].Vk))))
                 {
-                    string asTyped = LayoutService.Render(_fgHkl, _buf.Snapshot());
-                    int typedLang = LanguageTables.LangOf(asTyped);
-                    if (asTyped.Length == 1 && typedLang >= 0 &&
-                        !WordDict.HasSingleLetterWord(asTyped, typedLang))
+                    var keys1 = _buf.Snapshot();
+                    bool tailPunct = keys1.Count == 2;
+                    string asTyped = LayoutService.Render(_fgHkl, keys1);
+                    string coreTyped = tailPunct ? asTyped.Substring(0, 1) : asTyped;
+                    string tailTxt = tailPunct ? asTyped.Substring(1) : "";
+                    int typedLang = LanguageTables.LangOf(coreTyped);
+                    if (coreTyped.Length == 1 && tailTxt.Length <= 1 && typedLang >= 0 &&
+                        !WordDict.HasSingleLetterWord(coreTyped, typedLang))
                     {
                         IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
                         if (otherHkl != IntPtr.Zero)
                         {
-                            string flipped = LayoutService.Render(otherHkl, _buf.Snapshot());
+                            var one = new List<KeyRec> { keys1[0] };
+                            string flipped = LayoutService.Render(otherHkl, one);
                             if (flipped.Length == 1 && WordDict.HasSingleLetterWord(flipped, 1 - typedLang))
                             {
+                                string result = flipped + tailTxt;
                                 converted = true;
                                 TextConverter.ReleaseModifiers();
                                 TextConverter.InjectMode = S.InputMode;
                                 TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-                                Log("single-letter: '" + asTyped + "' -> '" + flipped + "'");
+                                Log("single-letter: '" + asTyped + "' -> '" + result + "'");
                                 Suppress(600);
-                                TextConverter.SendBackspaces(1);
-                                TextConverter.SendUnicode(flipped);
-                                // точка отката: Break вернёт букву и разделитель
+                                TextConverter.SendBackspaces(keys1.Count);
+                                TextConverter.SendUnicode(result);
+                                // точка отката: Break вернёт набранное и разделитель
                                 _undoPending = true;
                                 _undoText = asTyped;
-                                _undoLen = flipped.Length;
+                                _undoLen = result.Length;
                                 _undoSepText = RenderKeyChar(vk, _fgHkl, shift);
                                 _undoHkl = _fgHkl;
                                 _undoHwnd = _fgHwnd;
@@ -1008,6 +1016,13 @@ namespace OpenSwitcher.Core
         {
             return (vk >= 0x41 && vk <= 0x5A) || vk == 0xBA || vk == 0xBC || vk == 0xBD ||
                    vk == 0xBE || vk == 0xC0 || vk == 0xDB || vk == 0xDC || vk == 0xDE;
+        }
+
+        /// <summary>Знаковая клавиша-«двойник» русской буквы (б=',', ю='.', ж=';', э=''').
+        /// Хвост такой клавиши в перевороте остаётся ЗНАКОМ: «z,» -> «я,», а не «яб».</summary>
+        private static bool IsPunctTwinVk(int vk)
+        {
+            return vk == 0xBA || vk == 0xBC || vk == 0xBE || vk == 0xDE;
         }
 
         /// <summary>Что печатает клавиша в данной раскладке (для досылки/отката разделителей).</summary>
