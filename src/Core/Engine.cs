@@ -787,7 +787,7 @@ namespace OpenSwitcher.Core
             // настоящие разделители — знаки В ОБОИХ раскладках (пробел, цифры, '=', '.', '\').
             // б/ю/ж/э/х/ъ/ё-клавиши — буквы (IsLetterVk), слово они не заканчивают
             if (vk == 0x20 || (vk >= 0x30 && vk <= 0x39) ||
-                vk == 0xBB || vk == 0xBF || vk == 0xDD)
+                vk == 0xBB || vk == 0xBF || vk == 0xDC)
             {
                 // при зажатых модификаторах (шорткаты) не вмешиваемся
                 bool modified = ctrl || alt || win || shift;
@@ -799,7 +799,7 @@ namespace OpenSwitcher.Core
                 // лока, rejected и тумблера автоисправления
                 if (!modified && !S.Paused && vk == 0x20 && S.AutoConvertOnWordEnd &&
                     (!S.LockAutoAfterManualSwitch || !_autoLocked) &&
-                    unchecked(Environment.TickCount - _noFlipUntil) < 0 &&
+                    unchecked(Environment.TickCount - _noFlipUntil) >= 0 &&
                     (_buf.Count == 1 ||
                     (_buf.Count == 2 && IsPunctTwinVk(_buf.Snapshot()[1].Vk))))
                 {
@@ -1036,7 +1036,7 @@ namespace OpenSwitcher.Core
         private static bool IsLetterVk(int vk)
         {
             return (vk >= 0x41 && vk <= 0x5A) || vk == 0xBA || vk == 0xBC || vk == 0xBD ||
-                   vk == 0xBE || vk == 0xC0 || vk == 0xDB || vk == 0xDC || vk == 0xDE;
+                   vk == 0xBE || vk == 0xC0 || vk == 0xDB || vk == 0xDD || vk == 0xDE;
         }
 
         /// <summary>Знаковая клавиша-«двойник» русской буквы (б=',', ю='.', ж=';', э=''').
