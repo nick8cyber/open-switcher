@@ -813,6 +813,11 @@ namespace OpenSwitcher.Core
                     if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
                     else _undoTailBroken = true;
                 }
+                // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь
+                if (vk == 0x20 && !modified)
+                    Log("space: " + (converted ? "flip+resend" : "pass") +
+                        " bufWas=" + _buf.Count +
+                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastResendSpaceTick) < 250 ? "y" : "n"));
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }
