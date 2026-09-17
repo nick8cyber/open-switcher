@@ -386,7 +386,7 @@ namespace OpenSwitcher.Core
                 if (msg == Native.WM_KEYDOWN && treatAsReal && (k.vkCode & 0xFF) == 0x20)
                 {
                     if (_lastResendSpaceTick != 0 && _buf.Count == 0 &&
-                        unchecked(Environment.TickCount - _lastResendSpaceTick) < 250)
+                        unchecked(Environment.TickCount - _lastResendSpaceTick) < 600)
                     {
                         Log("space-echo swallowed");
                         return IntPtr.Zero;
@@ -731,6 +731,34 @@ namespace OpenSwitcher.Core
                 }
                 if (!modified && S.FixOnEnter)
                     converted = TryConvertWord(word, 0x0D, false, false);
+                // одиночная буква по «словности» и на Enter ('f'+Enter -> «а»):
+                // без этого 'f' в начале сообщения уходит в чат неперевёрнутым
+                if (!converted && !modified && !S.Paused && word.Count == 1)
+                {
+                    string asTyped = LayoutService.Render(_fgHkl, word);
+                    int typedLang = LanguageTables.LangOf(asTyped);
+                    if (asTyped.Length == 1 && typedLang >= 0 &&
+                        !WordDict.HasSingleLetterWord(asTyped, typedLang))
+                    {
+                        IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
+                        if (otherHkl != IntPtr.Zero)
+                        {
+                            string flipped = LayoutService.Render(otherHkl, word);
+                            if (flipped.Length == 1 && WordDict.HasSingleLetterWord(flipped, 1 - typedLang))
+                            {
+                                converted = true;
+                                TextConverter.ReleaseModifiers();
+                                TextConverter.InjectMode = S.InputMode;
+                                TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+                                Log("single-letter enter: '" + asTyped + "' -> '" + flipped + "'");
+                                Suppress(600);
+                                TextConverter.SendBackspaces(1);
+                                TextConverter.SendUnicode(flipped);
+                                TextConverter.SendKey(0x0D, false, false); // Enter досылаем
+                            }
+                        }
+                    }
+                }
                 // ВАЖНО: Enter лок НЕ снимает — в длинном тексте энтеры подряд,
                 // а сессия ввода (окно) не сменилась. Лок держится до смены окна.
                 // хвост отката после Enter восстановить нельзя
@@ -817,7 +845,7 @@ namespace OpenSwitcher.Core
                 if (vk == 0x20 && !modified)
                     Log("space: " + (converted ? "flip+resend" : "pass") +
                         " bufWas=" + _buf.Count +
-                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastResendSpaceTick) < 250 ? "y" : "n"));
+                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastResendSpaceTick) < 600 ? "y" : "n"));
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }
