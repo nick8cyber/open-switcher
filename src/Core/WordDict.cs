@@ -60,6 +60,9 @@ namespace OpenSwitcher.Core
             "other some such only own same so than too very one two three four five hello " +
             "hi hey thanks thank please sorry okay ok yeah yep nope lol wow oops world love " +
             "time work day night life home house friend friends best good bad new old big " +
+            // 'iban' удалён: его RU-прочтение с клавиш — «шифт», и слово «шифт»
+            // переворачивалось в 'iban' при каждом правильном наборе
+            "really qwerty who test tests ban tan win fail " +
             "small great little last first next long short make made want need know think " +
             "see look hear listen understand write read help open close start stop wait " +
             "find take give forget remember sit stand sleep eat drink run walk go come get " +
@@ -68,7 +71,7 @@ namespace OpenSwitcher.Core
             "girl name money water food room door table chair book page learn study play " +
             "watch send nice cool crazy funny boring easy hard real true false sure maybe " +
             "probably actually right wrong now later today tomorrow yesterday morning " +
-            "evening just like know really qwerty iban who test tests ban tan win fail " +
+            "evening just like know really qwerty who test tests ban tan win fail " +
             "fixed fixer bugfix " +
             // двухбуквенные местоимения/предлоги/союзы: без них 2-буквенный порог
             // переворачивал бы 'he'->'не', 'me'->'ьу', 'we'->'це' при нормальном EN

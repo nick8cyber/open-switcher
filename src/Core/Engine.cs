@@ -43,6 +43,7 @@ namespace OpenSwitcher.Core
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
         private string _lastConvertInfo = "-"; // последняя конвертация «было -> стало» — для снимка в метке
         private int _lastConvertTick;        // когда была последняя конвертация
+        private int _lastConvertLang = -1;   // в какой язык конвертили последний раз (контекст для одиночных букв)
         private IntPtr _expectedHkl;         // раскладка, которую ожидаем в переднем окне
         private IntPtr _expectedHwnd;        // окно, для которого ожидаем _expectedHkl
         private bool _expectedValid;
@@ -748,6 +749,47 @@ namespace OpenSwitcher.Core
                 // при зажатых модификаторах (шорткаты) не вмешиваемся
                 bool modified = ctrl || alt || win || shift;
                 bool converted = false;
+
+                // ОДИНОЧНАЯ БУКВА + КОНТЕКСТ (как в Caramba: «'d' + пробел -> 'в'»).
+                // Словарь на одной букве бессилен; направление показывает последняя
+                // конвертация: если юзер только что конвертился в русский, то одинокая
+                // 'f' после этого — это «а» ('фс'->'ac', 'а'->'f' — жалобы из лога)
+                if (!modified && !S.Paused && _buf.Count == 1 && _lastConvertLang >= 0 &&
+                    unchecked(Environment.TickCount - _lastConvertTick) < 10000)
+                {
+                    IntPtr wantHkl = LayoutService.FindLayoutByLang(_lastConvertLang);
+                    if (wantHkl != IntPtr.Zero && wantHkl != _fgHkl)
+                    {
+                        string asTyped = LayoutService.Render(_fgHkl, _buf.Snapshot());
+                        string flipped = LayoutService.Render(wantHkl, _buf.Snapshot());
+                        if (asTyped.Length == 1 && flipped.Length == 1 && asTyped != flipped)
+                        {
+                            converted = true;
+                            TextConverter.ReleaseModifiers();
+                            TextConverter.InjectMode = S.InputMode;
+                            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+                            Log("single-letter: '" + asTyped + "' -> '" + flipped + "' (context)");
+                            Suppress(600);
+                            TextConverter.SendBackspaces(1);
+                            TextConverter.SendUnicode(flipped);
+                            // точка отката: Break вернёт букву и разделитель
+                            _undoPending = true;
+                            _undoText = asTyped;
+                            _undoLen = flipped.Length;
+                            _undoSepText = RenderKeyChar(vk, _fgHkl, shift);
+                            _undoHkl = _fgHkl;
+                            _undoHwnd = _fgHwnd;
+                            _undoFocus = _fgFocus;
+                            _undoTick = Environment.TickCount;
+                            _keysSinceUndoPoint = 0;
+                            _undoTail.Clear();
+                            _undoTailBroken = false;
+                            TextConverter.SendUnicode(_undoSepText); // досылаем разделитель как набрано
+                            if (_undoSepText == " ") _lastResendSpaceTick = Environment.TickCount;
+                        }
+                    }
+                }
+
                 if (!modified && S.AutoConvertOnWordEnd && _buf.Count > 0)
                 {
                     List<KeyRec> word = _buf.Snapshot();
@@ -1101,6 +1143,7 @@ namespace OpenSwitcher.Core
             // полностью погашенной инжекции (HIPS) текст не изменился — армng отката
             // стирал бы РЕАЛЬНЫЕ символы юзера при последующем Break
             bool injOk = TextConverter.LastSendInputRequested == 0 || TextConverter.LastSendInputResult > 0;
+            _lastConvertLang = best.Lang;
             _undoPending = resendVk != 0x0D && injOk;
             _undoText = cur.Text;
             _undoLen = best.Text.Length;
