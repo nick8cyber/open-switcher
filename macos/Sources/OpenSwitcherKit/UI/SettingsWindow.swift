@@ -285,8 +285,8 @@ struct GlyphView: NSViewRepresentable {
                 ctx?.strokeEllipse(in: CGRect(x: cx - r0, y: cy - r0, width: r0 * 2, height: r0 * 2))
                 for a in 0..<8 {
                     let ang = Double(a) * .pi / 4
-                    ctx?.move(to: CGPoint(x: cx + r0 * cos(ang), y: cy + r0 * sin(ang)))
-                    ctx?.addLine(to: CGPoint(x: cx + rad * cos(ang), y: cy + rad * sin(ang)))
+                    ctx?.move(to: CGPoint(x: cx + r0 * Foundation.cos(ang), y: cy + r0 * Foundation.sin(ang)))
+                    ctx?.addLine(to: CGPoint(x: cx + rad * Foundation.cos(ang), y: cy + rad * Foundation.sin(ang)))
                 }
                 ctx?.strokePath()
             default: break
