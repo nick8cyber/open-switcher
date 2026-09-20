@@ -9,6 +9,11 @@ set -e
 cd "$(dirname "$0")"
 APP="${1:-build/OpenSwitcher.app}"
 
+# ВАЖНО: звать бинарник notarytool НАПРЯМУЮ. Через `xcrun notarytool` связка
+# ключей считает его другим приложением (ACL по пути бинарника) и молча
+# отвечает «No Keychain password item found» — грабля раунда 5 (2026-09-20).
+NOTARY="$(xcrun -f notarytool)"
+
 AUTH_ARGS=()
 if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$TEAM_ID" ]; then
     AUTH_ARGS=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$TEAM_ID")
@@ -17,7 +22,7 @@ else
 fi
 
 echo ">> Отправка в Apple: $APP"
-xcrun notarytool submit "$(dirname "$APP")/$(basename "$APP").zip" \
+"$NOTARY" submit "$(dirname "$APP")/$(basename "$APP").zip" \
     "${AUTH_ARGS[@]}" --wait
 
 echo ">> Штапелирование"
