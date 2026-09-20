@@ -362,6 +362,11 @@ namespace OpenSwitcher.Core
                     string mBuf = _buf.Count > 0 ? LayoutService.Render(_fgHkl, _buf.Snapshot()) : "";
                     string mLastWord = _lastWord.Count > 0 ? LayoutService.Render(_fgHkl, _lastWord) : "";
                     Log("================ USER MARK #" + _markCount + " ================");
+                    if (!S.DevLog)
+                    {
+                        FireInfo("Журнал отключён — включите «Режим разработчика»");
+                        return IntPtr.Zero;
+                    }
                     Log("mark: proc=" + (_fgProc ?? "?") +
                         " hwnd=" + _fgHwnd.ToInt64().ToString("X") +
                         " hkl=" + _fgHkl.ToInt64().ToString("X8") +
@@ -1803,6 +1808,9 @@ namespace OpenSwitcher.Core
 
         private void Log(string line)
         {
+            // журнал ведётся только в режиме разработчика (настройка DevLog):
+            // для открытой версии — никаких записей о нажатиях пользователя
+            if (!S.DevLog) return;
             _logBuf.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line);
             Defer(FlushLog);
         }
