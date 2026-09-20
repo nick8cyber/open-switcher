@@ -34,6 +34,7 @@ public final class Settings {
     // --- система
     public var showPopup = true
     public var restoreClipboard = true
+    public var devLog = false  // режим разработчика: вести журнал решений в файл (DevLog в C#; для опенсорса — ВЫКЛ)
     public var startWithSystem = false
     public var paused = false
     public var exclusions = ""
@@ -66,6 +67,7 @@ public enum SettingsStore {
         case "DoubleShiftSwitch": s.doubleShiftSwitch = v == "1"
         case "ShowPopup": s.showPopup = v == "1"
         case "RestoreClipboard": s.restoreClipboard = v == "1"
+        case "DevLog": s.devLog = v == "1"
         case "StartWithWindows", "StartWithSystem": s.startWithSystem = v == "1"
         case "Paused": s.paused = v == "1"
         case "MinWordLen": s.minWordLen = max(2, min(8, Int(v) ?? 3))
@@ -97,6 +99,7 @@ public enum SettingsStore {
             "DoubleShiftSwitch=\(s.doubleShiftSwitch ? 1 : 0)",
             "ShowPopup=\(s.showPopup ? 1 : 0)",
             "RestoreClipboard=\(s.restoreClipboard ? 1 : 0)",
+            "DevLog=\(s.devLog ? 1 : 0)",
             "StartWithSystem=\(s.startWithSystem ? 1 : 0)",
             "Paused=\(s.paused ? 1 : 0)",
             "MinWordLen=\(s.minWordLen)",

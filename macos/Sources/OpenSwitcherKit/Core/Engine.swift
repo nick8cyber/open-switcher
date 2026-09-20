@@ -536,6 +536,12 @@ public final class Engine {
             let mBuf = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "") : ""
             let mLast = lastWord.isEmpty ? "" : (LayoutService.currentLayout().map { LayoutService.render($0, lastWord) } ?? "")
             logLine("================ USER MARK #\(markCount) ================")
+            // журнал выключен — вместо снимка подсказка юзеру (как в C#:
+            // FireInfo «Журнал отключён…» + выход без записи); F8 не глотается
+            if !s.devLog {
+                fireInfo("Журнал отключён — включите «Режим разработчика»")
+                return true
+            }
             logLine("mark: proc=\(fgProc) buf='\(mBuf)' lastWord='\(mLast)' (\(String(format: "%.1f", Engine.ms() - lastWordAt))s ago)" +
                 " undo=\(undoPending ? "pending ('\(undoText)')" : "no") locked=\(autoLocked ? 1 : 0)" +
                 " suppress=\(Engine.ms() < suppressUntil ? "yes" : "no")" +
@@ -1449,6 +1455,10 @@ public final class Engine {
     }()
 
     func logLine(_ line: String) {
+        // журнал ведётся только в режиме разработчика (настройка DevLog):
+        // для открытой версии — никаких записей о нажатиях пользователя
+        // (паритет C#: Log() при !S.DevLog не буферизует и не пишет ничего)
+        guard s.devLog else { return }
         // DateFormatter не потокобезопасен: форматируем под общим локом
         logLock.lock()
         let entry = "\(Self.logDateFormatter.string(from: Date()))  \(line)"

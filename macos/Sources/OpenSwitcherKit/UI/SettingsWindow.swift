@@ -772,6 +772,7 @@ public final class SettingsUiModel: ObservableObject {
     @Published var themeIndex = 0
     @Published var showPopup = true
     @Published var restoreClipboard = true
+    @Published var devLog = false
     @Published var startWithSystem = false
     @Published var exclusions = ""
 
@@ -785,7 +786,8 @@ public final class SettingsUiModel: ObservableObject {
                 "word": "\(hkWordVk):\(hkWordMods)", "sel": "\(hkSelVk):\(hkSelMods)",
                 "undo": "\(hkUndoVk):\(hkUndoMods)", "auto": "\(hkAutoVk):\(hkAutoMods)",
                 "ds": "\(doubleShift)", "theme": "\(themeIndex)", "popup": "\(showPopup)",
-                "clip": "\(restoreClipboard)", "autostart": "\(startWithSystem)",
+                "clip": "\(restoreClipboard)", "devlog": "\(devLog)",
+                "autostart": "\(startWithSystem)",
                 "excl": exclusions]
     }
 
@@ -808,6 +810,7 @@ public final class SettingsUiModel: ObservableObject {
         themeIndex = s.themeMode
         showPopup = s.showPopup
         restoreClipboard = s.restoreClipboard
+        devLog = s.devLog
         startWithSystem = s.startWithSystem
         exclusions = s.exclusions
         refreshBaseline()
@@ -828,6 +831,7 @@ public final class SettingsUiModel: ObservableObject {
         s.themeMode = themeIndex
         s.showPopup = showPopup
         s.restoreClipboard = restoreClipboard
+        s.devLog = devLog
         s.startWithSystem = startWithSystem
         s.exclusions = exclusions
             .replacingOccurrences(of: "\n", with: ",")  // ini однострочный
@@ -991,6 +995,11 @@ struct SystemPage: View {
                 Row(title: "Восстанавливать буфер обмена",
                     sub: "Вернуть прежнее содержимое после конвертации выделения") {
                     ToggleButton(on: model.restoreClipboard) { model.restoreClipboard.toggle() }
+                }
+                DividerW()
+                Row(title: "Режим разработчика",
+                    sub: "Вести журнал решений в файл (для отладки)") {
+                    ToggleButton(on: model.devLog) { model.devLog.toggle() }
                 }
                 DividerW()
                 Row(title: "Запускать при входе в macOS", sub: nil) {
