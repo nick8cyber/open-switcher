@@ -27,13 +27,14 @@ jobs:
       # секреты в step-if недоступны — пробрасываем через env
       HAS_P12: ${{ secrets.DEVELOPER_ID_P12 != '' }}
       SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       TEAM_ID: ${{ secrets.TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Developer ID certificate
-        if: ${{ secrets.DEVELOPER_ID_P12 != '' }}
+        if: env.HAS_P12 == 'true' && env.P12_PASSWORD != '' 
         env:
           DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
@@ -48,19 +49,17 @@ jobs:
       - name: Build app (${{ matrix.arch }})
         run: cd macos && ./build.sh ${{ matrix.arch }}
       - name: Codesign
-        env:
-          SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
         run: |
-          ID="${SIGN_IDENTITY:-Developer ID Application}"
-          if secrets_set=1; [ -n "$SIGN_IDENTITY" ]; then
-            codesign --force --deep --options runtime --timestamp --sign "$ID" macos/build/OpenSwitcher.app
+          if [ -n "$SIGN_IDENTITY" ]; then
+            codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" macos/build/OpenSwitcher.app
           else
             codesign --force --deep -s - macos/build/OpenSwitcher.app
           fi
       - name: Notarize
-        if: ${{ secrets.APPLE_ID != '' }}
+        if: env.APPLE_ID != '' && env.APPLE_APP_SPECIFIC_PASSWORD != '' 
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
