@@ -9,3 +9,9 @@ tools/add-startmenu-run.cmd
 sm.log
 autorun_check.txt
 cert_check.txt
+
+# --- macOS port ---
+.build/
+build/
+*.app
+.DS_Store
