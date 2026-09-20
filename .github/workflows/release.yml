@@ -1,0 +1,36 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build exe
+        shell: cmd
+        run: cd win && build.cmd
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path win/OpenSwitcher.exe, win/README.md -DestinationPath OpenSwitcher-win.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: OpenSwitcher-win.zip
+  macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app (${{ matrix.arch }})
+        run: cd macos && ./build.sh ${{ matrix.arch }}
+      - name: Codesign (ad-hoc) and zip
+        run: |
+          codesign --force --deep -s - macos/build/OpenSwitcher.app
+          NAME=OpenSwitcher-macOS-AppleSilicon
+          [ "${{ matrix.arch }}" = "x86_64" ] && NAME=OpenSwitcher-macOS-Intel
+          cd macos/build && zip -qry "../../$NAME.app.zip" OpenSwitcher.app
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: OpenSwitcher-macOS-*.zip
