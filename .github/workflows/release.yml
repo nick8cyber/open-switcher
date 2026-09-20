@@ -21,6 +21,13 @@ jobs:
     strategy:
       matrix:
         arch: [arm64, x86_64]
+    env:
+      # секреты в step-if недоступны — пробрасываем через env
+      HAS_P12: ${{ secrets.DEVELOPER_ID_P12 != '' }}
+      SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Developer ID certificate

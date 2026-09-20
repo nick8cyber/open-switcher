@@ -28,6 +28,23 @@ Mac-порт синхронизирован со спекой и проходи�
   «Универсальный доступ») — приложение подхватит его само в течение 10 с.
   Подробнее в [`macos/README.md`](macos/README.md).
 
+### Подпись и нотаризация (macOS)
+
+Сборки подписываются сертификатом **Developer ID Application** и отправляются
+в Apple на нотаризацию (Gatekeeper). Локально:
+
+```bash
+cd macos
+./build.sh arm64
+codesign --force --deep --options runtime --timestamp \
+  --sign "Developer ID Application: <Имя> (TEAMID)" build/OpenSwitcher.app
+APPLE_ID=... APPLE_APP_SPECIFIC_PASSWORD=... TEAM_ID=... ./notarize.sh build/OpenSwitcher.app
+```
+
+Автоматически — в CI по тегу (секреты `SIGN_IDENTITY`, `DEVELOPER_ID_P12`,
+`P12_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `TEAM_ID`).
+Без нотаризации Gatekeeper попросит ПКМ → «Открыть» при первом запуске.
+
 ## Структура
 
 ```
