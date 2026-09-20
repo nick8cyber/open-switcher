@@ -107,3 +107,10 @@ build.cmd
 - Лок после ручного выбора языка по умолчанию выключен; исключения —
   точные имена процессов («notepad.exe»), через запятую.
 
+## Лицензия
+
+[GPL-3.0](LICENSE) — anyone who builds on this code must release their
+version under the same license. Закрытые форки и платные сборки на основе
+этого кода запрещены. Коммерческое лицензирование вне GPL — по
+согласованию с автором ([@nick8cyber](https://github.com/nick8cyber)).
+
