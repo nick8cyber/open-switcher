@@ -95,6 +95,23 @@ public enum SelfTest {
             sb += "\(pass ? "PASS" : "FAIL"): [v3] \(name)\(pass ? "" : " !!")\n"
         }
 
+        // --- keycode-карта букв (раунд 7): kVK_ANSI_X=0x07, kVK_ANSI_Y=0x10,
+        // 0x19 — это «9», а не «y»; «ч»/«н» набираются клавишами X/Y ---
+        let xychecks: [(String, Bool)] = [
+            ("keycode: 'x' = 0x07 (kVK_ANSI_X)",  CharMaps.keyCode(ofChar: "x", fromRu: false) == 0x07),
+            ("keycode: 'y' = 0x10 (kVK_ANSI_Y)",  CharMaps.keyCode(ofChar: "y", fromRu: false) == 0x10),
+            ("keycode: 'ч' → клавиша X (0x07)",   CharMaps.keyCode(ofChar: "ч", fromRu: true) == 0x07),
+            ("keycode: 'н' → клавиша Y (0x10)",   CharMaps.keyCode(ofChar: "н", fromRu: true) == 0x10),
+            ("keycode: '9' — не буква",           KeyCodeMap.ansiCode(ofLatin: "9") == -1),
+            ("keycode: '9' цифрой (0x19)",        KeyCodeMap.digits.contains(0x19)),
+            ("keycode: вся латиница a..z в карте", "abcdefghijklmnopqrstuvwxyz".allSatisfy { CharMaps.keyCode(ofChar: $0, fromRu: false) >= 0 }),
+            ("keycode: вся кириллица в карте",    CharMaps.ru.allSatisfy { CharMaps.keyCode(ofChar: $0, fromRu: true) >= 0 }),
+        ]
+        for (name, got) in xychecks {
+            if !got { fails += 1 }
+            sb += "\(got ? "PASS" : "FAIL"): [xy] \(name)\(got ? "" : " !!")\n"
+        }
+
         sb += fails == 0 ? "ALL TESTS PASSED\n" : "\(fails) TEST(S) FAILED\n"
         try? sb.write(toFile: outPath, atomically: true, encoding: .utf8)
         print(sb, terminator: "")

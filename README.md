@@ -18,8 +18,8 @@ Mac-порт синхронизирован со спекой и проходи�
 Готовые сборки — в [Releases](../../releases) по тегам:
 
 - `OpenSwitcher-win.zip` — Windows (anycpu, .NET Framework 4.x предустановлен);
-- `OpenSwitcher-macOS-AppleSilicon.zip` — Mac на чипах M1…M-серии;
-- `OpenSwitcher-macOS-Intel.zip` — старые Mac на Intel.
+- `OpenSwitcher-macOS-AppleSilicon.app.zip` — Mac на чипах M1…M-серии;
+- `OpenSwitcher-macOS-Intel.app.zip` — старые Mac на Intel.
 
 ## Первый запуск
 
@@ -38,6 +38,7 @@ cd macos
 ./build.sh arm64
 codesign --force --deep --options runtime --timestamp \
   --sign "Developer ID Application: <Имя> (TEAMID)" build/OpenSwitcher.app
+cd build && ditto -c -k --keepParent OpenSwitcher.app OpenSwitcher.app.zip && cd ..
 APPLE_ID=... APPLE_APP_SPECIFIC_PASSWORD=... TEAM_ID=... ./notarize.sh build/OpenSwitcher.app
 ```
 

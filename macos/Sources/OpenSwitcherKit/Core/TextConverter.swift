@@ -10,9 +10,6 @@ public enum TextConverter {
     static let selfMagic: Int64 = 0x05FA_5717
     static let userField = CGEventField(rawValue: 42)! // kCGEventSourceUserData (CGEventTypes.h)
 
-    /// Индекс GLM: помечаем и нажатия и отпускания.
-    static var selfInjectDepth = 0
-
     /// PID переднего приложения: инжекция адресуется ему (CGEventPostToPid,
     /// спека v3 §16) — смена окна в момент доставки не уводит текст в чужое окно.
     public static var targetPid: pid_t = 0

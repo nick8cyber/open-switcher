@@ -11,6 +11,7 @@ public final class Engine {
 
     private var tap: CFMachPort?
     private var tapThread: Thread?
+    private var tapRunLoop: CFRunLoop?   // runloop потока тапа (для сериализации с main)
 
     private let buf = WordBuffer()
     private var lastWord: [KeyRec] = []
@@ -45,7 +46,6 @@ public final class Engine {
     private var undoTail: [KeyRec] = []
     private var undoTailBroken = false
     private var lastConvertInfo = "-"
-    private var lastConvertAt: TimeInterval = 0
 
     // ожидаемая раскладка (ложный лок автодетекта после ручной смены)
     private var expectedLayoutID: String?
@@ -69,7 +69,6 @@ public final class Engine {
     private var fgProc = ""
     private var fgIsOwnApp = false
     private var procCache: [pid_t: String] = [:]
-    private var prevFlags: CGEventFlags = []
 
     // собственное окно настроек: автоисправление только в «песочнице»
     public var uiSettingsActive = false
@@ -143,6 +142,7 @@ public final class Engine {
         let port = initialPort
         let thread = Thread { [weak self] in
             let rlCF = RunLoop.current.getCFRunLoop()
+            self?.tapRunLoop = rlCF // до run(): публичные переключения встают в очередь этого runloop
             if let port = port ?? self?.tap {
                 CFRunLoopAddSource(rlCF, CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0), .commonModes)
             }
@@ -408,7 +408,6 @@ public final class Engine {
 
     private func onFlagsChanged(_ event: CGEvent) -> Bool {
         let flags = currentFlags(event)
-        defer { prevFlags = flags }
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
         let now = Engine.ms()
         let m = heldModsFromFlags(flags)
@@ -533,19 +532,21 @@ public final class Engine {
         if code == 0x64 {
             markCount += 1
             updateForeground()
-            let mBuf = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "") : ""
-            let mLast = lastWord.isEmpty ? "" : (LayoutService.currentLayout().map { LayoutService.render($0, lastWord) } ?? "")
-            logLine("================ USER MARK #\(markCount) ================")
             // журнал выключен — вместо снимка подсказка юзеру (как в C#:
             // FireInfo «Журнал отключён…» + выход без записи); F8 не глотается
             if !s.devLog {
                 fireInfo("Журнал отключён — включите «Режим разработчика»")
                 return true
             }
+            // рендер снимка (UCKeyTranslate) — только при включённом журнале
+            let mBuf = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "") : ""
+            let mLast = lastWord.isEmpty ? "" : (LayoutService.currentLayout().map { LayoutService.render($0, lastWord) } ?? "")
+            logLine("================ USER MARK #\(markCount) ================")
             logLine("mark: proc=\(fgProc) buf='\(mBuf)' lastWord='\(mLast)' (\(String(format: "%.1f", Engine.ms() - lastWordAt))s ago)" +
                 " undo=\(undoPending ? "pending ('\(undoText)')" : "no") locked=\(autoLocked ? 1 : 0)" +
                 " suppress=\(Engine.ms() < suppressUntil ? "yes" : "no")" +
                 " lastConvert=\(lastConvertInfo)")
+            fireInfo("Метка #\(markCount) записана в лог") // паритет C# Engine.cs:384
         }
         let flags = currentFlags(event)
         let shift = flags.contains(.maskShift)
@@ -894,7 +895,26 @@ public final class Engine {
 
     // ------------------------------------------------------------------ действия
 
+    /// Сериализация публичных действий на потоке тапа: меню/горячие пути зовут
+    /// их с main, а тело мутирует gapBuf/gapActive/autoLocked, которые читает
+    /// живой тап-поток. На потоке тапа — исполняем сразу; тапа нет (selftest)
+    /// — исполняем как есть.
+    private func performOnTapThread(_ body: @escaping () -> Void) {
+        if CFRunLoopGetCurrent() === tapRunLoop {
+            body()
+        } else if let rl = tapRunLoop {
+            CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) { body() }
+            CFRunLoopWakeUp(rl)
+        } else {
+            body()
+        }
+    }
+
     public func switchToLanguage(_ lang: Int) {
+        performOnTapThread { [weak self] in self?.switchToLanguageOnTap(lang) }
+    }
+
+    private func switchToLanguageOnTap(_ lang: Int) {
         updateForeground()
         guard let target = LayoutService.findLayoutByLang(lang) else {
             fireInfo(lang == 0 ? "Русская раскладка не найдена" : "Английская раскладка не найдена")
@@ -910,6 +930,10 @@ public final class Engine {
     }
 
     public func switchToOtherLayout() {
+        performOnTapThread { [weak self] in self?.switchToOtherLayoutOnTap() }
+    }
+
+    private func switchToOtherLayoutOnTap() {
         updateForeground()
         let layouts = LayoutService.getLayouts()
         guard let curID = LayoutService.currentLayout()?.id,
@@ -942,7 +966,6 @@ public final class Engine {
 
         guard let curID = LayoutService.currentLayout()?.id,
               let cur = cands.first(where: { $0.layoutID == curID }) else {
-            // идентификатор текущей раскладки не найден в списке — берём первую
             logLine("convert skip: cur unknown"); return false
         }
         if cur.lang < 0 { logLine("convert skip: cur unknown lang"); return false }
@@ -1038,7 +1061,6 @@ public final class Engine {
         lastWordSepKey = 0 // ручной/беспраздельный путь: точный force-flip разоружаем (C#:1236)
         logLine("convert OK: '\(cur.text)' -> '\(bestText)' (resend=\(resendKey))")
         lastConvertInfo = "'\(cur.text)' -> '\(bestText)'"
-        lastConvertAt = Engine.ms()
         lastWord = word
 
         suppress(0.6)
@@ -1190,7 +1212,6 @@ public final class Engine {
 
         logLine("force-flip: '\(cur.text)' -> '\(best.text)'")
         lastConvertInfo = "force '\(cur.text)' -> '\(best.text)'"
-        lastConvertAt = Engine.ms()
 
         suppress(0.6)
         TextConverter.targetPid = fgApp
@@ -1317,7 +1338,6 @@ public final class Engine {
         TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
         logLine("sel: pasted converted (lang=\(lang))")
         lastConvertInfo = "sel '\(text)' -> '\(converted)'"
-        lastConvertAt = Engine.ms()
 
         if selFromFixWord && text.count >= s.minWordLen && text.count <= 24
             && text == LanguageTables.lettersOnly(text) && !WordDict.has(text, lang) {

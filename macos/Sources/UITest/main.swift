@@ -23,7 +23,7 @@ window.layoutIfNeeded()
 
 let view = vc.view
 view.layoutSubtreeIfNeeded()
-let size = view.fittingSize == .zero ? view.bounds.size : view.bounds.size
+let size = view.bounds.size
 guard size.width > 10 else { print("no size"); exit(2) }
 
 let image = NSImage(size: size)

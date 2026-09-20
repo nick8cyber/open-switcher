@@ -39,11 +39,31 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
     }
 
     public func windowWillClose(_ notification: Notification) {
+        // dirty-guard (порт OnFormClosing SettingsForm.cs): несохранённые правки —
+        // спрашиваем; «Отмена» возвращает окно и не даёт закрыться
+        if uiModel.isDirty {
+            let alert = NSAlert()
+            alert.messageText = "Закрыть без сохранения?"
+            alert.informativeText = "Настройки были изменены, но не сохранены."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Сохранить")
+            alert.addButton(withTitle: "Не сохранять")
+            alert.addButton(withTitle: "Отмена")
+            let resp = alert.runModal()
+            switch resp {
+            case .alertFirstButtonReturn:
+                applySettingsFromModel(engine: engine, model: uiModel)
+            case .alertThirdButtonReturn:
+                window?.makeKeyAndOrderFront(nil)
+                return
+            default:
+                break // «Не сохранять» — закрываем без применения
+            }
+        }
         engine.uiSettingsActive = false
         engine.sandboxFocused = false
         // окно закрывается — освобождаем ссылку в статус-айтеме через замыкание
         onClose?()
-
     }
 }
 
