@@ -85,8 +85,8 @@ jobs:
 
       - name: Zip
         run: |
-          NAME=OpenSwitcher-macOS-AppleSilicon
-          [ "${{ matrix.arch }}" = "x86_64" ] && NAME=OpenSwitcher-macOS-Intel
+          NAME=OpenSwitcher-macOS-AppleSilicon-M1-M6
+          [ "${{ matrix.arch }}" = "x86_64" ] && NAME=OpenSwitcher-macOS-Intel-old-Macs
           cd macos/build
           zip -qry "../../$NAME.app.zip" OpenSwitcher.app
 

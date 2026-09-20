@@ -18,8 +18,11 @@ Mac-порт синхронизирован со спекой и проходи�
 Готовые сборки — в [Releases](../../releases) по тегам:
 
 - `OpenSwitcher-win.zip` — Windows (anycpu, .NET Framework 4.x предустановлен);
-- `OpenSwitcher-macOS-AppleSilicon.app.zip` — Mac на чипах M1…M-серии;
-- `OpenSwitcher-macOS-Intel.app.zip` — старые Mac на Intel.
+- `OpenSwitcher-macOS-AppleSilicon-M1-M6.app.zip` — Mac на чипах M1…M-серии;
+- `OpenSwitcher-macOS-Intel-old-Macs.app.zip` — старые Mac на Intel.
+
+Не знаешь, какой у тебя процессор: меню  → «Об этом Mac» — строка
+«Чип» (Apple Silicon) или «Процессор» (Intel).
 
 ## Первый запуск
 

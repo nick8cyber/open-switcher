@@ -53,7 +53,11 @@ Windows-аналога Punto Switcher / Caramba Switcher с открытым и�
 
 Соберёт `build/OpenSwitcher.app` и прогонит self-test детектора
 (selftest пропускается, если целевая архитектура не исполняема на хосте).
-Готовые сборки под обе архитектуры — в [Releases](../../releases) репозитория.
+Готовые сборки — в [Releases](../../releases) репозитория:
+`OpenSwitcher-macOS-AppleSilicon-M1-M6.app.zip` (Mac на чипах M1…M-серии) и
+`OpenSwitcher-macOS-Intel-old-Macs.app.zip` (старые Mac на Intel). Какой у тебя
+процессор: меню  → «Об этом Mac» — строка «Чип» (Apple Silicon) или
+«Процессор» (Intel).
 
 Полезные режимы:
 
