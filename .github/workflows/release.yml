@@ -53,6 +53,16 @@ jobs:
       - name: Build app (${{ matrix.arch }})
         run: cd macos && ./build.sh ${{ matrix.arch }}
 
+      - name: Verify architecture
+        shell: bash
+        run: |
+          BIN=macos/build/OpenSwitcher.app/Contents/MacOS/OpenSwitcher
+          lipo -info "$BIN"
+          if ! lipo -archs "$BIN" | tr -s ' ' '\n' | grep -qx "${{ matrix.arch }}"; then
+            echo "::error::Architecture mismatch: expected ${{ matrix.arch }}, got [$(lipo -archs "$BIN" | xargs)]"
+            exit 1
+          fi
+
       - name: Codesign
         run: |
           if [ -n "$SIGN_IDENTITY" ]; then
