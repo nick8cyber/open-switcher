@@ -133,7 +133,12 @@ public final class Engine {
         guard let port = createTapPort() else {
             logLine("tap FAILED: нет разрешения («Мониторинг ввода»)")
             tapAlertShown = true
-            DispatchQueue.main.async { [weak self] in self?.showInputMonitoringAlert() }
+            // AX-состояние читаем на main в момент алерта: если не хватает и его —
+            // покажем один комбинированный алерт, а не только «Мониторинг ввода»
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.showInputMonitoringAlert(alsoAccessibilityMissing: !accessibilityTrusted(prompt: false))
+            }
             // watchdog на потоке тапа позже сам повторит createTapPort()
             ensureTapThread()
             return
@@ -253,19 +258,31 @@ public final class Engine {
     }
 
     /// Только main: не больше одного напоминания за раз, каждое — не чаще раза
-    /// за запуск. Порядок: сперва «Мониторинг ввода» (без него нечего проверять),
-    /// потом «Универсальный доступ», когда оба есть — «Работаю!».
+    /// за запуск. Состояния тапа и AX вычисляются НЕЗАВИСИМО: ранний return при
+    /// отсутствии тапа (старая логика) навсегда прятал AX-алерт — создание
+    /// .defaultTap-тапа само требует «Универсальный доступ», и юзер застревал
+    /// с одним алертом про «Мониторинг ввода».
     private func onboardingCheckOnMain() {
         guard onboardingAllowed, tapThread != nil else { return }
-        let st = permissionsState()
-        if !st.tap {
+        let tapOk = tap != nil
+        let axOk = accessibilityTrusted(prompt: false)
+        if !tapOk && !axOk {
+            // обоих разрешений нет — ОДИН комбинированный алерт с обоими пунктами
             if !tapAlertShown {
                 tapAlertShown = true
-                showInputMonitoringAlert()
+                axAlertShown = true // комбинированный алерт закрывает и AX-подсказку
+                showInputMonitoringAlert(alsoAccessibilityMissing: true)
             }
-            return // «Понадобится также „Универсальный доступ“ — спросим после»
+            return
         }
-        if !st.accessibility {
+        if !tapOk {
+            if !tapAlertShown {
+                tapAlertShown = true
+                showInputMonitoringAlert(alsoAccessibilityMissing: false)
+            }
+            return
+        }
+        if !axOk {
             if !axAlertShown {
                 axAlertShown = true
                 showAccessibilityAlert()
@@ -284,9 +301,23 @@ public final class Engine {
     }
 
     /// Подсказка при отсутствии разрешения «Мониторинг ввода» (чтение клавиш).
-    private func showInputMonitoringAlert() {
+    /// alsoAccessibilityMissing=true — обоих разрешений нет: один комбинированный
+    /// алерт с обоими пунктами, кнопка открывает ОБЕ панели (создание тапа само
+    /// требует AX — ждать «спросим после» нечему).
+    private func showInputMonitoringAlert(alsoAccessibilityMissing: Bool) {
         guard onboardingAllowed else { return }
         let a = NSAlert()
+        if alsoAccessibilityMissing {
+            a.messageText = "Нужны два разрешения: «Мониторинг ввода» и «Универсальный доступ»"
+            a.informativeText = "OpenSwitcher не видит нажатия клавиш и не может исправлять текст. Откройте Системные настройки → Конфиденциальность и безопасность и включите OpenSwitcher в разделах «Мониторинг ввода» и «Универсальный доступ». Перезапуск не нужен: приложение подхватит разрешения само в течение 10 секунд."
+            a.addButton(withTitle: "Открыть обе панели")
+            a.addButton(withTitle: "Позже")
+            if a.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(PermissionPanels.inputMonitoring)
+                NSWorkspace.shared.open(PermissionPanels.accessibility)
+            }
+            return
+        }
         a.messageText = "Требуется разрешение «Мониторинг ввода»"
         a.informativeText = "OpenSwitcher не видит нажатия клавиш. Откройте Системные настройки → Конфиденциальность и безопасность → Мониторинг ввода и включите OpenSwitcher. Перезапуск не нужен: приложение подхватит разрешение само в течение 10 секунд.\n\nПонадобится также «Универсальный доступ» — спросим после."
         a.addButton(withTitle: "Открыть Системные настройки")

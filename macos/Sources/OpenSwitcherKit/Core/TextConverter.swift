@@ -26,12 +26,25 @@ public enum TextConverter {
     /// Отпустить все модификаторы физически не нужно — CGEvent-комбо несут свои флаги.
     public static func releaseModifiers() {}
 
-    /// Ввести текст «юникодом» (аналог KEYEVENTF_UNICODE).
+    /// Системный лимит CGEventKeyboardSetUnicodeString — 20 кодовых единиц UTF-16
+    /// (uxUTF16StringMaxLength, CGEvent.h; тот же лимит режет чанки Chromium в
+    /// input_injector_mac.cc). Чанк больше лимита молча ОБРЕЗАЕТСЯ до 20 единиц:
+    /// прежние 60 теряли хвост слов длиннее ~20 символов.
+    private static let maxUTF16Chunk = 20
+
+    /// Ввести текст «юникодом» (аналог KEYEVENTF_UNICODE). Чанки считаются в
+    /// единицах UTF-16 (лимит системный именно в них); суррогатная пара
+    /// (символ вне BMP) не разрывается между чанками.
     public static func sendUnicode(_ text: String) {
-        let chars = Array(text.unicodeScalars)
+        let units = Array(text.utf16)
         var i = 0
-        while i < chars.count {
-            let chunk = String(String.UnicodeScalarView(chars[i..<min(i + 60, chars.count)]))
+        while i < units.count {
+            var end = min(i + maxUTF16Chunk, units.count) // остаток ≤ 20 единиц UTF-16
+            if end > i + 1, end < units.count,
+               units[end - 1] >= 0xD800, units[end - 1] <= 0xDBFF {
+                end -= 1 // граница попала между high/low суррогатом — отдвигаем её
+            }
+            let chunk = String(decoding: units[i..<end], as: UTF16.self)
             let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)
             down?.keyboardSetUnicodeString(stringLength: chunk.utf16.count,
                                            unicodeString: chunk.utf16.map { $0 as UniChar })
@@ -40,7 +53,7 @@ public enum TextConverter {
             up?.keyboardSetUnicodeString(stringLength: chunk.utf16.count,
                                          unicodeString: chunk.utf16.map { $0 as UniChar })
             if let u = up { post(u) }
-            i += 60
+            i = end
         }
     }
 
