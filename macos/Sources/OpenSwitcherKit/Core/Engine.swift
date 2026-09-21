@@ -1137,28 +1137,30 @@ public final class Engine {
             logLine("convert: dict-over-score ('\(cur.text)' -> '\(bestText)')")
         }
 
-        var dictSkip: String? = nil
-        if pass && !acceptedWord {
-            let targetInDict = WordDict.has(LanguageTables.lettersOnly(bestText), best.lang)
-            let curInDict = WordDict.has(cur.text, cur.lang)
-            if curInDict && !targetInDict {
-                dictSkip = "cur-in-dict, target-not"
-                pass = false
-            } else if !targetInDict && !curInDict {
-                if best.text.count <= 3 {
-                    dictSkip = "both-not-in-dict, short"
-                    pass = false
-                } else {
-                    let need = LanguageTables.baseMargin / max(0.3, s.sensitivity)
-                    if best.score - cur.score < need {
-                        dictSkip = "both-not-in-dict, margin"
-                        pass = false
-                    }
-                }
+        // цель не словарная (только «возможная» по биграммам): авто-переворот
+        // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
+        // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
+        // Словарные цели — обычный порог, выученные — без порога
+        // (порт C# 2fc5eaf «По бою 18:45»; прежний порт с single-margin
+        // «both-not-in-dict» опечаточный мусор пропускал)
+        if pass && !acceptedWord &&
+            !WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) {
+            let need = 2 * LanguageTables.baseMargin / max(0.3, s.sensitivity)
+            if best.score - cur.score < need {
+                logLine("convert skip: non-dict margin ('\(cur.text)' -> '\(bestText)')")
+                return false
             }
         }
+
+        // последнее предохранительное: набранное — частое слово, цель — нет:
+        // не трогаем (выученные пары не проверяем — юзер настоял) (C#:1213-1220)
+        if pass && !acceptedWord && WordDict.has(cur.text, cur.lang) &&
+            !WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) {
+            logLine("convert skip: cur-in-dict, target-not ('\(cur.text)' -> '\(bestText)')")
+            return false
+        }
         if !pass {
-            logLine("convert skip: score\(dictSkip.map { "/" + $0 } ?? "") ('\(cur.text)' -> '\(bestText)')")
+            logLine("convert skip: score ('\(cur.text)' -> '\(bestText)')")
             return false
         }
 
@@ -1308,6 +1310,14 @@ public final class Engine {
         guard let curID = LayoutService.currentLayout()?.id,
               let cur = cands.first(where: { $0.layoutID == curID }), cur.lang >= 0 else {
             logLine("force-flip skip: cur unknown"); return false
+        }
+        // юзер уже отменял переворот этой буквы/слова (rejected) — не повторяем
+        // его же ошибку (порт C# 2fc5eaf: 'lfdfqw'->«давайц» -> backspace ->
+        // Break вернул тот же мусор -> пинг-понг переворотов)
+        if isRejected(cur.text.lowercased()) {
+            logLine("force-flip skip: word in rejected ('\(cur.text)')")
+            fireInfo("Этот переворот ты уже отменял")
+            return false
         }
         guard let best = cands.filter({ $0.layoutID != curID && $0.lang >= 0 }).max(by: { $0.score < $1.score }),
               best.text != cur.text else {
