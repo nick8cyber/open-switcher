@@ -1195,6 +1195,21 @@ namespace OpenSwitcher.Core
                 Log("convert: dict-over-score ('" + cur.Text + "' -> '" + best.Text + "')");
             }
 
+            // цель не словарная (только «возможная» по биграммам): авто-переворот
+            // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
+            // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
+            // Словарные цели — обычный порог, выученные — без порога
+            if (pass && !acceptedWord &&
+                !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
+            {
+                double need = 2 * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
+                if (best.Score - cur.Score < need)
+                {
+                    Log("convert skip: non-dict margin ('" + cur.Text + "' -> '" + best.Text + "')");
+                    return false;
+                }
+            }
+
             // последнее предохранительное: набранное — частое слово, цель — нет:
             // не трогаем (выученные пары не проверяем — юзер настоял)
             if (pass && !acceptedWord && WordDict.Has(cur.Text, cur.Lang) &&
@@ -1426,6 +1441,13 @@ namespace OpenSwitcher.Core
             LayoutCandidate cur = null;
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) { Log("force-flip skip: cur unknown"); return false; }
+            // юзер уже отменял переворот этой буквы/слова (rejected) — не повторяем его же ошибку
+            if (_rejected.Contains(cur.Text.ToLowerInvariant()))
+            {
+                Log("force-flip skip: word in rejected ('" + cur.Text + "')");
+                FireInfo("Этот переворот ты уже отменял");
+                return false;
+            }
 
             LayoutCandidate best = null;
             foreach (LayoutCandidate c in cands)
