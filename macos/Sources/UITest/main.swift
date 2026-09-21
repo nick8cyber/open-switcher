@@ -23,26 +23,16 @@ window.layoutIfNeeded()
 
 let view = vc.view
 view.layoutSubtreeIfNeeded()
+
+// прогоняем runloop, чтобы SwiftUI досчитал лейаут — ДО гейта размера:
+// на macOS 15 синхронный layoutSubtreeIfNeeded без тиков runloop даёт 0x0
+for _ in 0..<5 { RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+
+view.layoutSubtreeIfNeeded()
 let size = view.bounds.size
 guard size.width > 10 else { print("no size"); exit(2) }
 
 let image = NSImage(size: size)
-image.lockFocus()
-if let ctx = NSGraphicsContext.current {
-    let cg = ctx.cgContext
-    cg.saveGState()
-    cg.translateBy(x: 0, y: size.height)
-    cg.scaleBy(x: 1, y: -1)
-    UiTheme.shared.bg.setFill()
-    NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
-    view.layer?.render(in: cg)
-    cg.restoreGState()
-}
-image.unlockFocus()
-
-// прогоняем runloop, чтобы SwiftUI досчитал лейаут
-for _ in 0..<5 { RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
-
 image.lockFocus()
 if let ctx = NSGraphicsContext.current {
     let cg = ctx.cgContext
