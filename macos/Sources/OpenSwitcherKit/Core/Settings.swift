@@ -31,7 +31,8 @@ public final class Settings {
     public var hotAutoToggleMods: Int = 0
     public var hotPasteVk: Int = 0x09            // «V» — вставить без форматирования (как в Caramba)
     public var hotPasteMods: Int = HK.CMD | HK.SHIFT
-    public var lockAutoAfterManualSwitch = false // v3 §18: ВЫКЛ — тапы у юзера рефлекторные
+    public var lockAutoAfterManualSwitch = true // классика Punto/Caramba: ручной тап = «я сам выбрал
+                                                // раскладку, не мешай» (владелец отменил SPEC v3 §18, defaultsV 10)
     public var doubleShiftSwitch = true
 
     // --- жесты «как в Caramba»
@@ -47,7 +48,7 @@ public final class Settings {
     public var paused = false
     public var exclusions = ""
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
-    public var defaultsV = 9
+    public var defaultsV = 10
 }
 
 public enum SettingsStore {
@@ -69,20 +70,32 @@ public enum SettingsStore {
     /// Миграции дефолтов (точное совпадение со старым дефолтом —
     /// кастомные хоткеи юзера не трогаем).
     static func migrate(_ s: inout Settings) {
-        guard s.defaultsV < 9 else { return }
-        // defaultsV 9: F15 (0x71) нет на современных Mac-клавиатурах —
-        // дефолтные undo/fixsel снимаются; главная отмена — Backspace сразу
-        // после замены, выделение конвертит Option-тап (select-left fallback).
-        if s.hotUndoVk == KeyCodeMap.f15 {
-            s.hotUndoVk = 0
-            s.hotUndoMods = 0
+        var migrated = false
+        if s.defaultsV < 9 {
+            // defaultsV 9: F15 (0x71) нет на современных Mac-клавиатурах —
+            // дефолтные undo/fixsel снимаются; главная отмена — Backspace сразу
+            // после замены, выделение конвертит Option-тап (select-left fallback).
+            if s.hotUndoVk == KeyCodeMap.f15 {
+                s.hotUndoVk = 0
+                s.hotUndoMods = 0
+            }
+            if s.hotFixSelVk == KeyCodeMap.f15 && s.hotFixSelMods == HK.SHIFT {
+                s.hotFixSelVk = 0
+                s.hotFixSelMods = 0
+            }
+            s.defaultsV = 9
+            migrated = true
         }
-        if s.hotFixSelVk == KeyCodeMap.f15 && s.hotFixSelMods == HK.SHIFT {
-            s.hotFixSelVk = 0
-            s.hotFixSelMods = 0
+        if s.defaultsV < 10 {
+            // defaultsV 10: лок автодетекта после ручного переключения ВКЛЮЧЁН
+            // по умолчанию — классика Punto/Caramba; решение владельца, отмена
+            // SPEC v3 §18. NB: безусловно перезапишет и юзера, кто осознанно
+            // выключил лок в ini, — осознанный компромисс (машина владельца).
+            s.lockAutoAfterManualSwitch = true
+            s.defaultsV = 10
+            migrated = true
         }
-        s.defaultsV = 9
-        save(s)
+        if migrated { save(s) }
     }
 
     static func applyLine(_ s: Settings, _ line: String) {

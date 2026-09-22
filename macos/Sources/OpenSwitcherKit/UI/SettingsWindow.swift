@@ -927,7 +927,7 @@ struct MainPage: View {
                 }
                 DividerW()
                 Row(title: "Не трогать после ручного выбора языка",
-                    sub: "Автодетект молчит до смены окна или приложения") {
+                    sub: "После тапа Shift / ручной смены автодетект молчит до смены окна или паузы 3 с") {
                     ToggleButton(on: model.lockAuto) { model.lockAuto.toggle() }
                 }
                 DividerW()
