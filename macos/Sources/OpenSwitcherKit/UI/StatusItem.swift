@@ -1,7 +1,8 @@
 import AppKit
 
-/// Иконка и меню в строке меню (порт TrayService.cs): тот же градиентный
-/// скруглённый квадрат со стрелками-переключателем.
+/// Иконка и меню в строке меню (порт TrayService.cs). Иконка строки меню —
+/// template-монохром по HIG (система красит под тему); цветной градиентный
+/// квадрат остался только в титлбаре окна настроек (AppIconView).
 public final class StatusItemService: NSObject {
     private let engine: Engine
     private var item: NSStatusItem?
@@ -15,7 +16,7 @@ public final class StatusItemService: NSObject {
 
     public func initItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = Self.makeIcon()
+        item.button?.image = Self.makeMenuIcon(paused: engine.s.paused)
         updateTooltip()
         let menu = NSMenu()
         // строка статуса (недоступна для клика)
@@ -81,6 +82,7 @@ public final class StatusItemService: NSObject {
     }
 
     public func updateTooltip() {
+        item?.button?.image = Self.makeMenuIcon(paused: engine.s.paused)
         item?.button?.toolTip = "OpenSwitcher — " + (engine.s.paused ? "пауза" : "Ru ⇄ En")
         // окно настроек следит за этим уведомлением — синк карточки статуса
         NotificationCenter.default.post(name: Notification.Name("os.paused"), object: nil)
@@ -140,7 +142,49 @@ public final class StatusItemService: NSObject {
         w.show()
     }
 
-    /// Иконка: градиент accent → #7C5CFF, белые стрелки-переключатель (порт MakeIcon).
+    /// Иконка строки меню: template-монохром по HIG — рисуем чёрным глиф,
+    /// система сама перекрашивает под тему/подсветку строки меню.
+    /// active: стрелки ⇄ (верхняя →, нижняя ←), paused: знак паузы ‖.
+    static func makeMenuIcon(paused: Bool) -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        if let ctx = NSGraphicsContext.current?.cgContext {
+            // глиф ~13×12 в центре 18×18, чтобы не лип к краям строки меню
+            ctx.setStrokeColor(NSColor.black.cgColor)
+            ctx.setLineWidth(1.8)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            if paused {
+                // ‖ — две вертикальные полосы
+                for x: CGFloat in [6.6, 11.4] {
+                    ctx.move(to: CGPoint(x: x, y: 4.5))
+                    ctx.addLine(to: CGPoint(x: x, y: 13.5))
+                }
+            } else {
+                // верхняя стрелка →
+                ctx.move(to: CGPoint(x: 2.9, y: 12))
+                ctx.addLine(to: CGPoint(x: 15.1, y: 12))
+                ctx.addLine(to: CGPoint(x: 12.5, y: 14.6))
+                ctx.move(to: CGPoint(x: 15.1, y: 12))
+                ctx.addLine(to: CGPoint(x: 12.5, y: 9.4))
+                // нижняя стрелка ←
+                ctx.move(to: CGPoint(x: 15.1, y: 6))
+                ctx.addLine(to: CGPoint(x: 2.9, y: 6))
+                ctx.addLine(to: CGPoint(x: 5.5, y: 3.4))
+                ctx.move(to: CGPoint(x: 2.9, y: 6))
+                ctx.addLine(to: CGPoint(x: 5.5, y: 8.6))
+            }
+            ctx.strokePath()
+        }
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    /// Иконка приложения (цветная — по HIG это правильно): градиент accent →
+    /// #7C5CFF, белые стрелки-переключатель (порт MakeIcon). Используется
+    /// только в титлбаре окна настроек (AppIconView), НЕ в строке меню.
     static func makeIcon() -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size)
