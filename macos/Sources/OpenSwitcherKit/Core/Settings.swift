@@ -28,8 +28,15 @@ public final class Settings {
     public var hotEnMods: Int = 0
     public var hotAutoToggleVk: Int = 0
     public var hotAutoToggleMods: Int = 0
+    public var hotPasteVk: Int = 0x09            // «V» — вставить без форматирования (как в Caramba)
+    public var hotPasteMods: Int = HK.CMD | HK.SHIFT
     public var lockAutoAfterManualSwitch = false // v3 §18: ВЫКЛ — тапы у юзера рефлекторные
     public var doubleShiftSwitch = true
+
+    // --- жесты «как в Caramba»
+    public var optionFlip = true        // голый тап Option — принудительный переворот слова (пинг-понг)
+    public var pastePlain = true        // хоткей «вставить без форматирования» включён
+    public var shiftShiftToggle = false // оба Shift одновременно — вкл/выкл автопереключения
 
     // --- система
     public var showPopup = true
@@ -39,7 +46,7 @@ public final class Settings {
     public var paused = false
     public var exclusions = ""
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
-    public var defaultsV = 7
+    public var defaultsV = 8
 }
 
 public enum SettingsStore {
@@ -65,6 +72,9 @@ public enum SettingsStore {
         case "FixOnEnter": s.fixOnEnter = v == "1"
         case "AutoConvertOnWordEnd": s.autoConvertOnWordEnd = v == "1"
         case "DoubleShiftSwitch": s.doubleShiftSwitch = v == "1"
+        case "OptionFlip": s.optionFlip = v == "1"
+        case "PastePlain": s.pastePlain = v == "1"
+        case "ShiftShiftToggle": s.shiftShiftToggle = v == "1"
         case "ShowPopup": s.showPopup = v == "1"
         case "RestoreClipboard": s.restoreClipboard = v == "1"
         case "DevLog": s.devLog = v == "1"
@@ -84,6 +94,8 @@ public enum SettingsStore {
         case "HotAutoToggleMods": s.hotAutoToggleMods = Int(v) ?? s.hotAutoToggleMods  // битое значение — дефолт, как в C#
         case "HotUndoVk": s.hotUndoVk = Int(v) ?? s.hotUndoVk  // битое значение — дефолт, как в C#
         case "HotUndoMods": s.hotUndoMods = Int(v) ?? s.hotUndoMods  // битое значение — дефолт, как в C#
+        case "HotPasteVk": s.hotPasteVk = Int(v) ?? s.hotPasteVk  // битое значение — дефолт, как в C#
+        case "HotPasteMods": s.hotPasteMods = Int(v) ?? s.hotPasteMods  // битое значение — дефолт, как в C#
         case "LockAutoAfterManualSwitch": s.lockAutoAfterManualSwitch = v == "1"
         case "Exclusions": s.exclusions = v
         case "ThemeMode": s.themeMode = max(0, min(2, Int(v) ?? 0))
@@ -97,6 +109,9 @@ public enum SettingsStore {
             "FixOnEnter=\(s.fixOnEnter ? 1 : 0)",
             "AutoConvertOnWordEnd=\(s.autoConvertOnWordEnd ? 1 : 0)",
             "DoubleShiftSwitch=\(s.doubleShiftSwitch ? 1 : 0)",
+            "OptionFlip=\(s.optionFlip ? 1 : 0)",
+            "PastePlain=\(s.pastePlain ? 1 : 0)",
+            "ShiftShiftToggle=\(s.shiftShiftToggle ? 1 : 0)",
             "ShowPopup=\(s.showPopup ? 1 : 0)",
             "RestoreClipboard=\(s.restoreClipboard ? 1 : 0)",
             "DevLog=\(s.devLog ? 1 : 0)",
@@ -116,6 +131,8 @@ public enum SettingsStore {
             "HotAutoToggleMods=\(s.hotAutoToggleMods)",
             "HotUndoVk=\(s.hotUndoVk)",
             "HotUndoMods=\(s.hotUndoMods)",
+            "HotPasteVk=\(s.hotPasteVk)",
+            "HotPasteMods=\(s.hotPasteMods)",
             "LockAutoAfterManualSwitch=\(s.lockAutoAfterManualSwitch ? 1 : 0)",
             "Exclusions=\(s.exclusions)",
             "ThemeMode=\(s.themeMode)",

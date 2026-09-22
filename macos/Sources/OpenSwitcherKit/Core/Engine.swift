@@ -29,6 +29,13 @@ public final class Engine {
     private var tapTarget = 0              // 0 = РУС, 1 = ENG
     private var tapDownAt: TimeInterval = 0
     private var tapAlone = false
+
+    // Option-тап «как в Caramba» (принудительный переворот слова): арм — на
+    // голом нажатии Option, действие — на отпускании в пределах 0.7 с
+    private var optTapVk = 0               // 0x3A/0x3D, пока тап вооружён; 0 = не арм
+    private var optTapDownAt: TimeInterval = 0
+    // «чистая пара» обоих Shift (вкл/выкл автопереключения): любой keyDown гасит
+    private var shiftPairClean = false
     private var autoLocked = false
     private var lastInputAt: TimeInterval = 0
     private let sessionPause: TimeInterval = 3.0
@@ -271,6 +278,8 @@ public final class Engine {
         pressedMods.removeAll()
         tapVk = 0
         tapAlone = false
+        optTapVk = 0
+        shiftPairClean = false
     }
 
     // ------------------------------------------------------- онбординг разрешений
@@ -551,6 +560,11 @@ public final class Engine {
         if wasPressed { pressedMods.remove(code) } else { pressedMods.insert(code) }
         let isPress = !wasPressed
 
+        // ЛЮБОЙ другой модификатор-down гасит Option-тап (тап — только голый
+        // Option: Shift/Ctrl/Cmd-чорды не страдают); само нажатие Option армит
+        // ниже в своей ветке
+        if isPress && code != 0x3A && code != 0x3D { optTapVk = 0 }
+
         let isShiftKey = code == KeyCodeMap.leftShift || code == KeyCodeMap.rightShift
         // Shift — тап-клавиша раскладки? (тогда двойной Shift отключён)
         let shiftIsTapKey = (s.hotRuMods == 0 && (s.hotRuVk == KeyCodeMap.leftShift || s.hotRuVk == KeyCodeMap.rightShift))
@@ -559,6 +573,20 @@ public final class Engine {
             && ((s.hotRuMods == 0 && s.hotRuVk == code) || (s.hotEnMods == 0 && s.hotEnVk == code))
 
         if isShiftKey && isPress {
+            let otherShift = code == KeyCodeMap.leftShift ? KeyCodeMap.rightShift : KeyCodeMap.leftShift
+            // Оба Shift одновременно (как в Caramba) — вкл/выкл автопереключения:
+            // чистая пара (ни одной клавиши между двумя Shift-down) гасит оба
+            // Shift-тапа и дёргает глобальный тумблер паузы
+            if s.shiftShiftToggle && pressedMods.contains(otherShift) && shiftPairClean {
+                shiftPairClean = false
+                lastShiftDown = 0
+                anyKeySinceShift = true
+                tapVk = 0
+                tapAlone = false
+                logLine("both-shifts: toggle auto")
+                toggleAuto()
+                return true // оба бита и так выставлены — флаги не глотаем
+            }
             // двойной Shift — сменить раскладку; ОТКЛЮЧЁН, пока тап-переключение
             // висит на Shift'ах (v3 §10/§17.14: иначе второй тап «съедается»)
             if !anyKeySinceShift && (now - lastShiftDown) >= 0 && (now - lastShiftDown) < 0.4
@@ -577,6 +605,7 @@ public final class Engine {
                 tapDownAt = now
                 tapAlone = true
             }
+            shiftPairClean = true // первый Shift чист: ждём второй (keyDown отменит)
             return true
         }
         if isShiftKey && !isPress {
@@ -598,6 +627,28 @@ public final class Engine {
             // отпускание — завершение тапа; тоже глотаем
             _ = fireTapIfArmed(code: code, now: now, flags: flags)
             return false
+        }
+
+        // ---- Option-тап «как в Caramba»: короткий голый тап Option — принудительный
+        // переворот слова. Гасится любым keyDown (onKeyDown), другим модификатором
+        // (выше) и кликом мыши — реальные Option+клавиша / Cmd+Option+… не страдают.
+        if code == 0x3A || code == 0x3D { // левый/правый Option
+            if isPress {
+                anyKeySinceShift = true
+                if code != tapVk { tapAlone = false }
+                buf.clear() // Option — не набор (паритет с прочими модификаторами)
+                // армим только голый Option: зажатые Ctrl/Cmd/Shift — чужое сочетание
+                let mOpt = heldModsFromFlags(flags)
+                if s.optionFlip && !mOpt.ctrl && !mOpt.cmd && !flags.contains(.maskShift) {
+                    optTapVk = code
+                    optTapDownAt = now
+                } else {
+                    optTapVk = 0
+                }
+            } else {
+                fireOptionTapIfArmed(code: code, now: now, flags: flags)
+            }
+            return true
         }
 
         if isPress {
@@ -626,6 +677,20 @@ public final class Engine {
             switchToLanguage(tapTarget)
         }
         return true
+    }
+
+    /// Отпускание Option — завершение Option-тапа «как в Caramba».
+    private func fireOptionTapIfArmed(code: Int, now: TimeInterval, flags: CGEventFlags) {
+        guard optTapVk != 0, code == optTapVk else { return }
+        optTapVk = 0
+        // в suppress-окне не диспетчеризуем — как Shift-тап (инжекция в полёте)
+        if now < suppressUntil { return }
+        let m = heldModsFromFlags(flags)
+        // только голый: любой модификатор, ещё зажатый на отпускании, — чужое сочетание
+        guard !m.ctrl && !m.alt && !m.cmd && !flags.contains(.maskShift) else { return }
+        guard (now - optTapDownAt) >= 0 && (now - optTapDownAt) < 0.7 else { return }
+        logLine("option-tap fired")
+        carambaFlip()
     }
 
     private func heldModsFromFlags(_ f: CGEventFlags) -> (ctrl: Bool, alt: Bool, cmd: Bool) {
@@ -660,6 +725,11 @@ public final class Engine {
     /// Возвращает true — пропустить клавишу дальше, false — проглотить.
     private func onKeyDown(_ event: CGEvent) -> Bool {
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+
+        // ЛЮБАЯ клавиша между нажатием и отпусканием гасит «чистые» жесты:
+        // Option-тап и пару обоих Shift
+        optTapVk = 0
+        shiftPairClean = false
 
         // F8 (kVK_F8 = 0x64) — метка проблемы в журнале (спека v3 §15): юзер жмёт
         // при глюке, в лог падает снимок состояния. Не глотается — F8 продолжает работать.
@@ -803,6 +873,13 @@ public final class Engine {
         if matchHot(codeEvent: code, event, vkHot: s.hotFixSelVk, modsHot: s.hotFixSelMods) {
             logLine("hotkey: fix-selection")
             beginFixSelection(fromFixWord: false)
+            return false
+        }
+        // Вставить без форматирования (как в Caramba): переназначаемый хоткей;
+        // не задан (vk == 0) или PastePlain выключен — функция выкл
+        if s.pastePlain && matchHot(codeEvent: code, event, vkHot: s.hotPasteVk, modsHot: s.hotPasteMods) {
+            logLine("hotkey: paste-plain")
+            pastePlainAction()
             return false
         }
         // сочетания-раскладки с модификаторами
@@ -1015,6 +1092,8 @@ public final class Engine {
         lastWordApp = 0
         buf.clear()
         tapAlone = false
+        optTapVk = 0          // Option+клик — реальное сочетание, не тап
+        shiftPairClean = false // клик между Shift-down ломает «одновременность»
         keysSinceUndoPoint += 1
         if undoPending { undoTailBroken = true }
     }
@@ -1330,7 +1409,11 @@ public final class Engine {
         fireInfo("Курсор не сразу после слова — выдели его и нажми Shift+Break")
     }
 
-    private func forceConvertWord(_ word: [KeyRec], trailSepKey: Int) -> Bool {
+    /// Принудительный переворот слова. skipRejected — не блокировать переворот
+    /// выученно-отменённых слов (Option-пинг-понг: юзер гоняет слово туда-сюда
+    /// руками); skipLearn — не писать в самообучение (чистый ручной инструмент).
+    private func forceConvertWord(_ word: [KeyRec], trailSepKey: Int,
+                                  skipRejected: Bool = false, skipLearn: Bool = false) -> Bool {
         updateForeground()
         if isExcludedHere() { logLine("force-flip skip: excluded app"); return false }
         let layouts = LayoutService.getLayouts()
@@ -1344,7 +1427,7 @@ public final class Engine {
         // юзер уже отменял переворот этой буквы/слова (rejected) — не повторяем
         // его же ошибку (порт C# 2fc5eaf: 'lfdfqw'->«давайц» -> backspace ->
         // Break вернул тот же мусор -> пинг-понг переворотов)
-        if isRejected(cur.text.lowercased()) {
+        if !skipRejected && isRejected(cur.text.lowercased()) {
             logLine("force-flip skip: word in rejected ('\(cur.text)')")
             fireInfo("Этот переворот ты уже отменял")
             return false
@@ -1387,14 +1470,63 @@ public final class Engine {
         undoTailBroken = false
 
         // одиночные буквы (нулевого сигнала), слова со знаками внутри и уже словарные
-        // слова не заучиваем; 2-буквенные сленговые пары ('et'->'уе') — заучиваем (v3 §9)
-        if cur.text.count >= 2 && cur.text == LanguageTables.lettersOnly(cur.text) &&
+        // слова не заучиваем; 2-буквенные сленговые пары ('et'->'уе') — заучиваем (v3 §9);
+        // Option-пинг-понг (skipLearn) самообучение не трогает вовсе
+        if !skipLearn && cur.text.count >= 2 && cur.text == LanguageTables.lettersOnly(cur.text) &&
             !WordDict.has(cur.text, cur.lang) {
             let learned = cur.text.lowercased()
             rememberAccepted(learned)
             fireInfo("Заучено: \(cur.text) → \(best.text)")
         }
         return true
+    }
+
+    /// Option-тап (как в Caramba): принудительный «пинг-понг» переворотов.
+    /// В отличие от Shift+Break НЕ блокируется rejected-защитой и НЕ пишет в
+    /// самообучение (rejected/accepted) — чистый ручной инструмент. Точку
+    /// отката ставим (Break работает), раскладка переключается (как force-flip).
+    private func carambaFlip() {
+        updateForeground()
+        if buf.count >= 2 {
+            logLine("caramba-flip: live buffer (\(buf.count) keys)")
+            _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true, skipLearn: true)
+            buf.clear() // флип живого буфера — буфер отработал
+            return
+        }
+        // свежее последнее слово (≤10 с, разделитель известен, то же приложение) —
+        // точный переворот куском [слово+разд]
+        if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
+            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
+            logLine("caramba-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
+            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, skipRejected: true, skipLearn: true)
+            return
+        }
+        // свежего слова нет — выделяем слово слева от каретки и конвертируем
+        logLine("caramba-flip: no fresh word at caret -> select-left")
+        TextConverter.targetPid = fgApp
+        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
+        beginFixSelection(fromFixWord: false)
+    }
+
+    /// «Вставить без форматирования» (как в Caramba): содержимое буфера обмена
+    /// заменяется чистым текстом и вставляется Cmd+V. На main: NSPasteboard
+    /// не потокобезопасен. Собственная инжекция помечена магией и в тапе
+    /// ре-перехватываться не будет.
+    private func pastePlainAction() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+                self.logLine("paste-plain skip: no text in clipboard")
+                self.fireInfo("В буфере обмена нет текста")
+                return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string) // только plain
+            TextConverter.targetPid = self.fgApp
+            self.suppress(0.3)
+            TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
+            self.logLine("paste-plain: sent Cmd+V (\(text.count) chars)")
+        }
     }
 
     // ------------------------------------------------------------------ конвертация выделенного

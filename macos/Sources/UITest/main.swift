@@ -10,15 +10,20 @@ if let tm = ProcessInfo.processInfo.environment["UI_THEME"] { settings.themeMode
 UiTheme.shared.applyMode(settings.themeMode)
 
 let engine = Engine(settings)
-let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 660),
+// UI_HEIGHT — рендер с нестандартной высотой окна (страницы длиннее 660)
+let winH = Double(ProcessInfo.processInfo.environment["UI_HEIGHT"] ?? "") ?? 660
+let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: winH),
                       styleMask: [.titled, .closable], backing: .buffered, defer: false)
 window.titlebarAppearsTransparent = true
 window.titleVisibility = .hidden
 window.backgroundColor = .clear
 let page = Int(ProcessInfo.processInfo.environment["UI_PAGE"] ?? "0") ?? 0
 let vc = NSHostingController(rootView: SettingsRoot(engine: engine, initialPage: page))
+vc.sizingOptions = [] // иначе hosting controller жмёт окно к fitting-минимуму (620)
 window.contentViewController = vc
 vc.view.wantsLayer = true
+// окно не видно — AppKit не размечает hosting view сам: кадр задаём явно
+vc.view.frame = NSRect(x: 0, y: 0, width: 880, height: winH)
 window.layoutIfNeeded()
 
 let view = vc.view

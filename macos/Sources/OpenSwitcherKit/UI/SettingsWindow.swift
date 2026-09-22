@@ -787,7 +787,13 @@ public final class SettingsUiModel: ObservableObject {
     @Published var hkSelVk = 0; @Published var hkSelMods = 0
     @Published var hkUndoVk = 0; @Published var hkUndoMods = 0
     @Published var hkAutoVk = 0; @Published var hkAutoMods = 0
+    @Published var hkPasteVk = 0; @Published var hkPasteMods = 0
     @Published var doubleShift = true
+
+    // жесты «как в Caramba»
+    @Published var optionFlip = true
+    @Published var pastePlain = true
+    @Published var shiftShiftToggle = false
 
     @Published var themeIndex = 0
     @Published var showPopup = true
@@ -805,7 +811,10 @@ public final class SettingsUiModel: ObservableObject {
                 "ru": "\(hkRuVk):\(hkRuMods)", "en": "\(hkEnVk):\(hkEnMods)",
                 "word": "\(hkWordVk):\(hkWordMods)", "sel": "\(hkSelVk):\(hkSelMods)",
                 "undo": "\(hkUndoVk):\(hkUndoMods)", "auto": "\(hkAutoVk):\(hkAutoMods)",
-                "ds": "\(doubleShift)", "theme": "\(themeIndex)", "popup": "\(showPopup)",
+                "paste": "\(hkPasteVk):\(hkPasteMods)",
+                "ds": "\(doubleShift)", "optflip": "\(optionFlip)",
+                "pasteplain": "\(pastePlain)", "shiftshift": "\(shiftShiftToggle)",
+                "theme": "\(themeIndex)", "popup": "\(showPopup)",
                 "clip": "\(restoreClipboard)", "devlog": "\(devLog)",
                 "autostart": "\(startWithSystem)",
                 "excl": exclusions]
@@ -826,7 +835,11 @@ public final class SettingsUiModel: ObservableObject {
         hkSelVk = s.hotFixSelVk; hkSelMods = s.hotFixSelMods
         hkUndoVk = s.hotUndoVk; hkUndoMods = s.hotUndoMods
         hkAutoVk = s.hotAutoToggleVk; hkAutoMods = s.hotAutoToggleMods
+        hkPasteVk = s.hotPasteVk; hkPasteMods = s.hotPasteMods
         doubleShift = s.doubleShiftSwitch
+        optionFlip = s.optionFlip
+        pastePlain = s.pastePlain
+        shiftShiftToggle = s.shiftShiftToggle
         themeIndex = s.themeMode
         showPopup = s.showPopup
         restoreClipboard = s.restoreClipboard
@@ -847,7 +860,11 @@ public final class SettingsUiModel: ObservableObject {
         s.hotFixSelVk = hkSelVk; s.hotFixSelMods = hkSelMods
         s.hotUndoVk = hkUndoVk; s.hotUndoMods = hkUndoMods
         s.hotAutoToggleVk = hkAutoVk; s.hotAutoToggleMods = hkAutoMods
+        s.hotPasteVk = hkPasteVk; s.hotPasteMods = hkPasteMods
         s.doubleShiftSwitch = doubleShift
+        s.optionFlip = optionFlip
+        s.pastePlain = pastePlain
+        s.shiftShiftToggle = shiftShiftToggle
         s.themeMode = themeIndex
         s.showPopup = showPopup
         s.restoreClipboard = restoreClipboard
@@ -970,6 +987,21 @@ struct KeysPage: View {
                 Row(title: "Пауза автоперевода",
                     sub: "Глобальный тумблер; по умолчанию не назначена") {
                     HotkeyBox(vk: $model.hkAutoVk, mods: $model.hkAutoMods).frame(width: 190, height: 26)
+                }
+                DividerW()
+                Row(title: "Option-тап — перевернуть слово",
+                    sub: "Как в Caramba: короткий голый тап Option переворачивает слово туда-сюда") {
+                    ToggleButton(on: model.optionFlip) { model.optionFlip.toggle() }
+                }
+                DividerW()
+                Row(title: "Вставить без форматирования",
+                    sub: "Заменяет буфер на чистый текст и вставляет — Cmd+Shift+V по умолчанию") {
+                    HotkeyBox(vk: $model.hkPasteVk, mods: $model.hkPasteMods).frame(width: 190, height: 26)
+                }
+                DividerW()
+                Row(title: "Left Shift + Right Shift — вкл/выкл автопереключение",
+                    sub: "Зажать оба Shift одновременно") {
+                    ToggleButton(on: model.shiftShiftToggle) { model.shiftShiftToggle.toggle() }
                 }
             }
         }
