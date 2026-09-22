@@ -15,13 +15,14 @@ public final class Settings {
     public var minWordLen = 3
     public var sensitivity = 1.0
 
-    // --- хоткеи (macOS keycodes; F15 = Pause/Break)
-    public var hotUndoVk: Int = KeyCodeMap.f15
+    // --- хоткеи (macOS keycodes). F15 (0x71 = Pause/Break) больше не дефолт:
+    // клавиши нет на современных Mac-клавиатурах (defaultsV 9).
+    public var hotUndoVk: Int = 0
     public var hotUndoMods: Int = 0
     public var hotFixWordVk: Int = KeyCodeMap.space
     public var hotFixWordMods: Int = HK.CTRL
-    public var hotFixSelVk: Int = KeyCodeMap.f15
-    public var hotFixSelMods: Int = HK.SHIFT
+    public var hotFixSelVk: Int = 0
+    public var hotFixSelMods: Int = 0
     public var hotRuVk: Int = KeyCodeMap.leftShift
     public var hotRuMods: Int = 0
     public var hotEnVk: Int = KeyCodeMap.rightShift
@@ -46,7 +47,7 @@ public final class Settings {
     public var paused = false
     public var exclusions = ""
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
-    public var defaultsV = 8
+    public var defaultsV = 9
 }
 
 public enum SettingsStore {
@@ -58,10 +59,30 @@ public enum SettingsStore {
     static var filePath: String { dir + "/settings.ini" }
 
     public static func load() -> Settings {
-        let s = Settings()
+        var s = Settings()
         guard let text = try? String(contentsOfFile: filePath, encoding: .utf8) else { return s }
         for line in text.components(separatedBy: .newlines) { applyLine(s, line) }
+        migrate(&s)
         return s
+    }
+
+    /// Миграции дефолтов (точное совпадение со старым дефолтом —
+    /// кастомные хоткеи юзера не трогаем).
+    static func migrate(_ s: inout Settings) {
+        guard s.defaultsV < 9 else { return }
+        // defaultsV 9: F15 (0x71) нет на современных Mac-клавиатурах —
+        // дефолтные undo/fixsel снимаются; главная отмена — Backspace сразу
+        // после замены, выделение конвертит Option-тап (select-left fallback).
+        if s.hotUndoVk == KeyCodeMap.f15 {
+            s.hotUndoVk = 0
+            s.hotUndoMods = 0
+        }
+        if s.hotFixSelVk == KeyCodeMap.f15 && s.hotFixSelMods == HK.SHIFT {
+            s.hotFixSelVk = 0
+            s.hotFixSelMods = 0
+        }
+        s.defaultsV = 9
+        save(s)
     }
 
     static func applyLine(_ s: Settings, _ line: String) {

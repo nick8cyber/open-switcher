@@ -1125,7 +1125,7 @@ struct Footer: View {
     var body: some View {
         let t = theme.t
         HStack(spacing: 10) {
-            Text("OpenSwitcher 1.1 · Ru ⇄ En")
+            Text("OpenSwitcher 1.2.0 · Ru ⇄ En")
                 .font(.system(size: 10))
                 .foregroundColor(t.dim)
             Spacer()
