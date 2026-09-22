@@ -23,10 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         App.statusItem.initItem()
 
         // внешняя смена раскладки (системное меню, юзер) — инвалидирует
-        // висящие verifySwitch-ретраи движка
+        // висящие verifySwitch-ретраи движка и сразу обновляет TIS-кэш
+        // (TIS-вызовы — только на main, поэтому main.async: блок наблюдателя
+        // с queue: nil исполняется на произвольном потоке)
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("AppleSelectedInputSourceChangedNotification"), object: nil, queue: nil) { _ in
             App.engine?.bumpSwitchSerial()
+            DispatchQueue.main.async { LayoutService.refreshOnMain() }
         }
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: nil) { _ in

@@ -34,6 +34,9 @@ public final class Engine {
     private let sessionPause: TimeInterval = 3.0
     private var lastResendSpaceAt: TimeInterval = 0
 
+    // держалка main-таймера свежести кэша раскладок (TIS — только на main)
+    private var layoutRefreshTimer: Timer?
+
     // точка отката последней автозамены
     private var undoPending = false
     private var undoText = ""
@@ -97,6 +100,11 @@ public final class Engine {
         _ = LanguageTables.possibleWord("тест", 0)
         _ = LanguageTables.possibleWord("test", 1)
         loadLearned()
+        // TIS-кэш раскладок: прогрев ДО создания тапа (Engine.init — main) и
+        // повторяющееся обновление на main каждые 0.25 с. Все TIS-вызовы
+        // (TISCopyCurrentKeyboardInputSource/TISCreateInputSourceList/TISSelect)
+        // на macOS 15 ассертят main-очередь — поток тапа читает только кэши.
+        startLayoutRefreshTimer()
         // офскрин-рендерам UI тап не нужен (и алерт зависнет без рантайма)
         if ProcessInfo.processInfo.environment["OS_DISABLE_TAP"] != "1" {
             startTap()
@@ -104,7 +112,20 @@ public final class Engine {
         watchForeground()
     }
 
-    deinit { stopTap() }
+    deinit {
+        layoutRefreshTimer?.invalidate()
+        stopTap()
+    }
+
+    /// main only: раз в 0.25 с обновляет кэш раскладок (TISCopyCurrentKeyboardInputSource
+    /// + сравнение id; полная перестройка списка — по TTL 30 с). Дёшево: микросекунды.
+    private func startLayoutRefreshTimer() {
+        layoutRefreshTimer?.invalidate()
+        LayoutService.refreshOnMain() // прогрев: кэш жив до первого тика
+        let t = Timer(timeInterval: 0.25, repeats: true) { _ in LayoutService.refreshOnMain() }
+        RunLoop.main.add(t, forMode: .common)
+        layoutRefreshTimer = t
+    }
 
     public func apply(_ settings: Settings) {
         s = settings
@@ -223,9 +244,18 @@ public final class Engine {
         switchSerial += 1
     }
 
+    /// TISSelectInputSource допустим только на main (macOS 15 ассертит очередь —
+    /// краш в TSMGetInputSourceProperty с потока тапа): из тап-контекста уводим
+    /// на main. Порядок инжекции не зависит от TISSelect — юникод-инжекция идёт
+    /// сразу, сама смена раскладки применяется асинхронно (verifySwitch/gap это
+    /// уже покрывают).
+    private func switchLayoutOnMain(_ data: LayoutService.LayoutData) {
+        DispatchQueue.main.async { LayoutService.switchTo(data) }
+    }
+
     /// Проверка применения раскладки через 400 мс; TISSelectInputSource асинхронен —
     /// при лаге/игноре повторяем одиночно (fallback, v3 §10/§16). Ретрай жив только
-    /// пока не произошло более новой смены (нашей или внешней).
+    /// пока не произошло более новой смены (нашей или внешней). Main only.
     private func verifySwitch(target: LayoutService.LayoutData) {
         let serial = switchSerial
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
@@ -737,7 +767,7 @@ public final class Engine {
                 TextConverter.sendBackspaces(bs2)
                 TextConverter.sendUnicode(restore2)
                 if let ul = undoLayout {
-                    LayoutService.switchTo(ul)
+                    switchLayoutOnMain(ul)
                     verifySwitch(target: ul)
                     expectLayout(ul)
                 }
@@ -1024,7 +1054,7 @@ public final class Engine {
             fireInfo(lang == 0 ? "Русская раскладка не найдена" : "Английская раскладка не найдена")
             return
         }
-        LayoutService.switchTo(target)
+        switchLayoutOnMain(target)
         verifySwitch(target: target)
         expectLayout(target)
         if s.lockAutoAfterManualSwitch { autoLocked = true }
@@ -1044,7 +1074,7 @@ public final class Engine {
               let other = layouts.first(where: { $0.id != curID }) else { return }
         let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
         let name = LanguageTables.langOf(LayoutService.render(other, probe)) == 0 ? "РУС" : "ENG"
-        LayoutService.switchTo(other)
+        switchLayoutOnMain(other)
         verifySwitch(target: other)
         expectLayout(other)
         if s.lockAutoAfterManualSwitch { autoLocked = true }
@@ -1182,7 +1212,7 @@ public final class Engine {
         }
         if resendKey == KeyCodeMap.space { lastResendSpaceAt = Engine.ms() }
         if let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            LayoutService.switchTo(bl)
+            switchLayoutOnMain(bl)
             verifySwitch(target: bl)
             expectLayout(bl)
         }
@@ -1239,7 +1269,7 @@ public final class Engine {
         TextConverter.sendBackspaces(bs)
         TextConverter.sendUnicode(restore)
         if let ul = undoLayout {
-            LayoutService.switchTo(ul)
+            switchLayoutOnMain(ul)
             verifySwitch(target: ul)
             expectLayout(ul)
         }
@@ -1340,7 +1370,7 @@ public final class Engine {
         // раскладку переключаем только при перевороте СЛОВА: одиночная буква
         // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
         if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            LayoutService.switchTo(bl)
+            switchLayoutOnMain(bl)
             verifySwitch(target: bl)
             expectLayout(bl)
         }

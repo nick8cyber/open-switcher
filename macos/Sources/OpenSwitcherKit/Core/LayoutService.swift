@@ -32,22 +32,56 @@ public enum LayoutService {
     static var cache: [LayoutData] = []
     static var cacheAt: TimeInterval = 0
     static let cacheLock = NSLock()
-    /// TTL-кэш текущей раскладки: убирает TIS-вызовы с горячего пути (каждая клавиша).
-    static var curCache: (data: LayoutData, at: TimeInterval)?
+    static let cacheTTL: TimeInterval = 30
+    /// Текущая раскладка — снапшот последнего refreshOnMain() (TIS на main).
+    /// Читается с любого потока (в т.ч. с потока тапа) только под cacheLock.
+    static var cachedCurrent: LayoutData?
+
+    /// ЕДИНСТВЕННАЯ точка TIS-вызовов чтения состояния (macOS 15 ассертит
+    /// main-очередь: EXC_BAD_INSTRUCTION dispatch_assert_queue_fail в
+    /// TSMGetInputSourceProperty при вызове с потока event-tap). Вызывается
+    /// с main: таймер Engine 0.25 с, наблюдатель AppleSelectedInputSourceChanged,
+    /// прогрев Engine.init. Перестраивает список раскладок по TTL и обновляет
+    /// cachedCurrent. Вызовы НЕ с main запрещены (dispatchPrecondition).
+    public static func refreshOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if cache.isEmpty || Date().timeIntervalSinceReferenceDate - cacheAt >= cacheTTL {
+            _ = rebuildLayoutsOnMain()
+        }
+        guard let cur = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let idPtr = TISGetInputSourceProperty(cur, kTISPropertyInputSourceID) else { return }
+        let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as String
+        cacheLock.lock()
+        cachedCurrent = cache.first(where: { $0.id == id })
+        cacheLock.unlock()
+    }
 
     /// Все включённые раскладки с юникод-данными (кэш 30 с).
-    /// Вызывается и с потока тапа, и с main: под локом только проверка TTL и
-    /// запись результата, само перечисление TIS (миллисекунды) — ВНЕ лока,
-    /// иначе тап блокируется на полной перестройке.
+    /// TISCreateInputSourceList допустим только на main: живой кэш возвращается
+    /// с любого потока; протухший/пустой на main перестраивается инлайн, с чужого
+    /// потока (тап) возвращается последний известный список, а main асинхронно
+    /// просится обновить кэш (refreshOnMain).
     public static func getLayouts() -> [LayoutData] {
         cacheLock.lock()
         let now = Date().timeIntervalSinceReferenceDate
-        if !cache.isEmpty, now - cacheAt < 30 {
+        if !cache.isEmpty, now - cacheAt < cacheTTL {
+            let snap = cache
             cacheLock.unlock()
-            return cache
+            return snap
         }
+        let stale = cache
         cacheLock.unlock()
 
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { refreshOnMain() }
+            return stale
+        }
+        return rebuildLayoutsOnMain()
+    }
+
+    /// Перечисление TISCreateInputSourceList — только с main.
+    private static func rebuildLayoutsOnMain() -> [LayoutData] {
+        dispatchPrecondition(condition: .onQueue(.main))
         var list: [LayoutData] = []
         let filter = [kTISPropertyInputSourceIsEnableCapable as String: true] as CFDictionary
         if let sources = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource] {
@@ -63,7 +97,7 @@ public enum LayoutService {
         cacheLock.lock()
         cache = list
         cacheAt = Date().timeIntervalSinceReferenceDate
-        curCache = nil // набор раскладок изменился — кэш текущей недостоверен
+        cachedCurrent = nil // набор раскладок изменился — кэш текущей недостоверен
         cacheLock.unlock()
         return list
     }
@@ -113,29 +147,14 @@ public enum LayoutService {
         }
     }
 
-    /// Текущая системная раскладка. TTL-кэш 0.1 c: вызывается из тапа на каждую
-    /// клавишу, TISCopyCurrentKeyboardInputSource на горячем пути недопустим.
-    /// Смена раскладки снаружи подхватывается максимум за 100 мс (грейс expectLayout
-    /// 1.2 с и gap-дедлайн 0.8 с это покрывают).
+    /// Текущая системная раскладка. БЕЗ TIS-вызовов: только чтение cachedCurrent
+    /// под локом — безопасно с потока тапа на каждое нажатие. Свежесть держат
+    /// main-обновления: таймер Engine 0.25 с + наблюдатель смены раскладки
+    /// (грейс expectLayout 1.2 с и gap-дедлайн 0.8 с перекрывают лаг 0.25 с).
     public static func currentLayout() -> LayoutData? {
         cacheLock.lock()
-        let now = Date().timeIntervalSinceReferenceDate
-        if let c = curCache, now - c.at < 0.1 {
-            cacheLock.unlock()
-            return c.data
-        }
-        cacheLock.unlock()
-
-        guard let cur = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-              let idPtr = TISGetInputSourceProperty(cur, kTISPropertyInputSourceID) else { return nil }
-        let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as String
-        let layouts = getLayouts()
-        guard let hit = layouts.first(where: { $0.id == id }) else { return nil }
-
-        cacheLock.lock()
-        curCache = (hit, Date().timeIntervalSinceReferenceDate)
-        cacheLock.unlock()
-        return hit
+        defer { cacheLock.unlock() }
+        return cachedCurrent
     }
 
     /// Найти раскладку, в которой клавиша 'a' даёт кириллицу (0) или латиницу (1).
@@ -145,8 +164,11 @@ public enum LayoutService {
     }
 
     /// Переключить раскладку (на macOS — глобально, TISSelectInputSource).
+    /// ТОЛЬКО main (macOS 15 ассертит очередь): вызывающие с потока тапа
+    /// обязаны заводить вызов через DispatchQueue.main.async.
     @discardableResult
     public static func switchTo(_ data: LayoutData) -> Bool {
-        TISSelectInputSource(data.source) == noErr
+        dispatchPrecondition(condition: .onQueue(.main))
+        return TISSelectInputSource(data.source) == noErr
     }
 }
