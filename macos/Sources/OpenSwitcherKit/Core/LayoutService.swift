@@ -168,6 +168,12 @@ public enum LayoutService {
     /// обязаны заводить вызов через DispatchQueue.main.async.
     @discardableResult
     public static func switchTo(_ data: LayoutData) -> Bool {
+        // наша собственная смена — кэш текущей раскладки обновляем МГНОВЕННО:
+        // иначе тап-поток до 250 мс «не видит» переключения и gap-буфер
+        // глотает первые буквы после тапа (жалоба юзера «переключается редко»)
+        cacheLock.lock()
+        cachedCurrent = data
+        cacheLock.unlock()
         dispatchPrecondition(condition: .onQueue(.main))
         return TISSelectInputSource(data.source) == noErr
     }
