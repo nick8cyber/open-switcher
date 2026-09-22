@@ -74,6 +74,62 @@ if let i = args.firstIndex(of: "--simtest"), i + 1 < args.count {
     exit(Int32(SelfTest.simulate(args[i + 1], sensitivity: 1.0)))
 }
 
+// --- crash-хендлер (порт Program.cs:19-31): UnhandledException пишет os_crash.log ---
+enum CrashLog {
+    static let path = SettingsStore.dir + "/os_crash.log"
+
+    /// NSException: время + стектрей (аллокации допустимы — это не signal-контекст).
+    static func install() {
+        try? FileManager.default.createDirectory(atPath: SettingsStore.dir,
+                                                 withIntermediateDirectories: true)
+        NSSetUncaughtExceptionHandler { ex in
+            let text = "\(Date()) OpenSwitcher: uncaught NSException \(ex.name.rawValue)\n"
+                + "reason: \(ex.reason ?? "-")\n"
+                + ex.callStackSymbols.joined(separator: "\n") + "\n"
+            try? text.write(toFile: CrashLog.path, atomically: true, encoding: .utf8)
+        }
+        for sig in [SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGTRAP] {
+            signal(sig, osCrashOnSignal)
+        }
+        // прогрев lazy-глобалов хендлера здесь, в обычном контексте:
+        // в signal-хендлере ленивая инициализация невозможна
+        _ = (osCrashLogCPath.count, osSigAbortMsg.count, osSigIllMsg.count,
+             osSigSegvMsg.count, osSigFpeMsg.count, osSigTrapMsg.count)
+    }
+}
+
+// Строки «signal N» собраны заранее: хендлер делает только open/write/close
+// (async-signal-safe), никаких интерполяций и аллокаций.
+private let osCrashLogCPath: [CChar] = Array((SettingsStore.dir + "/os_crash.log").utf8CString)
+private let osSigAbortMsg: [CChar] = Array("OpenSwitcher: signal SIGABRT\n".utf8CString)
+private let osSigIllMsg: [CChar] = Array("OpenSwitcher: signal SIGILL\n".utf8CString)
+private let osSigSegvMsg: [CChar] = Array("OpenSwitcher: signal SIGSEGV\n".utf8CString)
+private let osSigFpeMsg: [CChar] = Array("OpenSwitcher: signal SIGFPE\n".utf8CString)
+private let osSigTrapMsg: [CChar] = Array("OpenSwitcher: signal SIGTRAP\n".utf8CString)
+
+private func osCrashOnSignal(_ sig: Int32) {
+    let msg: [CChar]
+    switch sig {
+    case SIGABRT: msg = osSigAbortMsg
+    case SIGILL: msg = osSigIllMsg
+    case SIGSEGV: msg = osSigSegvMsg
+    case SIGFPE: msg = osSigFpeMsg
+    case SIGTRAP: msg = osSigTrapMsg
+    default: return // хендлер ставится только на пять сигналов выше
+    }
+    let fd = open(osCrashLogCPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if fd >= 0 {
+        msg.withUnsafeBufferPointer { buf in
+            _ = write(fd, buf.baseAddress, buf.count > 0 ? buf.count - 1 : 0)
+        }
+        close(fd)
+    }
+    // дефолтный диспоз и перевысыл — ядро фиксирует реальную причину краша
+    signal(sig, SIG_DFL)
+    raise(sig)
+}
+CrashLog.install()
+
 // --- single-instance: живая копия = «открой настройки» у неё и выход
 /// Жив ли pid И это наш процесс (защита от переиспользования PID чужим процессом).
 func pidIsOurs(_ pid: Int) -> Bool {

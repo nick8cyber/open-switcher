@@ -38,6 +38,20 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
         engine.uiSettingsActive = true
     }
 
+    /// Esc закрывает окно (порт OnKeyDown SettingsForm.cs:490-501, там KeyPreview=true).
+    /// performKey(with:) вызывается окном ДО диспетчеризации keyDown first responder'у:
+    /// во время захвата хоткея отдаём событие вниз — его съест HotkeyNsView.keyDown
+    /// (отмена захвата, как сейчас), в остальных случаях закрываем — dirty-guard
+    /// в windowWillClose сработает сам.
+    public func performKey(with event: NSEvent) -> Bool {
+        guard event.keyCode == 53 else { return false } // только Esc
+        if let hk = window?.firstResponder as? HotkeyBox.HotkeyNsView, hk.capturing {
+            return false // захват активен — Esc пойдёт в keyDown и отменит захват
+        }
+        window?.performClose(nil)
+        return true
+    }
+
     public func windowWillClose(_ notification: Notification) {
         // dirty-guard (порт OnFormClosing SettingsForm.cs): несохранённые правки —
         // спрашиваем; «Отмена» возвращает окно и не даёт закрыться

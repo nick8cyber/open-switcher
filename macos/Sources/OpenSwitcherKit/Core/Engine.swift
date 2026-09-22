@@ -1596,7 +1596,7 @@ public final class Engine {
                 logLine("sel: retry with 2 words left")
                 return
             }
-            logLine("sel: no new clipboard")
+            logLine("sel: no new clipboard (text \(text.isEmpty ? "empty" : "present")\(seqChanged ? "" : ", seq unchanged"))")
             fireInfo("Не удалось скопировать выделение в этом приложении")
             return
         }
