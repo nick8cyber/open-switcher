@@ -31,7 +31,7 @@ public final class Settings {
     public var hotAutoToggleMods: Int = 0
     public var hotPasteVk: Int = 0x09            // «V» — вставить без форматирования (как в Caramba)
     public var hotPasteMods: Int = HK.CMD | HK.SHIFT
-    public var lockAutoAfterManualSwitch = false // паритет Windows-референсу: ручной выбор раскладки
+    public var lockAutoAfterManualSwitch = true // решение владельца: после ручного тапа автодетект молчит
                                                  // отключает автодетект до новой сессии (defaultsV 10)
     public var doubleShiftSwitch = true
 
@@ -49,7 +49,7 @@ public final class Settings {
     public var paused = false
     public var exclusions = ""
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
-    public var defaultsV = 10
+    public var defaultsV = 11
 }
 
 public enum SettingsStore {
@@ -88,11 +88,14 @@ public enum SettingsStore {
             migrated = true
         }
         if s.defaultsV < 10 {
-            // defaultsV 10: дефолт лока автодетекта после ручного переключения
-            // сменён на ВЫКЛ (паритет Windows-референсу). Значение юзера из ini
-            // НЕ трогаем: прежняя миграция безусловно ставила true и затирала
-            // осознанный выбор владельца. Свежие установки получают false.
             s.defaultsV = 10
+            migrated = true
+        }
+        if s.defaultsV < 11 {
+            // defaultsV 11 (решение владельца 2026-09-23): после ручного
+            // переключения автодетект молчит — лок ВКЛ по умолчанию
+            s.lockAutoAfterManualSwitch = true
+            s.defaultsV = 11
             migrated = true
         }
         if migrated { save(s) }
