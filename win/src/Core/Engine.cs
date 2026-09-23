@@ -26,6 +26,7 @@ namespace OpenSwitcher.Core
         private List<KeyRec> _lastWord = new List<KeyRec>();
         private int _lastWordAt;             // тикант снимка последнего слова
         private int _lastWordSepVk;          // разделитель сразу после последнего слова (0 = неизвестен/Enter)
+        private int _lastSpacePassTick;      // когда последний пробел ушёл в текст (для дедупа двойных)
         private IntPtr _lastWordHwnd;        // окно, где набрано последнее слово (0 = неизвестно)
 
         private int _suppressUntil;          // тикант до которого игнорируем собственную инжекцию
@@ -798,6 +799,17 @@ namespace OpenSwitcher.Core
                 bool modified = ctrl || alt || win || shift;
                 bool converted = false;
 
+                // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
+                // при пустом буфере в пределах окна глотается — защита от рефлекса
+                // двойного нажатия после конвертаций. Не глотаем при буквах в буфере
+                if (vk == 0x20 && !modified && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
+                    _lastSpacePassTick != 0 &&
+                    unchecked(Environment.TickCount - _lastSpacePassTick) < S.SpaceDedupMs)
+                {
+                    Log("space: dedup swallowed");
+                    return false; // проглотить (в текст не идёт)
+                }
+
                 // ОДИНОЧНАЯ БУКВА по «словности»: 'f' — не английское слово, «а» — русское
                 // (союз) => 'f'->«а». «а» — русское слово => не переворачивается никогда.
                 // Только по ПРОБЕЛУ (буква+цифра = идентификатор), с уважением кулдауна,
@@ -875,9 +887,12 @@ namespace OpenSwitcher.Core
                 }
                 // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь
                 if (vk == 0x20 && !modified)
+                {
+                    if (!converted) _lastSpacePassTick = Environment.TickCount;
                     Log("space: " + (converted ? "flip+resend" : "pass") +
                         " bufWas=" + _buf.Count +
                         " echoInWindow=" + (unchecked(Environment.TickCount - _lastResendSpaceTick) < 600 ? "y" : "n"));
+                }
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
             }

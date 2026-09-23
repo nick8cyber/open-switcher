@@ -43,6 +43,7 @@ namespace OpenSwitcher.Core
         public bool ShowPopup = true;
         public bool RestoreClipboard = true;
         public bool DevLog = false;           // режим разработчика: вести журнал решений в файл
+        public int SpaceDedupMs = 0;          // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
         public bool StartWithWindows = false;
         public bool Paused = false;
         public string Exclusions = "";
@@ -160,6 +161,7 @@ namespace OpenSwitcher.Core
                 case "ShowPopup": s.ShowPopup = v == "1"; break;
                 case "RestoreClipboard": s.RestoreClipboard = v == "1"; break;
                 case "DevLog": s.DevLog = v == "1"; break;
+                case "SpaceDedupMs": { int n; if (int.TryParse(v, out n)) s.SpaceDedupMs = Math.Max(0, Math.Min(3000, n)); break; }
                 case "StartWithWindows": s.StartWithWindows = v == "1"; break;
                 case "Paused": s.Paused = v == "1"; break;
                 case "MinWordLen": { int n; if (int.TryParse(v, out n)) s.MinWordLen = Math.Max(2, Math.Min(8, n)); break; }
@@ -196,6 +198,7 @@ namespace OpenSwitcher.Core
                 sb.AppendLine("ShowPopup=" + (s.ShowPopup ? "1" : "0"));
                 sb.AppendLine("RestoreClipboard=" + (s.RestoreClipboard ? "1" : "0"));
                 sb.AppendLine("DevLog=" + (s.DevLog ? "1" : "0"));
+                sb.AppendLine("SpaceDedupMs=" + s.SpaceDedupMs);
                 sb.AppendLine("StartWithWindows=" + (s.StartWithWindows ? "1" : "0"));
                 sb.AppendLine("Paused=" + (s.Paused ? "1" : "0"));
                 sb.AppendLine("MinWordLen=" + s.MinWordLen);
