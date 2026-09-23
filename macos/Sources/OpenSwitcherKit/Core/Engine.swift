@@ -40,6 +40,7 @@ public final class Engine {
     private var lastInputAt: TimeInterval = 0
     private let sessionPause: TimeInterval = 3.0
     private var lastResendSpaceAt: TimeInterval = 0
+    private var lastSpacePassTick: TimeInterval = 0 // когда последний пробел ушёл в текст (для дедупа двойных)
 
     // держалка main-таймера свежести кэша раскладок (TIS — только на main)
     private var layoutRefreshTimer: Timer?
@@ -843,9 +844,7 @@ public final class Engine {
                 }
                 if s.lockAutoAfterManualSwitch { autoLocked = true }
                 let w = undoText.lowercased()
-                learnedLock.lock()
-                rejected.insert(w)
-                learnedLock.unlock()
+                rememberRejected(w) // персистентность как у hotkey-undo: слово в learned.txt переживёт рестарт
                 removeAccepted(w)
                 noFlipUntil = Engine.ms() + 5.0 // юзер правит сам — движок молчит 5 с (v3 §6.2)
                 fireInfo("Отменено: \(restore2) · больше не исправлять")
@@ -997,6 +996,15 @@ public final class Engine {
             var converted = false
             let bufWas = buf.count
 
+            // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
+            // при пустом буфере в пределах окна глотается — защита от рефлекса
+            // двойного нажатия после конвертаций (порт C# Engine.cs:802-811)
+            if code == KeyCodeMap.space && !modified && !s.paused && s.spaceDedupMs > 0 &&
+                buf.count == 0 && lastSpacePassTick != 0 && (now - lastSpacePassTick) < Double(s.spaceDedupMs) {
+                logLine("space: dedup swallowed")
+                return false // проглотить (в текст не идёт)
+            }
+
             // одиночная буква по «словности»: 'f' — не английское слово, «а» — русское
             // (союз) => 'f'->«а». Неприкасаемые (а/и/в/к/о/с/у/я, a/i) не переворачиваются.
             // Только по пробелу; хвостовой знак-двойник остаётся знаком («z,» -> «я,»).
@@ -1060,6 +1068,7 @@ public final class Engine {
             }
             // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь (v3 §15)
             if code == KeyCodeMap.space && !modified {
+                if !converted { lastSpacePassTick = now } // считаем только юзерские пробелы: пересланные/конвертные — нет (C#:891)
                 logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
             }
             buf.clear()
@@ -1197,6 +1206,15 @@ public final class Engine {
             logLine("convert skip: no candidate"); return false
         }
 
+        // РУ->EN авто-переворот коротких (<5 букв) слов ОТКЛЮЧЁН: короткое
+        // «русское» прочтение почти всегда правильный русский текст («ща», «фда»),
+        // а его EN-прочтение ('of', 'alf') — мусор (порт C# Engine.cs:1138-1147).
+        // EN->РУ (ядро программы) и ручной путь не трогаем.
+        if !manual && !acceptedWord && cur.lang == 0 && best.lang == 1 && word.count < 5 {
+            logLine("convert skip: ru->en short ('\(cur.text)' -> '\(best.text)')")
+            return false
+        }
+
         // Кулдаун после ручной правки — первым делом (v3 §6.2)
         if !manual && !acceptedWord && Engine.ms() < noFlipUntil {
             logLine("convert skip: cool-down after manual fix")
@@ -1296,7 +1314,12 @@ public final class Engine {
             expectLayout(bl)
         }
 
-        undoPending = resendKey != KeyCodeMap.enter
+        // паритет C# injOk (Engine.cs:1295): без «Универсального доступа» инжекция
+        // (CGEventPostToPid) не применяется — откат не армим (Break стирал бы
+        // РЕАЛЬНЫЕ символы юзера) и замена не заучивается
+        let injOk = accessibilityTrusted(prompt: false)
+        if !injOk { logLine("convert warn: accessibility off — undo/learning not armed") }
+        undoPending = resendKey != KeyCodeMap.enter && injOk
         undoText = cur.text
         undoLen = bestText.count
         undoSepText = sepText
@@ -1307,7 +1330,7 @@ public final class Engine {
         undoTail.removeAll()
         undoTailBroken = false
 
-        if cur.text.count >= 3 {
+        if injOk && cur.text.count >= 3 {
             // принятие честное: через 15 с, если юзер не откатил (v3 §12)
             let acceptedTyped = cur.text.lowercased()
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in

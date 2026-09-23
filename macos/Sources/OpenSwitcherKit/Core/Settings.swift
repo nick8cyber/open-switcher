@@ -31,8 +31,8 @@ public final class Settings {
     public var hotAutoToggleMods: Int = 0
     public var hotPasteVk: Int = 0x09            // «V» — вставить без форматирования (как в Caramba)
     public var hotPasteMods: Int = HK.CMD | HK.SHIFT
-    public var lockAutoAfterManualSwitch = true // классика Punto/Caramba: ручной тап = «я сам выбрал
-                                                // раскладку, не мешай» (владелец отменил SPEC v3 §18, defaultsV 10)
+    public var lockAutoAfterManualSwitch = false // паритет Windows-референсу: ручной выбор раскладки
+                                                 // отключает автодетект до новой сессии (defaultsV 10)
     public var doubleShiftSwitch = true
 
     // --- жесты «как в Caramba»
@@ -44,6 +44,7 @@ public final class Settings {
     public var showPopup = true
     public var restoreClipboard = true
     public var devLog = false  // режим разработчика: вести журнал решений в файл (DevLog в C#; для опенсорса — ВЫКЛ)
+    public var spaceDedupMs = 0 // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
     public var startWithSystem = false
     public var paused = false
     public var exclusions = ""
@@ -87,11 +88,10 @@ public enum SettingsStore {
             migrated = true
         }
         if s.defaultsV < 10 {
-            // defaultsV 10: лок автодетекта после ручного переключения ВКЛЮЧЁН
-            // по умолчанию — классика Punto/Caramba; решение владельца, отмена
-            // SPEC v3 §18. NB: безусловно перезапишет и юзера, кто осознанно
-            // выключил лок в ini, — осознанный компромисс (машина владельца).
-            s.lockAutoAfterManualSwitch = true
+            // defaultsV 10: дефолт лока автодетекта после ручного переключения
+            // сменён на ВЫКЛ (паритет Windows-референсу). Значение юзера из ini
+            // НЕ трогаем: прежняя миграция безусловно ставила true и затирала
+            // осознанный выбор владельца. Свежие установки получают false.
             s.defaultsV = 10
             migrated = true
         }
@@ -114,6 +114,7 @@ public enum SettingsStore {
         case "DevLog": s.devLog = v == "1"
         case "StartWithWindows", "StartWithSystem": s.startWithSystem = v == "1"
         case "Paused": s.paused = v == "1"
+        case "SpaceDedupMs": s.spaceDedupMs = max(0, min(3000, Int(v) ?? 0))  // 0 = выкл, как в C#
         case "MinWordLen": s.minWordLen = max(2, min(8, Int(v) ?? 3))
         case "Sensitivity": s.sensitivity = Double(v) ?? 1.0
         case "HotFixWordVk": s.hotFixWordVk = Int(v) ?? s.hotFixWordVk  // битое значение — дефолт, как в C#
@@ -149,6 +150,7 @@ public enum SettingsStore {
             "ShowPopup=\(s.showPopup ? 1 : 0)",
             "RestoreClipboard=\(s.restoreClipboard ? 1 : 0)",
             "DevLog=\(s.devLog ? 1 : 0)",
+            "SpaceDedupMs=\(s.spaceDedupMs)",
             "StartWithSystem=\(s.startWithSystem ? 1 : 0)",
             "Paused=\(s.paused ? 1 : 0)",
             "MinWordLen=\(s.minWordLen)",
