@@ -39,7 +39,7 @@ namespace OpenSwitcher.Core
         private bool _autoLocked;            // юзер сам выбрал раскладку — автодетект молчит до конца текущего сеанса набора
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
-        private int _lastResendSpaceTick;    // когда дослали проглоченный пробел — для глотания «эха» (двойных пробелов)
+        private int _lastSpaceTextTick;      // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл или нажатие) — для дедупа двойных
         private int _wdTicks;                // счётчик тиков watchdog'а (heartbeat раз в 10 тиков)
         private int _noFlipUntil;            // кулдаун после ручной правки: юзер чинит текст сам — не мешаем
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
@@ -241,7 +241,7 @@ namespace OpenSwitcher.Core
                 if (TestInjectMode)
                     Log("window-switch: " + _fgHwnd.ToInt64().ToString("X") + " (was " + prevHwnd.ToInt64().ToString("X") + ")");
                 _autoLocked = false;
-                _lastResendSpaceTick = 0; // окно эха пробела не переносится в другое окно
+                _lastSpaceTextTick = 0; // окно дедупа пробела не переносится в другое окно
                 _undoPending = false;
                 _undoTailBroken = true;
                 _buf.Clear();
@@ -385,25 +385,23 @@ namespace OpenSwitcher.Core
                     FireInfo("Метка #" + _markCount + " записана в лог");
                 }
 
-                // эхо-пробел: пробел, прилетающий в первые 250 мс после досланного
-                // после замены разделителя, — это второе нажатие/авторепит (юзер не
-                // увидел мгновенную замену и нажал ещё раз). Глотаем, иначе после
-                // автоправок появляются двойные/тройные пробелы. Инжектированный
-                // досланный пробел сюда не попадает (treatAsReal=false).
-                if (msg == Native.WM_KEYDOWN && treatAsReal && (k.vkCode & 0xFF) == 0x20)
+                // дедуп двойных пробелов: ЛЮБОЙ пробел, прилетающий в пределах
+                // SpaceDedupMs после предыдущего пробела в тексте (досланного или
+                // нажатого), глотается — рефлекс двойного нажатия после конвертаций.
+                // Инжектированный досланный пробел сюда не попадает (treatAsReal=false),
+                // но сам досыл обновляет тик (см. исполнение замены)
+                if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
+                    (k.vkCode & 0xFF) == 0x20 && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
+                    _lastSpaceTextTick != 0 &&
+                    unchecked(Environment.TickCount - _lastSpaceTextTick) < S.SpaceDedupMs)
                 {
-                    if (_lastResendSpaceTick != 0 && _buf.Count == 0 &&
-                        unchecked(Environment.TickCount - _lastResendSpaceTick) < 600)
-                    {
-                        Log("space-echo swallowed");
-                        _lastResendSpaceTick = 0; // одноразово: следующий реальный пробел не глотаем
-                        return IntPtr.Zero;
-                    }
-                    _lastResendSpaceTick = 0;
+                    Log("space: dedup swallowed");
+                    return IntPtr.Zero;
                 }
                 else if (msg == Native.WM_KEYDOWN && treatAsReal)
                 {
-                    _lastResendSpaceTick = 0; // пошла новая печать — окно эха не нужно
+                    // не-пробел (новая печать) сбрасывает окно дедупа
+                    _lastSpaceTextTick = 0;
                 }
 
                 // guard отката: считаем ЛЮБЫЕ реальные нажатия — даже в suppress-окне
@@ -859,7 +857,7 @@ namespace OpenSwitcher.Core
                                 _undoTail.Clear();
                                 _undoTailBroken = false;
                                 TextConverter.SendUnicode(_undoSepText); // досылаем разделитель как набрано
-                                if (_undoSepText == " ") _lastResendSpaceTick = Environment.TickCount;
+                                if (_undoSepText == " ") _lastSpaceTextTick = Environment.TickCount;
                             }
                         }
                     }
@@ -891,7 +889,7 @@ namespace OpenSwitcher.Core
                     if (!converted) _lastSpacePassTick = Environment.TickCount;
                     Log("space: " + (converted ? "flip+resend" : "pass") +
                         " bufWas=" + _buf.Count +
-                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastResendSpaceTick) < 600 ? "y" : "n"));
+                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastSpaceTextTick) < S.SpaceDedupMs ? "y" : "n"));
                 }
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
@@ -931,7 +929,7 @@ namespace OpenSwitcher.Core
             if (TestInjectMode)
                 Log("fg-event: hwnd=" + hwnd.ToInt64().ToString("X") + " (was " + _fgHwnd.ToInt64().ToString("X") + ")");
             if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
-            _lastResendSpaceTick = 0; // окно эха не переносится в другое окно
+            _lastSpaceTextTick = 0; // окно дедупа не переносится в другое окно
             _buf.Clear();
             _anyKeySinceShift = true;
             _tapAlone = false;
@@ -1282,7 +1280,7 @@ namespace OpenSwitcher.Core
                 if (resendVk == 0x0D) TextConverter.SendKey(0x0D, false, false);
                 else TextConverter.SendUnicode(RenderKeyChar(resendVk, _fgHkl, resendShift));
             }
-            if (resendVk == 0x20) _lastResendSpaceTick = Environment.TickCount; // окно глотания «эха» пробела
+            if (resendVk == 0x20) _lastSpaceTextTick = Environment.TickCount; // окно дедупа двойных пробелов
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
 
