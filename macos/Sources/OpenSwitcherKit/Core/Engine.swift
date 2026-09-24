@@ -86,10 +86,20 @@ public final class Engine {
     public var uiSettingsActive = false
     public var sandboxFocused = false
 
-    // онбординг разрешений: каждое напоминание и «Работаю!» — не чаще раза за запуск
-    private var tapAlertShown = false
-    private var axAlertShown = false
+    // онбординг разрешений: авто-показ окна не чаще раза за запуск
+    private var onboardingAutoShown = false
     private var readyInfoFired = false
+
+    // --------------------------------------------------------- онбординг-окно
+
+    /// Хук показа онбординг-окна: Core не зависит от UI, поэтому main.swift
+    /// присваивает сюда вызов OnboardingWindowController.show (App.showOnboarding).
+    public static var showOnboardingHook: (() -> Void)?
+
+    /// Показ онбординга из любого потока: окно поднимается на main.
+    static func showOnboarding() {
+        DispatchQueue.main.async { showOnboardingHook?() }
+    }
 
     public var onConverted: ((String, String) -> Void)?
     public var onInfo: ((String) -> Void)?
@@ -161,14 +171,11 @@ public final class Engine {
 
     private func startTap() {
         guard let port = createTapPort() else {
-            logLine("tap FAILED: нет разрешения («Мониторинг ввода»)")
-            tapAlertShown = true
-            // AX-состояние читаем на main в момент алерта: если не хватает и его —
-            // покажем один комбинированный алерт, а не только «Мониторинг ввода»
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.showInputMonitoringAlert(alsoAccessibilityMissing: !accessibilityTrusted(prompt: false))
-            }
+            logLine("tap FAILED: нет разрешения («Универсальный доступ»)")
+            onboardingAutoShown = true // окно уже показано — watchdog его не дублирует
+            // создание .defaultTap-тапа само требует «Универсальный доступ»:
+            // онбординг-окно покажет нужный блок и живую проверку
+            Self.showOnboarding()
             // watchdog на потоке тапа позже сам повторит createTapPort()
             ensureTapThread()
             return
@@ -297,47 +304,33 @@ public final class Engine {
 
     // ------------------------------------------------------- онбординг разрешений
 
-    /// Единый статус обоих разрешений (меню → «Проверить разрешения»):
-    /// tap — событийный тап создан («Мониторинг ввода»); accessibility — AX trusted.
+    /// Единый статус обоих разрешений (меню → «Разрешения и диагностика»):
+    /// tap — событийный тап создан; accessibility — AX trusted.
     public func permissionsState() -> (tap: Bool, accessibility: Bool) {
         (tap != nil, accessibilityTrusted(prompt: false))
     }
 
     /// Онбординг из фоновых мест (watchdog на потоке тапа, startTap):
-    /// сама проверка дешёвая, но алерты и попапы — только с main.
+    /// сама проверка дешёвая, но показ окна — только с main.
     private func onboardingCheckAsync() {
         DispatchQueue.main.async { [weak self] in self?.onboardingCheckOnMain() }
     }
 
-    /// Только main: не больше одного напоминания за раз, каждое — не чаще раза
-    /// за запуск. Состояния тапа и AX вычисляются НЕЗАВИСИМО: ранний return при
-    /// отсутствии тапа (старая логика) навсегда прятал AX-алерт — создание
-    /// .defaultTap-тапа само требует «Универсальный доступ», и юзер застревал
-    /// с одним алертом про «Мониторинг ввода».
+    /// Только main: онбординг-окно вместо старых алертов — авто-показ не чаще
+    /// раза за запуск (закрытое юзером окно не достаём; из меню онбординг
+    /// открывается всегда). Состояния тапа и AX вычисляются НЕЗАВИСИМО: ранний
+    /// return при отсутствии тапа (старая логика) навсегда прятал AX-подсказку —
+    /// создание .defaultTap-тапа само требует «Универсальный доступ», и юзер
+    /// застревал с одним сообщением про «Мониторинг ввода». Само окно покажет
+    /// нужный блок: у него живая проверка раз в секунду.
     private func onboardingCheckOnMain() {
         guard onboardingAllowed, tapThread != nil else { return }
         let tapOk = tap != nil
         let axOk = accessibilityTrusted(prompt: false)
-        if !tapOk && !axOk {
-            // обоих разрешений нет — ОДИН комбинированный алерт с обоими пунктами
-            if !tapAlertShown {
-                tapAlertShown = true
-                axAlertShown = true // комбинированный алерт закрывает и AX-подсказку
-                showInputMonitoringAlert(alsoAccessibilityMissing: true)
-            }
-            return
-        }
-        if !tapOk {
-            if !tapAlertShown {
-                tapAlertShown = true
-                showInputMonitoringAlert(alsoAccessibilityMissing: false)
-            }
-            return
-        }
-        if !axOk {
-            if !axAlertShown {
-                axAlertShown = true
-                showAccessibilityAlert()
+        if !tapOk || !axOk {
+            if !onboardingAutoShown {
+                onboardingAutoShown = true
+                Self.showOnboarding()
             }
             return
         }
@@ -347,52 +340,17 @@ public final class Engine {
         }
     }
 
-    /// Offscreen-рендеры и selftest (OS_DISABLE_TAP=1) — без алертов, рендер не висит.
+    /// Попап «Работаю!» при закрытии онбординг-окна (одноразово: тот же
+    /// readyInfoFired-гвард, что и у фоновой проверки, — двойного попапа нет).
+    public func fireReadyInfoFromOnboarding() {
+        guard !readyInfoFired else { return }
+        readyInfoFired = true
+        fireInfo("Работаю! Напечатайте ghbdtn и пробел")
+    }
+
+    /// Offscreen-рендеры и selftest (OS_DISABLE_TAP=1) — без онбординга, рендер не висит.
     private var onboardingAllowed: Bool {
         ProcessInfo.processInfo.environment["OS_DISABLE_TAP"] != "1"
-    }
-
-    /// Подсказка при отсутствии разрешения «Мониторинг ввода» (чтение клавиш).
-    /// alsoAccessibilityMissing=true — обоих разрешений нет: один комбинированный
-    /// алерт с обоими пунктами, кнопка открывает ОБЕ панели (создание тапа само
-    /// требует AX — ждать «спросим после» нечему).
-    private func showInputMonitoringAlert(alsoAccessibilityMissing: Bool) {
-        guard onboardingAllowed else { return }
-        let a = NSAlert()
-        if alsoAccessibilityMissing {
-            a.messageText = "Нужны два разрешения: «Мониторинг ввода» и «Универсальный доступ»"
-            a.informativeText = "OpenSwitcher не видит нажатия клавиш и не может исправлять текст. Откройте Системные настройки → Конфиденциальность и безопасность и включите OpenSwitcher в разделах «Мониторинг ввода» и «Универсальный доступ». Перезапуск не нужен: приложение подхватит разрешения само в течение 10 секунд."
-            a.addButton(withTitle: "Открыть обе панели")
-            a.addButton(withTitle: "Позже")
-            if a.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(PermissionPanels.inputMonitoring)
-                NSWorkspace.shared.open(PermissionPanels.accessibility)
-            }
-            return
-        }
-        a.messageText = "Требуется разрешение «Мониторинг ввода»"
-        a.informativeText = "OpenSwitcher не видит нажатия клавиш. Откройте Системные настройки → Конфиденциальность и безопасность → Мониторинг ввода и включите OpenSwitcher. Перезапуск не нужен: приложение подхватит разрешение само в течение 10 секунд.\n\nПонадобится также «Универсальный доступ» — спросим после."
-        a.addButton(withTitle: "Открыть Системные настройки")
-        a.addButton(withTitle: "Позже")
-        if a.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(PermissionPanels.inputMonitoring)
-        }
-    }
-
-    /// Подсказка при отсутствии «Универсального доступа»: тап читает клавиши,
-    /// но инжекция исправлений не применяется («читает, но не исправляет»).
-    /// Системный промпт AXIsProcessTrustedWithOptions(prompt: true) не показывает
-    /// список приложений на части версий — открываем панель сами, как выше.
-    private func showAccessibilityAlert() {
-        guard onboardingAllowed else { return }
-        let a = NSAlert()
-        a.messageText = "Разрешение «Универсальный доступ»"
-        a.informativeText = "Чтобы приложение могло исправлять текст, дай ему «Универсальный доступ» (Accessibility). Системные настройки откроются — добавь OpenSwitcher в список. Перезапуск не нужен."
-        a.addButton(withTitle: "Открыть Системные настройки")
-        a.addButton(withTitle: "Позже")
-        if a.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(PermissionPanels.accessibility)
-        }
     }
 
     private func tapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {

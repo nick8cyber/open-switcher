@@ -8,9 +8,9 @@ import AppKit
 ///
 /// prompt=true — macOS сам покажет системный диалог добавления приложения;
 /// на части версий macOS в этом диалоге не видно списка приложений, поэтому
-/// онбординг использует собственный алерт + открытие нужной панели Системных
-/// настроек (как для «Мониторинга ввода»), а фоновые проверки зовут эту
-/// функцию с prompt=false — никаких системных диалогов без спроса.
+/// онбординг-окно открывает нужную панель Системных настроек само, а фоновые
+/// проверки зовут эту функцию с prompt=false — никаких системных диалогов
+/// без спроса.
 public func accessibilityTrusted(prompt: Bool) -> Bool {
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
     return AXIsProcessTrustedWithOptions(opts)

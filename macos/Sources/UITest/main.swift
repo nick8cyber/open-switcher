@@ -11,19 +11,26 @@ UiTheme.shared.applyMode(settings.themeMode)
 
 let engine = Engine(settings)
 // UI_HEIGHT — рендер с нестандартной высотой окна (страницы длиннее 660)
-let winH = Double(ProcessInfo.processInfo.environment["UI_HEIGHT"] ?? "") ?? 660
-let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: winH),
+let onboarding = ProcessInfo.processInfo.environment["UI_PAGE"] == "onboarding"
+let winW: Double = onboarding ? 560 : 880
+let winH = onboarding ? 420.0 : (Double(ProcessInfo.processInfo.environment["UI_HEIGHT"] ?? "") ?? 660)
+let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: winW, height: winH),
                       styleMask: [.titled, .closable], backing: .buffered, defer: false)
 window.titlebarAppearsTransparent = true
 window.titleVisibility = .hidden
 window.backgroundColor = .clear
-let page = Int(ProcessInfo.processInfo.environment["UI_PAGE"] ?? "0") ?? 0
-let vc = NSHostingController(rootView: SettingsRoot(engine: engine, initialPage: page))
+let page = ProcessInfo.processInfo.environment["UI_PAGE"] ?? "0"
+// UI_PAGE=onboarding — рендер онбординг-окна; UI_STALE=1 — сразу с блоком сброса прав
+let rootView: AnyView = onboarding
+    ? AnyView(OnboardingView(engine: engine, onFinish: {},
+                             previewStale: ProcessInfo.processInfo.environment["UI_STALE"] == "1"))
+    : AnyView(SettingsRoot(engine: engine, initialPage: Int(page) ?? 0))
+let vc = NSHostingController(rootView: rootView)
 vc.sizingOptions = [] // иначе hosting controller жмёт окно к fitting-минимуму (620)
 window.contentViewController = vc
 vc.view.wantsLayer = true
 // окно не видно — AppKit не размечает hosting view сам: кадр задаём явно
-vc.view.frame = NSRect(x: 0, y: 0, width: 880, height: winH)
+vc.view.frame = NSRect(x: 0, y: 0, width: winW, height: winH)
 window.layoutIfNeeded()
 
 let view = vc.view

@@ -9,6 +9,12 @@ enum App {
     /// pid-файл single-instance (аналог мьютекса); при падении не остаётся
     /// мёртвым замком — pid проверяется через kill(pid, 0).
     static let pidPath = "/tmp/com.openswitcher.pid"
+
+    /// Онбординг-окно разрешений. Engine (Core) зовёт его через хук
+    /// Engine.showOnboardingHook — прямой зависимости Core → UI нет.
+    static func showOnboarding() {
+        OnboardingWindowController.show(engine: engine)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -18,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = SettingsStore.load()
         UiTheme.shared.applyMode(settings.themeMode)
 
+        // хук онбординга — ДО создания Engine: startTap при провале уже в этом
+        // тике ставит async-показ окна
+        Engine.showOnboardingHook = { App.showOnboarding() }
         App.engine = Engine(settings)
         App.statusItem = StatusItemService(engine: App.engine)
         App.statusItem.initItem()

@@ -26,7 +26,7 @@ public final class StatusItemService: NSObject {
         menu.addItem(.separator())
         let miSettings = NSMenuItem(title: "Настройки", action: #selector(showSettings), keyEquivalent: "")
         miSettings.target = self
-        let miPermissions = NSMenuItem(title: "Проверить разрешения", action: #selector(checkPermissions), keyEquivalent: "")
+        let miPermissions = NSMenuItem(title: "Разрешения и диагностика", action: #selector(openOnboarding), keyEquivalent: "")
         miPermissions.target = self
         miSettings.target = self
         let miRu = NSMenuItem(title: "→ РУС", action: #selector(switchRu), keyEquivalent: "")
@@ -100,27 +100,11 @@ public final class StatusItemService: NSObject {
         Engine.openInEditor(SettingsStore.dir + "/log.txt")
     }
 
-    /// Главная диагностика «говорят, не работает»: статус обоих разрешений и
-    /// кнопки открытия обеих панелей Системных настроек.
-    @objc private func checkPermissions() {
-        let st = engine.permissionsState()
-        let a = NSAlert()
-        a.messageText = "Проверка разрешений"
-        a.informativeText =
-            (st.tap ? "✓" : "✗") + " Мониторинг ввода — " +
-            (st.tap ? "клавиши читаются" : "клавиши НЕ читаются") + "\n" +
-            (st.accessibility ? "✓" : "✗") + " Универсальный доступ — " +
-            (st.accessibility ? "исправления работают" : "исправления НЕ применяются") +
-            "\n\nБез «Универсального доступа» приложение читает клавиши, но не исправляет текст. Добавьте OpenSwitcher в оба списка — перезапуск не нужен."
-        a.addButton(withTitle: "Открыть «Мониторинг ввода»")
-        a.addButton(withTitle: "Открыть «Универсальный доступ»")
-        a.addButton(withTitle: "Готово")
-        let res = a.runModal()
-        if res == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(PermissionPanels.inputMonitoring)
-        } else if res == .alertSecondButtonReturn {
-            NSWorkspace.shared.open(PermissionPanels.accessibility)
-        }
+    /// Онбординг-окно: живой статус обоих разрешений, инструкция по «Универсальному
+    /// доступу», сброс «протухшей записи» (tccutil) — главная диагностика
+    /// «говорят, не работает».
+    @objc private func openOnboarding() {
+        OnboardingWindowController.show(engine: engine)
     }
 
     @objc private func togglePause() {
