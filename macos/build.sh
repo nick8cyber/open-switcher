@@ -56,15 +56,6 @@ else
     echo "ВНИМАНИЕ: macos/AppIcon.icns не найден — бандл будет без иконки"
 fi
 
-# Подпись Developer ID (если сертификат есть): TCC-права (Мониторинг ввода,
-# Универсальный доступ) привязаны к подписи — ad-hoc-сборки ломали их при
-# каждой пересборке. Стабильная подпись = права переживают пересборку.
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
-    codesign --force --deep --options runtime --timestamp \
-        --sign "Developer ID Application" "$APP" 2>/dev/null || \
-    codesign --force --deep -s - "$APP"
-fi
-
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -84,6 +75,16 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+
+# Подпись Developer ID (если сертификат есть): TCC-права (Мониторинг ввода,
+# Универсальный доступ) привязаны к подписи — ad-hoc-сборки ломали их при
+# каждой пересборке. Подписываем только собранный бандл: изменение Info.plist
+# после codesign нарушает целостность подписи.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
+    codesign --force --deep --options runtime --timestamp \
+        --sign "Developer ID Application" "$APP" 2>/dev/null || \
+    codesign --force --deep -s - "$APP"
+fi
 
 echo "Готово: $APP"
 
