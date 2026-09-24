@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import QuartzCore
 
@@ -189,6 +190,17 @@ public final class Engine {
             if let port = port ?? self?.tap {
                 CFRunLoopAddSource(rlCF, CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0), .commonModes)
             }
+            // Телеметрия прав раз в минуту: точное состояние по мнению системы
+            var permTick = 0
+            CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 60, 0, 0) { _ in
+                let post = CGPreflightPostEventAccess()
+                let listen = CGPreflightListenEventAccess()
+                let ax = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary)
+                let tapAlive = self?.tap != nil
+                self?.logLine(String(format: "perms: post=%d listen=%d ax=%d tapAlive=%d", post ? 1 : 0, listen ? 1 : 0, ax ? 1 : 0, tapAlive ? 1 : 0))
+                _ = permTick
+            }.map { CFRunLoopAddTimer(rlCF, $0, .commonModes) }
+
             CFRunLoopAddTimer(rlCF, CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 10, 0, 0) { [weak self] _ in
                 // watchdog: macOS молча отключает тап при таймауте колбэка;
                 // если тап вовсе не создан (разрешение выдали позже) — пробуем снова
@@ -398,6 +410,19 @@ public final class Engine {
         }
         if consumeSessionReset() { resetSession() }
 
+        // ДИАГНОСТИКА (временно): полное эхо входящих клавиатурных событий
+        if s.devLog, type == .keyDown || type == .keyUp || type == .flagsChanged {
+            let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            let fl = event.flags
+            var f = ""
+            if fl.contains(.maskShift) { f += "S" }
+            if fl.contains(.maskCommand) { f += "C" }
+            if fl.contains(.maskAlternate) { f += "A" }
+            if fl.contains(.maskControl) { f += "^" }
+            if fl.contains(.maskAlphaShift) { f += "caps" }
+            logLine(String(format: "ev: type=%d code=0x%02X flags=[%@]", type.rawValue, kc, f))
+        }
+
         switch type {
         case .keyDown:
             if !onKeyDown(event) { return nil } // проглотить
@@ -555,6 +580,9 @@ public final class Engine {
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
         let now = Engine.ms()
         let m = heldModsFromFlags(flags)
+        if s.devLog, KeyCodeMap.isModifier(code) {
+            logLine(String(format: "flags: code=0x%02X press=%d tapVk=%d alone=%d", code, pressedMods.contains(code) ? 0 : 1, tapVk, tapAlone ? 1 : 0))
+        }
 
         // press/release по чётности: событие на уже «нажатой» клавише — её отпускание
         let wasPressed = pressedMods.contains(code)
@@ -611,6 +639,9 @@ public final class Engine {
         }
         if isShiftKey && !isPress {
             // отпускание Shift — завершение тапа (смена бита глотать бессмысленно)
+            if s.devLog {
+                logLine(String(format: "shift-up: code=0x%02X tapVk=%d alone=%d dt=%.3f", code, tapVk, tapAlone ? 1 : 0, now - tapDownAt))
+            }
             _ = fireTapIfArmed(code: code, now: now, flags: flags)
             return true
         }
@@ -672,6 +703,9 @@ public final class Engine {
         let m = heldModsFromFlags(flags)
         let alone = tapAlone && !m.ctrl && !m.alt && !m.cmd
             && (now - tapDownAt) >= 0 && (now - tapDownAt) < 0.7
+        if !alone, s.devLog {
+            logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, now - tapDownAt, now < suppressUntil ? 1 : 0))
+        }
         if alone {
             logLine("tap fired: lang=\(tapTarget)")
             updateForeground()
