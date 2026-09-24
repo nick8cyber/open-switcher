@@ -142,7 +142,8 @@ public enum SettingsStore {
         }
     }
 
-    public static func save(_ s: Settings) {
+    @discardableResult
+    public static func save(_ s: Settings) -> Bool {
         let lines = [
             "FixOnEnter=\(s.fixOnEnter ? 1 : 0)",
             "AutoConvertOnWordEnd=\(s.autoConvertOnWordEnd ? 1 : 0)",
@@ -177,8 +178,14 @@ public enum SettingsStore {
             "ThemeMode=\(s.themeMode)",
             "DefaultsV=\(s.defaultsV)",
         ]
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? lines.joined(separator: "\n").appending("\n").write(toFile: filePath, atomically: true, encoding: .utf8)
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try lines.joined(separator: "\n").appending("\n")
+                .write(toFile: filePath, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
     }
 }
 
