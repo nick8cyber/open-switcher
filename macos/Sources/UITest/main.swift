@@ -13,17 +13,19 @@ let engine = Engine(settings)
 // UI_HEIGHT — рендер с нестандартной высотой окна (страницы длиннее 660)
 let onboarding = ProcessInfo.processInfo.environment["UI_PAGE"] == "onboarding"
 let winW: Double = onboarding ? 560 : 880
-let winH = onboarding ? 420.0 : (Double(ProcessInfo.processInfo.environment["UI_HEIGHT"] ?? "") ?? 660)
+let winH = onboarding ? 470.0 : (Double(ProcessInfo.processInfo.environment["UI_HEIGHT"] ?? "") ?? 660)
 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: winW, height: winH),
                       styleMask: [.titled, .closable], backing: .buffered, defer: false)
 window.titlebarAppearsTransparent = true
 window.titleVisibility = .hidden
 window.backgroundColor = .clear
 let page = ProcessInfo.processInfo.environment["UI_PAGE"] ?? "0"
-// UI_PAGE=onboarding — рендер онбординг-окна; UI_STALE=1 — сразу с блоком сброса прав
+// UI_PAGE=onboarding — рендер онбординг-окна; UI_STALE=1 — сразу в состоянии
+// «всё готово» (зелёные бейджи и нижняя кнопка); UI_DENIED=1 — карточки без прав
 let rootView: AnyView = onboarding
     ? AnyView(OnboardingView(engine: engine, onFinish: {},
-                             previewStale: ProcessInfo.processInfo.environment["UI_STALE"] == "1"))
+                             previewReady: ProcessInfo.processInfo.environment["UI_STALE"] == "1",
+                             previewDenied: ProcessInfo.processInfo.environment["UI_DENIED"] == "1"))
     : AnyView(SettingsRoot(engine: engine, initialPage: Int(page) ?? 0))
 let vc = NSHostingController(rootView: rootView)
 vc.sizingOptions = [] // иначе hosting controller жмёт окно к fitting-минимуму (620)
@@ -46,6 +48,11 @@ guard size.width > 10 else { print("no size"); exit(2) }
 
 let image = NSImage(size: size)
 image.lockFocus()
+// ждущие неявные CA-транзакции (SwiftUI .animation) без живого render loop
+// не коммитятся — сбрасываем принудительно, иначе слой остаётся в старых цветах
+CATransaction.begin()
+CATransaction.setDisableActions(true)
+CATransaction.commit()
 if let ctx = NSGraphicsContext.current {
     let cg = ctx.cgContext
     cg.saveGState()

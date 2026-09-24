@@ -2,11 +2,12 @@ import AppKit
 import SwiftUI
 
 /// Онбординг-окно разрешений (замена старым NSAlert): одно окно ведёт юзера от
-/// первого запуска до «работает». Живая проверка раз в секунду, блок-инструкция
-/// по «Универсальному доступу» (для .defaultTap его хватает — «Мониторинг ввода»
-/// НЕ требуется) и разбор кейса «протухшей записи TCC»: тумблер в списке включён,
-/// а AXIsProcessTrusted=false держится >20 с (запись от старой ad-hoc подписи) —
-/// лечится выключить-включить тумблер или сбросом tccutil.
+/// первого запуска до «работает» — за три клика. Оба разрешения запрашиваются
+/// ПРОГРАММНО (macOS 12+ API): «Универсальный доступ» — через
+/// AXIsProcessTrustedWithOptions(prompt: true), «Мониторинг ввода» — через
+/// CGRequestListenEventAccess (система сама добавит приложение в список и
+/// покажет тумблер). Живая проверка раз в секунду; всё зелёное — окно
+/// закрывается само с попапом «Работаю!».
 public final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     private let engine: Engine
     private var finished = false
@@ -25,16 +26,21 @@ public final class OnboardingWindowController: NSWindowController, NSWindowDeleg
         w.present()
     }
 
-    /// Показать, только если разрешения не в порядке (для автоматических мест).
+    /// Показать, только если хоть одно из трёх прав не в порядке
+    /// (для автоматических мест).
     public static func showIfNeeded(engine: Engine) {
         let st = engine.permissionsState()
-        guard !st.tap || !st.accessibility else { return }
+        let permsOk = Permissions.listenEventGranted()
+            && Permissions.postEventGranted()
+            && st.accessibility
+        guard !(permsOk && st.tap) else { return }
         show(engine: engine)
     }
 
     public init(engine: Engine) {
         self.engine = engine
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+        // 470: обе карточки с кнопками «Разрешить» должны влезать без скролла
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 470),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "OpenSwitcher — настройка"
         window.level = .floating
@@ -74,31 +80,38 @@ public final class OnboardingWindowController: NSWindowController, NSWindowDeleg
 
 // ---------------------------------------------------------------- SwiftUI
 
-/// Контент онбординга: заголовок, блок «Универсальный доступ» со живым бейджем,
-/// вложенный кейс «протухла запись» (после 20 с безуспешного ожидания),
-/// пояснение про «Мониторинг ввода» и большая кнопка-статус внизу.
+/// Контент онбординга: две карточки-разрешения с живыми бейджами и кнопкой
+/// «Разрешить» (программный запрос через системный API) и большая кнопка-статус
+/// внизу: всё выдано → зелёная, через 3 с окно закрывается само.
 /// public: офскрин-рендер (UITest) собирает вью из другого модуля.
 public struct OnboardingView: View {
     let engine: Engine
     var onFinish: () -> Void
-    /// Превью-режим офскрин-рендера (UI_STALE=1): сразу показать блок сброса прав.
-    var previewStale: Bool = false
+    /// Превью-режим офскрин-рендера (UI_STALE=1): показать «всё готово»
+    /// (зелёные бейджи и нижняя кнопка), не дожидаясь реальных прав.
+    var previewReady: Bool = false
+    /// Превью-режим офскрин-рендера (UI_DENIED=1): показать карточки без прав —
+    /// красные бейджи и кнопки «Разрешить» (машина с уже выданными правами
+    /// рендерит зелёное состояние и кнопки не видны).
+    var previewDenied: Bool = false
 
     @ObservedObject private var theme = ThemeEnv.shared
+    @State private var listenOk = false
+    @State private var postOk = false
+    @State private var axOk = false
     @State private var tapOk = false
-    @State private var axOk = accessibilityTrusted(prompt: false)
-    @State private var axFalseSince: Date?
-    @State private var staleHint = false
     @State private var greenSince: Date?
-    @State private var resetting = false
 
-    public init(engine: Engine, onFinish: @escaping () -> Void, previewStale: Bool = false) {
+    public init(engine: Engine, onFinish: @escaping () -> Void, previewReady: Bool = false,
+                previewDenied: Bool = false) {
         self.engine = engine
         self.onFinish = onFinish
-        _staleHint = State(initialValue: previewStale)
+        self.previewReady = previewReady
+        self.previewDenied = previewDenied
     }
 
-    // Живая проверка: таймер на main раз в 1 с.
+    // Живая проверка: таймер на main раз в 1 с (проверки прав недостоверны
+    // с фонового потока — потому только main).
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     public var body: some View {
@@ -117,12 +130,10 @@ public struct OnboardingView: View {
             .padding(.top, 18)
             .padding(.bottom, 10)
 
-            // скролл — на случай появления блока «протухла запись»
             ScrollView {
                 VStack(spacing: 12) {
                     axBlock(t)
-                    if staleHint { staleBlock(t) }
-                    monitorNote(t)
+                    listenBlock(t)
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
@@ -138,7 +149,9 @@ public struct OnboardingView: View {
         .onReceive(ticker) { _ in checkTick() }
     }
 
-    // Блок 1: «Универсальный доступ» — бейдж статуса, инструкция, кнопка панели.
+    // Блок A: «Универсальный доступ» — инжекция исправленного текста.
+    // «Разрешить» дергает AX-запрос с prompt=true: система покажет диалог
+    // добавления приложения в список.
     private func axBlock(_ t: ThemeColors) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
@@ -148,69 +161,63 @@ public struct OnboardingView: View {
                 OnbBadge(ok: axOk)
                 Spacer()
             }
-            Text("Откройте Системные настройки → Конфиденциальность и безопасность → Универсальный доступ и включите тумблер OpenSwitcher в списке. Перезапуск не нужен: приложение подхватит разрешение само.")
+            Text("Чтобы приложение могло исправлять текст — вставлять правильные буквы вместо набранных не в той раскладке.")
                 .font(.system(size: 11.5))
                 .foregroundColor(t.dim)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                OnbButton(title: "Открыть настройки", accent: true) {
-                    NSWorkspace.shared.open(PermissionPanels.accessibility)
+            if !axOk {
+                HStack {
+                    OnbButton(title: "Разрешить", accent: true) {
+                        _ = accessibilityTrusted(prompt: true)
+                    }
+                    OnbButton(title: "Открыть настройки", accent: false) {
+                        NSWorkspace.shared.open(PermissionPanels.accessibility)
+                    }
+                    Spacer()
                 }
-                Spacer()
             }
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(t.card))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(t.cardBorder))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(axOk ? t.ok.opacity(0.35) : t.warn.opacity(0.5)))
     }
 
-    // Вложенный кейс: право «застряло» — запись TCC от старой ad-hoc подписи.
-    private func staleBlock(_ t: ThemeColors) -> some View {
+    // Блок B: «Мониторинг ввода» — чтение нажатых клавиш. «Разрешить» зовёт
+    // CGRequestListenEventAccess: система САМА добавит приложение в список
+    // Мониторинга и покажет тумблер (раньше юзер добавлял вручную через «+»).
+    private func listenBlock(_ t: ThemeColors) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 12))
-                    .foregroundColor(t.warn)
-                Text("Право не применилось")
-                    .font(.system(size: 12.5, weight: .semibold))
+                Text("Мониторинг ввода")
+                    .font(.system(size: 13.5, weight: .semibold))
                     .foregroundColor(t.text)
+                OnbBadge(ok: listenOk)
+                Spacer()
             }
-            Text("OpenSwitcher уже в списке, но право не применилось (запись от старой сборки). Выключите тумблер и включите заново — или нажмите:")
+            Text("Чтобы приложение видело нажатия клавиш и понимало, что вы набрали не на той раскладке.")
                 .font(.system(size: 11.5))
                 .foregroundColor(t.dim)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                OnbButton(title: resetting ? "Сбрасываю…" : "Сбросить права",
-                          accent: false, disabled: resetting) {
-                    resetAccessibilityRights()
+            if !listenOk {
+                HStack {
+                    OnbButton(title: "Разрешить", accent: true) {
+                        Permissions.requestListenEventAccess()
+                    }
+                    OnbButton(title: "Открыть настройки", accent: false) {
+                        NSWorkspace.shared.open(PermissionPanels.inputMonitoring)
+                    }
+                    Spacer()
                 }
-                Spacer()
             }
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(t.card))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(t.warn.opacity(0.5)))
-    }
-
-    // Блок 2: снимаем вопрос «почему нет в списке Мониторинга ввода».
-    private func monitorNote(_ t: ThemeColors) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 11))
-                .foregroundColor(t.dim)
-            Text("Мониторинг ввода — не требуется: наш перехват клавиш работает через Универсальный доступ.")
-                .font(.system(size: 11))
-                .foregroundColor(t.dim)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(t.chipBg))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(listenOk ? t.ok.opacity(0.35) : t.warn.opacity(0.5)))
     }
 
     // Низ: большая кнопка-статус — «Жду разрешения…» → зелёное «Всё готово».
     private func bottomButton(_ t: ThemeColors) -> some View {
-        let ready = axOk && tapOk
+        let ready = readyNow
         return Text(ready ? "Всё готово — напечатайте ghbdtn и пробел!" : "Жду разрешения…")
             .font(.system(size: 13, weight: .semibold))
             .foregroundColor(ready ? .white : t.dim)
@@ -218,56 +225,33 @@ public struct OnboardingView: View {
             .padding(.vertical, 13)
             .background(RoundedRectangle(cornerRadius: 12).fill(ready ? t.ok : t.chipBg))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(ready ? Color.clear : t.cardBorder))
-            .animation(.easeInOut(duration: 0.2), value: ready)
     }
 
-    /// Тик живой проверки (main, 1 с): статус обоих разрешений, таймеры
-    /// «протухшей записи» и авто-закрытия.
+    /// Полный онбординг: «Мониторинг ввода» + инжекция (PostEvent) + AX.
+    private var readyNow: Bool {
+        previewReady || (listenOk && postOk && axOk)
+    }
+
+    /// Тик живой проверки (main, 1 с): статус всех прав и таймер авто-закрытия.
     private func checkTick() {
+        if previewDenied {
+            // превью офскрин-рендера: карточки в состоянии «нет прав»
+            listenOk = false; postOk = false; axOk = false; tapOk = false
+            return
+        }
         let st = engine.permissionsState()
-        let ax = accessibilityTrusted(prompt: false)
+        listenOk = Permissions.listenEventGranted()
+        postOk = Permissions.postEventGranted()
+        axOk = accessibilityTrusted(prompt: false)
         tapOk = st.tap
-        axOk = ax
-        let now = Date()
-        if ax && st.tap {
+        if readyNow {
             // всё готово: зелёный статус, через 3 с окно закрывается само
-            axFalseSince = nil
-            if greenSince == nil { greenSince = now }
-            if let g = greenSince, now.timeIntervalSince(g) >= 3 {
+            if greenSince == nil { greenSince = Date() }
+            if let g = greenSince, Date().timeIntervalSince(g) >= 3 {
                 onFinish()
             }
         } else {
             greenSince = nil
-            if ax {
-                axFalseSince = nil
-            } else {
-                if axFalseSince == nil { axFalseSince = now }
-                // «протухшая запись»: тумблер включён (напрямую не видно), но
-                // AXIsProcessTrusted=false держится >20 с при открытом онбординге
-                if !staleHint, let f = axFalseSince, now.timeIntervalSince(f) > 20 {
-                    staleHint = true
-                }
-            }
-        }
-    }
-
-    /// «Сбросить права»: tccutil reset Accessibility com.openswitcher.app
-    /// (без sudo). После сброса OpenSwitcher исчезает из списка — юзер включает
-    /// тумблер заново, запись создаётся от текущей подписи.
-    private func resetAccessibilityRights() {
-        guard !resetting else { return }
-        resetting = true
-        DispatchQueue.global(qos: .utility).async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            p.arguments = ["reset", "Accessibility", "com.openswitcher.app"]
-            try? p.run()
-            p.waitUntilExit()
-            DispatchQueue.main.async {
-                resetting = false
-                staleHint = false
-                axFalseSince = Date() // таймер кейса стартует заново
-            }
         }
     }
 }
