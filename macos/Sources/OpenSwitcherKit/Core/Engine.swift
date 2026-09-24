@@ -1558,11 +1558,11 @@ public final class Engine {
             _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, skipRejected: true, skipLearn: true)
             return
         }
-        // свежего слова нет — выделяем слово слева от каретки и конвертируем
-        logLine("caramba-flip: no fresh word at caret -> select-left")
-        TextConverter.targetPid = fgApp
-        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
-        beginFixSelection(fromFixWord: false)
+        // свежего слова нет (нет выделения юзера, слово >10 с или в другом
+        // приложении) — ЧЕСТНЫЙ ОТКАЗ: иначе тап схватит кусок предложения
+        // слева от каретки и «затрёт» его конвертацией (бой 2026-09-24 22:31)
+        logLine("caramba-flip: no fresh word at caret -> refuse")
+        fireInfo("Нет свежего слова у курсора — выдели текст и нажми Option ещё раз")
     }
 
     /// «Вставить без форматирования» (как в Caramba): содержимое буфера обмена
