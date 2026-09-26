@@ -1078,7 +1078,7 @@ namespace OpenSwitcher.Core
         /// <summary>Есть ли в набранном знак-двойник б/ю/ж/э (сигнал «русский текст в EN-раскладке»).</summary>
         private static bool ContainsPunctTwinChar(string s)
         {
-            return s != null && s.IndexOfAny(new[] { ',', '.', ';', ''' }) >= 0;
+            return s != null && s.IndexOfAny(new[] { ',', '.', ';', '\'' }) >= 0;
         }
 
         /// <summary>Знак, печатаемый клавишей-«двойником» в EN-раскладке (для хвоста переворота).</summary>
