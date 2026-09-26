@@ -1475,8 +1475,11 @@ public final class Engine {
 
         undoPending = true
         undoText = cur.text
-        undoLen = best.text.count
-        undoSepText = ""
+        // точка отката включает хвост-разделитель (порт C# 8e8af36): Break после
+        // force-флипа 'ии␣' вернёт 'ии␣' целиком — раньше пробел съедался и
+        // 'bb ␣ жрет' склеивалось в 'bиижрет'
+        undoLen = best.text.count + trailLen
+        undoSepText = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: false) : ""
         undoLayout = layouts.first { $0.id == cur.layoutID }
         undoApp = fgApp
         undoAt = Engine.ms()
