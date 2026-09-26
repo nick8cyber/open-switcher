@@ -1075,6 +1075,12 @@ namespace OpenSwitcher.Core
             return vk == 0xBA || vk == 0xBC || vk == 0xBE || vk == 0xDE;
         }
 
+        /// <summary>Есть ли в набранном знак-двойник б/ю/ж/э (сигнал «русский текст в EN-раскладке»).</summary>
+        private static bool ContainsPunctTwinChar(string s)
+        {
+            return s != null && s.IndexOfAny(new[] { ',', '.', ';', ''' }) >= 0;
+        }
+
         /// <summary>Знак, печатаемый клавишей-«двойником» в EN-раскладке (для хвоста переворота).</summary>
         private static char PunctCharOfVk(int vk)
         {
@@ -1230,11 +1236,26 @@ namespace OpenSwitcher.Core
                 Log("convert: dict-over-score ('" + cur.Text + "' -> '" + best.Text + "')");
             }
 
+            // ЗНАК-ДВОЙНИК ВНУТРИ НАБРАННОГО ('buhf.cm': '.' — это «ю» в RU): в
+            // настоящем английском точка/запятая/апостроф внутри «слова» почти
+            // невозможна — это русский текст с б/ю/ж/э, набранный в EN-раскладке
+            // (Caramba: «невозможность знака»). Цель чисто буквенная и возможная
+            // по корпусу → конвертим без словаря и без запаса скора
+            bool punctSignal = !acceptedWord && cur.Lang == 1 && best.Lang == 0 &&
+                               ContainsPunctTwinChar(cur.Text) &&
+                               best.Text == LanguageTables.LettersOnly(best.Text) &&
+                               LanguageTables.PossibleWord(LanguageTables.LettersOnly(best.Text), 0);
+            if (!pass && punctSignal)
+            {
+                pass = true;
+                Log("convert: punct-twin signal ('" + cur.Text + "' -> '" + best.Text + "')");
+            }
+
             // цель не словарная (только «возможная» по биграммам): авто-переворот
             // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
             // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
             // Словарные цели — обычный порог, выученные — без порога
-            if (pass && !acceptedWord &&
+            if (pass && !acceptedWord && !punctSignal &&
                 !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
             {
                 double need = 2 * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
