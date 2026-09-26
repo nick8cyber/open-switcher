@@ -548,6 +548,7 @@ namespace OpenSwitcher.Core
                     _anyKeySinceShift = true;
                     _tapAlone = false;
                     SwitchToOtherLayout();
+                    _noFlipUntil = Environment.TickCount + 2000;
                     return true;
                 }
                 _lastShiftDown = now;
@@ -1002,6 +1003,10 @@ namespace OpenSwitcher.Core
             ExpectLayout(target);
             // юзер выбрал язык явно — автодетект молчит до смены окна / Enter
             if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+            // и 2 с никаких авто-конвертаций: пока ОС применяет новую раскладку,
+            // движок видит СТАРУЮ и переворачивает свеженабранное в обратную
+            // сторону ('ith'->«шер» сразу после тапа на EN) — бой 23:26:01
+            _noFlipUntil = Environment.TickCount + 2000;
             // компенсация лага: буквы в просвете доставим в целевой раскладке
             _gapActive = true; _gapHkl = target; _gapBuf.Clear();
             _gapDeadline = Environment.TickCount + 800;
