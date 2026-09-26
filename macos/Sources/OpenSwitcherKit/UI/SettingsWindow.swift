@@ -25,6 +25,7 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
         window.delegate = self
         m.load(engine.s)
         let vc = NSHostingController(rootView: SettingsRoot(engine: engine, model: m))
+        vc.sizingOptions = [] // иначе hosting controller жмёт окно к fitting-минимуму
         self.contentViewController = vc
         vc.view.wantsLayer = true
         engine.uiSettingsActive = true

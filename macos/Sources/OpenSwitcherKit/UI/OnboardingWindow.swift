@@ -53,6 +53,9 @@ public final class OnboardingWindowController: NSWindowController, NSWindowDeleg
         let vc = NSHostingController(rootView: OnboardingView(engine: engine, onFinish: { [weak self] in
             self?.finish()
         }))
+        // иначе hosting controller жмёт окно к fitting-минимуму SwiftUI
+        // (у ScrollView он схлопывается — окно сжимается, текст обрезается)
+        vc.sizingOptions = []
         contentViewController = vc
     }
 
@@ -60,6 +63,10 @@ public final class OnboardingWindowController: NSWindowController, NSWindowDeleg
 
     private func present() {
         window?.makeKeyAndOrderFront(nil)
+        // диагностика: реальный кадр окна (ловит сжатие hosting-контроллёром)
+        if let f = window?.frame {
+            engine.logLine(String(format: "onboarding show: %.0fx%.0f", f.width, f.height))
+        }
         // accessory-приложение: без activate окно появляется без фокуса
         NSApp.activate(ignoringOtherApps: true)
     }
