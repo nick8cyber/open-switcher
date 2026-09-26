@@ -1516,12 +1516,12 @@ namespace OpenSwitcher.Core
                 ExpectLayout(best.Hkl);
             }
 
-            // точка отката: повторный Break вернёт исходное слово; отмена занесёт
-            // его в rejected — «самообучение» сработало в обратную сторону
+            // точка отката: повторный Break вернёт исходное слово + разделитель;
+            // отмена занесёт его в rejected — «самообучение» в обратную сторону
             _undoPending = true;
             _undoText = cur.Text;
-            _undoLen = best.Text.Length;
-            _undoSepText = "";
+            _undoLen = best.Text.Length + trailLen;
+            _undoSepText = trailSepVk != 0 ? RenderKeyChar(trailSepVk, cur.Hkl, false) : "";
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoFocus = _fgFocus;
