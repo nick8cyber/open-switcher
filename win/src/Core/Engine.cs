@@ -35,6 +35,7 @@ namespace OpenSwitcher.Core
         private int _tapVk;                  // клавиша, чей «тап» отслеживается
         private int _tapTarget;              // 0 = РУС, 1 = ENG
         private int _tapDownTick;
+        private int _lastTapDoneTick;        // когда прошлёл последний успешный тап-переключатель (для дребезг-фильтра)
         private bool _tapAlone;              // между нажатием и отпусканием не было других клавиш
         private bool _autoLocked;            // юзер сам выбрал раскладку — автодетект молчит до конца текущего сеанса набора
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
@@ -554,10 +555,20 @@ namespace OpenSwitcher.Core
                 _anyKeySinceShift = false;
                 if ((S.HotRuMods == 0 && S.HotRuVk == vk) || (S.HotEnMods == 0 && S.HotEnVk == vk))
                 {
-                    _tapVk = vk;
-                    _tapTarget = S.HotRuVk == vk ? 0 : 1;
-                    _tapDownTick = now;
-                    _tapAlone = true;
+                    // дребезг/авторепит: тап быстрее 200 мс после предыдущего тапа
+                    // не армится (двойное переключение «туда-обратно» рвёт слово посреди
+                    // набора: 'bиижрет' из боя 17:00)
+                    if (_lastTapDoneTick != 0 && unchecked(now - _lastTapDoneTick) < 200)
+                    {
+                        Log("tap debounce: too soon after previous tap");
+                    }
+                    else
+                    {
+                        _tapVk = vk;
+                        _tapTarget = S.HotRuVk == vk ? 0 : 1;
+                        _tapDownTick = now;
+                        _tapAlone = true;
+                    }
                 }
                 return true;
             }
@@ -971,6 +982,7 @@ namespace OpenSwitcher.Core
             if (alone)
             {
                 Log("tap fired: lang=" + _tapTarget);
+                _lastTapDoneTick = Environment.TickCount;
                 UpdateForeground();
                 SwitchToLanguage(_tapTarget);
             }
