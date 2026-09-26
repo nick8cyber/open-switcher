@@ -27,6 +27,7 @@ public final class Engine {
     private var lastShiftDown: TimeInterval = 0
     private var anyKeySinceShift = true
     private var tapVk = 0                  // клавиша, чей «тап» отслеживается
+    private var lastTapDoneAt: TimeInterval = 0 // когда сработал последний успешный тап (для дребезг-фильтра, C# 942c5ba)
     private var tapTarget = 0              // 0 = РУС, 1 = ENG
     private var tapDownAt: TimeInterval = 0
     private var tapAlone = false
@@ -41,7 +42,7 @@ public final class Engine {
     private var lastInputAt: TimeInterval = 0
     private let sessionPause: TimeInterval = 3.0
     private var lastResendSpaceAt: TimeInterval = 0
-    private var lastSpacePassTick: TimeInterval = 0 // когда последний пробел ушёл в текст (для дедупа двойных)
+    private var lastSpaceTextTick: TimeInterval = 0 // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл ИЛИ нажатие) — для дедупа двойных (C# 3baec1e)
 
     // держалка main-таймера свежести кэша раскладок (TIS — только на main)
     private var layoutRefreshTimer: Timer?
@@ -458,7 +459,8 @@ public final class Engine {
         gapActive = false; gapBuf.removeAll()
         autoLocked = false
         expectedLayoutID = nil // как _expectedValid=false в C#
-        lastResendSpaceAt = 0  // окно эха не переносится в другое окно
+        lastResendSpaceAt = 0
+        lastSpaceTextTick = 0 // окно дедупа не переносится в другое окно  // окно эха не переносится в другое окно
     }
 
     /// Вызывается на main: обновляет fgApp/fgProc/fgIsOwnApp и запрашивает
@@ -587,10 +589,16 @@ public final class Engine {
             lastShiftDown = now
             anyKeySinceShift = false
             if (s.hotRuMods == 0 && s.hotRuVk == code) || (s.hotEnMods == 0 && s.hotEnVk == code) {
-                tapVk = code
-                tapTarget = s.hotRuVk == code ? 0 : 1
-                tapDownAt = now
-                tapAlone = true
+                // дребезг/авторепит: тап быстрее 200 мс после предыдущего не армится
+                // (двойное переключение «туда-обратно» рвёт слово посреди набора — C# 942c5ba)
+                if lastTapDoneAt != 0 && (now - lastTapDoneAt) < 0.2 {
+                    logLine("tap debounce: too soon after previous tap")
+                } else {
+                    tapVk = code
+                    tapTarget = s.hotRuVk == code ? 0 : 1
+                    tapDownAt = now
+                    tapAlone = true
+                }
             }
             shiftPairClean = true // первый Shift чист: ждём второй (keyDown отменит)
             return true
@@ -666,6 +674,7 @@ public final class Engine {
         }
         if alone {
             logLine("tap fired: lang=\(tapTarget)")
+            lastTapDoneAt = now
             updateForeground()
             switchToLanguage(tapTarget)
         }
@@ -992,7 +1001,7 @@ public final class Engine {
             // при пустом буфере в пределах окна глотается — защита от рефлекса
             // двойного нажатия после конвертаций (порт C# Engine.cs:802-811)
             if code == KeyCodeMap.space && !modified && !s.paused && s.spaceDedupMs > 0 &&
-                buf.count == 0 && lastSpacePassTick != 0 && (now - lastSpacePassTick) < Double(s.spaceDedupMs) {
+                buf.count == 0 && lastSpaceTextTick != 0 && (now - lastSpaceTextTick) < Double(s.spaceDedupMs) {
                 logLine("space: dedup swallowed")
                 return false // проглотить (в текст не идёт)
             }
@@ -1060,7 +1069,7 @@ public final class Engine {
             }
             // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь (v3 §15)
             if code == KeyCodeMap.space && !modified {
-                if !converted { lastSpacePassTick = now } // считаем только юзерские пробелы: пересланные/конвертные — нет (C#:891)
+                if !converted { lastSpaceTextTick = now } // считаем только юзерские пробелы: пересланные/конвертные — нет (C#:891)
                 logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
             }
             buf.clear()
@@ -1299,7 +1308,10 @@ public final class Engine {
             if resendKey == KeyCodeMap.enter { TextConverter.sendEnter() }
             else { TextConverter.sendUnicode(sepText) }
         }
-        if resendKey == KeyCodeMap.space { lastResendSpaceAt = Engine.ms() }
+        if resendKey == KeyCodeMap.space {
+            lastResendSpaceAt = Engine.ms()
+            lastSpaceTextTick = Engine.ms() // окно дедупа двойных пробелов учитывает и досыл
+        }
         if let bl = layouts.first(where: { $0.id == best.layoutID }) {
             switchLayoutOnMain(bl)
             verifySwitch(target: bl)
