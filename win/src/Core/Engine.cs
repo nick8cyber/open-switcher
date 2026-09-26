@@ -1198,7 +1198,7 @@ namespace OpenSwitcher.Core
                 string tail = best.Text.Substring(core.Length);
                 if (core.Length == 0 || tail.Length > 1)
                 {
-                    Log("convert skip: target-not-letters ('" + best.Text + "')");
+                    Log("convert skip: target-not-letters ('" + cur.Text + "' -> '" + best.Text + "')");
                     return false;
                 }
                 // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (все пары
@@ -1207,7 +1207,7 @@ namespace OpenSwitcher.Core
                 if (!WordDict.Has(core, best.Lang) &&
                     (core.Length < 3 || !LanguageTables.PossibleWord(core, best.Lang)))
                 {
-                    Log("convert skip: target-not-in-dict ('" + best.Text + "')");
+                    Log("convert skip: target-not-in-dict ('" + cur.Text + "' -> '" + best.Text + "')");
                     return false;
                 }
                 // ВНИМАНИЕ: «набранное — возможное русское слово» здесь проверять НЕЛЬЗЯ —
