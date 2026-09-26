@@ -198,15 +198,18 @@ public final class Engine {
             if let port = port ?? self?.tap {
                 CFRunLoopAddSource(rlCF, CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0), .commonModes)
             }
-            // Телеметрия прав раз в минуту: точное состояние по мнению системы
-            var permTick = 0
+            // Телеметрия прав раз в минуту: точное состояние по мнению системы.
+            // Системные проверки прав достоверны только на main (с потока тапа —
+            // задокументированные false negatives), поэтому проверки и лог — там.
             CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 60, 0, 0) { _ in
-                let post = CGPreflightPostEventAccess()
-                let listen = CGPreflightListenEventAccess()
-                let ax = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary)
-                let tapAlive = self?.tap != nil
-                self?.logLine(String(format: "perms: post=%d listen=%d ax=%d tapAlive=%d", post ? 1 : 0, listen ? 1 : 0, ax ? 1 : 0, tapAlive ? 1 : 0))
-                _ = permTick
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    let post = CGPreflightPostEventAccess()
+                    let listen = CGPreflightListenEventAccess()
+                    let ax = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary)
+                    let tapAlive = self.tap != nil
+                    self.logLine(String(format: "perms: post=%d listen=%d ax=%d tapAlive=%d", post ? 1 : 0, listen ? 1 : 0, ax ? 1 : 0, tapAlive ? 1 : 0))
+                }
             }.map { CFRunLoopAddTimer(rlCF, $0, .commonModes) }
 
             CFRunLoopAddTimer(rlCF, CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 10, 0, 0) { [weak self] _ in

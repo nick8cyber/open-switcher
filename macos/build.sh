@@ -56,15 +56,9 @@ else
     echo "ВНИМАНИЕ: macos/AppIcon.icns не найден — бандл будет без иконки"
 fi
 
-# Подпись Developer ID (если сертификат есть): TCC-права (Мониторинг ввода,
-# Универсальный доступ) привязаны к подписи — ad-hoc-сборки ломали их при
-# каждой пересборке. Стабильная подпись = права переживают пересборку.
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
-    codesign --force --deep --options runtime --timestamp \
-        --sign "Developer ID Application" "$APP" 2>/dev/null || \
-    codesign --force --deep -s - "$APP"
-fi
-
+# Info.plist — ДО подписи: codesign берёт из него CFBundleIdentifier
+# (иначе идентификатор падает до "OpenSwitcher", TCC не узнаёт приложение
+# и выданные «Мониторинг ввода»/«Универсальный доступ» перестают действовать).
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -84,6 +78,22 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+
+# Подпись Developer ID (если сертификат есть): TCC-права (Мониторинг ввода,
+# Универсальный доступ) привязаны к подписи — ad-hoc-сборки ломали их при
+# каждой пересборке. Стабильная подпись = права переживают пересборку.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
+    codesign --force --deep --options runtime --timestamp \
+        --sign "Developer ID Application" "$APP" 2>/dev/null || \
+    codesign --force --deep -s - "$APP"
+fi
+
+# Гейт подписи: идентификатор обязан быть бандл-идентификатором, plist — связан.
+# Иначе (ad-hoc/нет plist при подписи) молча умирают TCC-права.
+SIGNED_ID="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')"
+if [ "$SIGNED_ID" != "com.openswitcher.app" ]; then
+    echo "ВНИМАНИЕ: подпись с идентификатором '$SIGNED_ID' вместо com.openswitcher.app — TCC-права не совпадут"
+fi
 
 echo "Готово: $APP"
 
