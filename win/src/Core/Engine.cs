@@ -186,6 +186,28 @@ namespace OpenSwitcher.Core
             catch (Exception) { }
         }
 
+        /// <summary>Снять отказ: слово снова в строю (юзер force-flip'нул его осознанно).
+        /// Перезапись learned.txt обязательна — иначе после рестарта отказ возвращался.</summary>
+        private void RemoveRejected(string typed)
+        {
+            try
+            {
+                string w = (typed ?? "").Trim().ToLowerInvariant();
+                if (w.Length == 0 || !_rejected.Remove(w)) return;
+                if (System.IO.File.Exists(LearnedPath))
+                {
+                    var keep = new List<string>();
+                    foreach (string line in System.IO.File.ReadAllLines(LearnedPath))
+                    {
+                        string t = line.Trim().ToLowerInvariant();
+                        if (t.Length > 0 && t != w) keep.Add(t);
+                    }
+                    System.IO.File.WriteAllLines(LearnedPath, keep);
+                }
+            }
+            catch (Exception) { }
+        }
+
         private void RememberAccepted(string typed)
         {
             try
@@ -1181,11 +1203,15 @@ namespace OpenSwitcher.Core
             // настоящем английском точка/запятая/апостроф внутри «слова» почти
             // невозможна — это русский текст с б/ю/ж/э, набранный в EN-раскладке
             // (Caramba: «невозможность знака»). Цель чисто буквенная и возможная
-            // по корпусу → конвертим без словаря и без запаса скора
+            // по корпусу → конвертим без словаря и без запаса скора.
+            // НО НЕ если буквенное ядро (без двойников) — настоящее EN-слово:
+            // 'twitter,' — это слово+запятая, а не русский текст с «б» на конце
+            // (бой 27.09 23:25: 'twitter,'->'ецшееукб')
             bool punctSignal = !acceptedWord && cur.Lang == 1 && best.Lang == 0 &&
                                ContainsPunctTwinChar(cur.Text) &&
                                best.Text == LanguageTables.LettersOnly(best.Text) &&
-                               LanguageTables.PossibleWord(LanguageTables.LettersOnly(best.Text), 0);
+                               LanguageTables.PossibleWord(LanguageTables.LettersOnly(best.Text), 0) &&
+                               !WordDict.Has(LanguageTables.LettersOnly(cur.Text), 1);
             if (!pass && punctSignal)
             {
                 pass = true;
@@ -1438,13 +1464,8 @@ namespace OpenSwitcher.Core
             LayoutCandidate cur = null;
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) { Log("force-flip skip: cur unknown"); return false; }
-            // юзер уже отменял переворот этой буквы/слова (rejected) — не повторяем его же ошибку
-            if (_rejected.Contains(cur.Text.ToLowerInvariant()))
-            {
-                Log("force-flip skip: word in rejected ('" + cur.Text + "')");
-                FireInfo("Этот переворот ты уже отменял");
-                return false;
-            }
+            string curLow = cur.Text.ToLowerInvariant();
+            bool wasRejected = _rejected.Contains(curLow);
 
             LayoutCandidate best = null;
             foreach (LayoutCandidate c in cands)
@@ -1460,6 +1481,15 @@ namespace OpenSwitcher.Core
             Log("force-flip: '" + cur.Text + "' -> '" + best.Text + "'");
             _lastConvertInfo = "force '" + cur.Text + "' -> '" + best.Text + "'";
             _lastConvertTick = Environment.TickCount;
+            // осознанный Break сильнее прошлых отказов: слово возвращаем в строй
+            // (иначе один случайный откат блокировал слово НАВСЕГДА — и авто,
+            // и ручной переворот; бой 27.09 23:20: 'free' не получить никаким путём).
+            // Если юзер снова отменит — undo положит его в rejected обратно
+            if (wasRejected)
+            {
+                RemoveRejected(curLow);
+                Log("force-flip: unrejected '" + curLow + "'");
+            }
 
             Suppress(600);
             // хвост-разделитель после слова уже в тексте приложения — стираем вместе

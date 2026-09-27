@@ -1362,7 +1362,7 @@ public final class Engine {
         updateForeground()
         if buf.count >= 2 {
             logLine("force-flip: current buffer (\(buf.count) keys)")
-            _ = forceConvertWord(buf.snapshot(), trailSepKey: 0)
+            _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true)
             buf.clear() // флип живого буфера — буфер отработал
             return
         }
@@ -1371,7 +1371,7 @@ public final class Engine {
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
             lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
             logLine("force-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
-            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey)
+            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, skipRejected: true)
             return
         }
         // честный отказ — паритет коду C# v3 (Engine.cs:1404-1406)
@@ -1394,14 +1394,11 @@ public final class Engine {
               let cur = cands.first(where: { $0.layoutID == curID }), cur.lang >= 0 else {
             logLine("force-flip skip: cur unknown"); return false
         }
-        // юзер уже отменял переворот этой буквы/слова (rejected) — не повторяем
-        // его же ошибку (порт C# 2fc5eaf: 'lfdfqw'->«давайц» -> backspace ->
-        // Break вернул тот же мусор -> пинг-понг переворотов)
-        if !skipRejected && isRejected(cur.text.lowercased()) {
-            logLine("force-flip skip: word in rejected ('\(cur.text)')")
-            fireInfo("Этот переворот ты уже отменял")
-            return false
-        }
+        // осознанный Break (главный путь) сильнее прошлых отказов: слово возвращаем
+        // в строй (иначе один случайный откат блокировал слово НАВСЕГДА — и авто,
+        // и ручной переворот; бой 27.09 23:20: 'free' не получить никаким путём).
+        // Option-пинг-понг (skipLearn) тоже пробивает, но rejected не трогает
+        let wasRejected = isRejected(cur.text.lowercased())
         guard let best = cands.filter({ $0.layoutID != curID && $0.lang >= 0 }).max(by: { $0.score < $1.score }),
               best.text != cur.text else {
             logLine("force-flip skip: no other reading"); return false
@@ -1409,6 +1406,10 @@ public final class Engine {
 
         logLine("force-flip: '\(cur.text)' -> '\(best.text)'")
         lastConvertInfo = "force '\(cur.text)' -> '\(best.text)'"
+        if wasRejected && !skipLearn {
+            removeRejected(cur.text.lowercased())
+            logLine("force-flip: unrejected '\(cur.text.lowercased())'")
+        }
 
         suppress(0.6)
         TextConverter.targetPid = fgApp
@@ -1670,6 +1671,21 @@ public final class Engine {
         // синхронная запись файла на потоке тапа (до 10 мс на тормозящем диске) недопустима
         DispatchQueue.global(qos: .utility).async {
             let _ = try? snapshot.joined(separator: "\n").appending("\n").write(toFile: self.acceptedPath, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Снять отказ: слово снова в строю (юзер force-flip'нул его осознанно).
+    /// Перезапись learned.txt обязательна — иначе после рестарта отказ возвращался.
+    private func removeRejected(_ typed: String) {
+        learnedLock.lock()
+        let removed = rejected.remove(typed) != nil
+        let snapshot = rejected
+        learnedLock.unlock()
+        guard removed else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let _ = try? snapshot.joined(separator: "
+").appending("
+").write(toFile: self.learnedPath, atomically: true, encoding: .utf8)
         }
     }
 
