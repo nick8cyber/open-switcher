@@ -1683,9 +1683,7 @@ public final class Engine {
         learnedLock.unlock()
         guard removed else { return }
         DispatchQueue.global(qos: .utility).async {
-            let _ = try? snapshot.joined(separator: "
-").appending("
-").write(toFile: self.learnedPath, atomically: true, encoding: .utf8)
+            let _ = try? snapshot.joined(separator: "\n").appending("\n").write(toFile: self.learnedPath, atomically: true, encoding: .utf8)
         }
     }
 
