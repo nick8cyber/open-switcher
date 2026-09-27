@@ -98,7 +98,9 @@ namespace OpenSwitcher
                 new Case("муд",    true,  false, "живое: 'vel' не словарное — не трогаем", true),
                 new Case("ghbdtn", false, true,  "живое: привет в словаре — перевернём", true),
                 new Case("что",    true,  false, "частое русское: цель 'xnj' не словарная, не трогаем"),
-                new Case("xnj",    false, true,  "цель 'что' словарная, набранное нет — словарь сильнее скоринга")
+                new Case("xnj",    false, true,  "цель 'что' словарная, набранное нет — словарь сильнее скоринга"),
+                new Case("кфп",    true,  true,  "мусор (rag в EN) -> словарное 'rag': короткий гейт пускает"),
+                new Case("еще",    true,  false, "короткое правильное русское — гейт не пускает")
             };
 
             var sb = new StringBuilder();
