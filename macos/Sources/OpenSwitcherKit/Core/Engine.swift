@@ -967,27 +967,8 @@ public final class Engine {
             if !modified && s.fixOnEnter {
                 converted = tryConvertWord(word, resendKey: KeyCodeMap.enter, resendShift: false, manual: false)
             }
-            // одиночная буква по «словности» и на Enter ('f'+Enter -> «а»): иначе 'f'
-            // в начале сообщения уходит в чат неперевёрнутым (v3 §7/§13)
-            if !converted && !modified && !s.paused && word.count == 1,
-               let curL = LayoutService.currentLayout() {
-                let asTyped = LayoutService.render(curL, word)
-                let typedLang = LanguageTables.langOf(asTyped)
-                if asTyped.count == 1, typedLang >= 0,
-                   !WordDict.hasSingleLetterWord(asTyped, typedLang),
-                   let other = LayoutService.findLayoutByLang(1 - typedLang) {
-                    let flipped = LayoutService.render(other, word)
-                    if flipped.count == 1 && WordDict.hasSingleLetterWord(flipped, 1 - typedLang) {
-                        converted = true
-                        logLine("single-letter enter: '\(asTyped)' -> '\(flipped)'")
-                        suppress(0.6)
-                        TextConverter.targetPid = fgApp
-                        TextConverter.sendBackspaces(1)
-                        TextConverter.sendUnicode(flipped)
-                        TextConverter.sendEnter() // Enter досылаем
-                    }
-                }
-            }
+            // одиночные буквы на Enter не конвертируются (как и на пробеле):
+            // у одной буквы нет сигнала намерения
             undoTailBroken = true
             buf.clear()
             return !converted
@@ -1009,52 +990,11 @@ public final class Engine {
                 return false // проглотить (в текст не идёт)
             }
 
-            // одиночная буква по «словности»: 'f' — не английское слово, «а» — русское
-            // (союз) => 'f'->«а». Неприкасаемые (а/и/в/к/о/с/у/я, a/i) не переворачиваются.
-            // Только по пробелу; хвостовой знак-двойник остаётся знаком («z,» -> «я,»).
-            // Уважает кулдаун, лок, rejected и тумблер (v3 §7)
-            if !modified && !s.paused && code == KeyCodeMap.space && s.autoConvertOnWordEnd &&
-                !(s.lockAutoAfterManualSwitch && autoLocked) && now >= noFlipUntil &&
-                (buf.count == 1 || (buf.count == 2 && KeyCodeMap.isPunctTwinKey(buf.snapshot()[1].code))) {
-                let keys1 = buf.snapshot()
-                let tailPunct = keys1.count == 2
-                if let curL = LayoutService.currentLayout() {
-                    let asTyped = LayoutService.render(curL, keys1)
-                    let coreTyped = tailPunct ? String(asTyped.prefix(1)) : asTyped
-                    let tailTxt = tailPunct ? String(asTyped.dropFirst()) : ""
-                    let typedLang = LanguageTables.langOf(coreTyped)
-                    if coreTyped.count == 1, tailTxt.count <= 1, typedLang >= 0,
-                       !rejected.contains(coreTyped),
-                       !WordDict.hasSingleLetterWord(coreTyped, typedLang),
-                       let other = LayoutService.findLayoutByLang(1 - typedLang) {
-                        let one = [keys1[0]]
-                        let flipped = LayoutService.render(other, one)
-                        if flipped.count == 1 && WordDict.hasSingleLetterWord(flipped, 1 - typedLang) {
-                            let result = flipped + tailTxt
-                            converted = true
-                            logLine("single-letter: '\(asTyped)' -> '\(result)'")
-                            suppress(0.6)
-                            TextConverter.targetPid = fgApp
-                            TextConverter.sendBackspaces(keys1.count)
-                            TextConverter.sendUnicode(result)
-                            // точка отката: Break вернёт набранное и разделитель
-                            undoPending = true
-                            undoText = asTyped
-                            undoLen = result.count
-                            undoSepText = TextConverter.renderKeyChar(keyCode: code, shift: shift)
-                            undoLayout = LayoutService.getLayouts().first { $0.id == curL.id }
-                            undoApp = fgApp
-                            undoAt = Engine.ms()
-                            keysSinceUndoPoint = 0
-                            undoTail.removeAll()
-                            undoTailBroken = false
-                            TextConverter.sendUnicode(undoSepText) // досылаем разделитель как набрано
-                            if undoSepText == " " { lastResendSpaceAt = Engine.ms() }
-                            fireConverted(asTyped, result)
-                        }
-                    }
-                }
-            }
+            // ОДИНОЧНЫЕ БУКВЫ НЕ КОНВЕРТИРУЮТСЯ АВТОМАТИЧЕСКИ (порт фикса win b1b11cf):
+            // у одной буквы нет сигнала намерения — wordness-флип то не срабатывал
+            // когда нужен ('f' в начале фразы), то портил латинские токены
+            // ('b2b' -> 'b2и': цифра рвёт слово, вторая 'b' становилась «одиночной»).
+            // Осознанный переворот — Break (force-flip).
 
             if !converted && !modified && s.autoConvertOnWordEnd && buf.count > 0 {
                 let word = buf.snapshot()
