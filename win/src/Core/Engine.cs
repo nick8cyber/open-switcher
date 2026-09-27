@@ -761,34 +761,8 @@ namespace OpenSwitcher.Core
                 }
                 if (!modified && S.FixOnEnter)
                     converted = TryConvertWord(word, 0x0D, false, false);
-                // одиночная буква по «словности» и на Enter ('f'+Enter -> «а»):
-                // без этого 'f' в начале сообщения уходит в чат неперевёрнутым
-                if (!converted && !modified && !S.Paused && word.Count == 1)
-                {
-                    string asTyped = LayoutService.Render(_fgHkl, word);
-                    int typedLang = LanguageTables.LangOf(asTyped);
-                    if (asTyped.Length == 1 && typedLang >= 0 &&
-                        !WordDict.HasSingleLetterWord(asTyped, typedLang))
-                    {
-                        IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
-                        if (otherHkl != IntPtr.Zero)
-                        {
-                            string flipped = LayoutService.Render(otherHkl, word);
-                            if (flipped.Length == 1 && WordDict.HasSingleLetterWord(flipped, 1 - typedLang))
-                            {
-                                converted = true;
-                                TextConverter.ReleaseModifiers();
-                                TextConverter.InjectMode = S.InputMode;
-                                TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-                                Log("single-letter enter: '" + asTyped + "' -> '" + flipped + "'");
-                                Suppress(600);
-                                TextConverter.SendBackspaces(1);
-                                TextConverter.SendUnicode(flipped);
-                                TextConverter.SendKey(0x0D, false, false); // Enter досылаем
-                            }
-                        }
-                    }
-                }
+                // одиночные буквы на Enter не конвертируются (как и на пробеле):
+                // у одной буквы нет сигнала намерения
                 // ВАЖНО: Enter лок НЕ снимает — в длинном тексте энтеры подряд,
                 // а сессия ввода (окно) не сменилась. Лок держится до смены окна.
                 // хвост отката после Enter восстановить нельзя
@@ -819,60 +793,10 @@ namespace OpenSwitcher.Core
                     return false; // проглотить (в текст не идёт)
                 }
 
-                // ОДИНОЧНАЯ БУКВА по «словности»: 'f' — не английское слово, «а» — русское
-                // (союз) => 'f'->«а». «а» — русское слово => не переворачивается никогда.
-                // Только по ПРОБЕЛУ (буква+цифра = идентификатор), с уважением кулдауна,
-                // лока, rejected и тумблера автоисправления
-                if (!modified && !S.Paused && vk == 0x20 && S.AutoConvertOnWordEnd &&
-                    (!S.LockAutoAfterManualSwitch || !_autoLocked) &&
-                    unchecked(Environment.TickCount - _noFlipUntil) >= 0 &&
-                    (_buf.Count == 1 ||
-                    (_buf.Count == 2 && IsPunctTwinVk(_buf.Snapshot()[1].Vk))))
-                {
-                    var keys1 = _buf.Snapshot();
-                    bool tailPunct = keys1.Count == 2;
-                    string asTyped = LayoutService.Render(_fgHkl, keys1);
-                    string coreTyped = tailPunct ? asTyped.Substring(0, 1) : asTyped;
-                    string tailTxt = tailPunct ? asTyped.Substring(1) : "";
-                    int typedLang = LanguageTables.LangOf(coreTyped);
-                    if (coreTyped.Length == 1 && tailTxt.Length <= 1 && typedLang >= 0 &&
-                        !_rejected.Contains(coreTyped) &&
-                        !WordDict.HasSingleLetterWord(coreTyped, typedLang))
-                    {
-                        IntPtr otherHkl = LayoutService.FindLayoutByLang(1 - typedLang);
-                        if (otherHkl != IntPtr.Zero)
-                        {
-                            var one = new List<KeyRec> { keys1[0] };
-                            string flipped = LayoutService.Render(otherHkl, one);
-                            if (flipped.Length == 1 && WordDict.HasSingleLetterWord(flipped, 1 - typedLang))
-                            {
-                                string result = flipped + tailTxt;
-                                converted = true;
-                                TextConverter.ReleaseModifiers();
-                                TextConverter.InjectMode = S.InputMode;
-                                TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-                                Log("single-letter: '" + asTyped + "' -> '" + result + "'");
-                                Suppress(600);
-                                TextConverter.SendBackspaces(keys1.Count);
-                                TextConverter.SendUnicode(result);
-                                // точка отката: Break вернёт набранное и разделитель
-                                _undoPending = true;
-                                _undoText = asTyped;
-                                _undoLen = result.Length;
-                                _undoSepText = RenderKeyChar(vk, _fgHkl, shift);
-                                _undoHkl = _fgHkl;
-                                _undoHwnd = _fgHwnd;
-                                _undoFocus = _fgFocus;
-                                _undoTick = Environment.TickCount;
-                                _keysSinceUndoPoint = 0;
-                                _undoTail.Clear();
-                                _undoTailBroken = false;
-                                TextConverter.SendUnicode(_undoSepText); // досылаем разделитель как набрано
-                                if (_undoSepText == " ") _lastSpaceTextTick = Environment.TickCount;
-                            }
-                        }
-                    }
-                }
+                // ОДИНОЧНЫЕ БУКВЫ НЕ КОНВЕРТИРУЮТСЯ АВТОМАТИЧЕСКИ (v2, после жалоб):
+                // у одной буквы нет сигнала намерения — wordness-флип то не срабатывал
+                // когда нужен ('f' в начале фразы), то портил латинские токены
+                // ('b2b' -> 'b2и'). Осознанный переворот — Break (force-flip).
 
                 if (!converted && !modified && S.AutoConvertOnWordEnd && _buf.Count > 0)
                 {
