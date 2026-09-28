@@ -91,6 +91,10 @@ fi
 # Гейт подписи: идентификатор обязан быть бандл-идентификатором, plist — связан.
 # Иначе (ad-hoc/нет plist при подписи) молча умирают TCC-права.
 SIGNED_ID="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')"
+if [ -z "$SIGNED_ID" ]; then
+    echo "СБОРКА ПРЕРВАНА: бандл НЕ ПОДПИСАН — TCC не выдаст права (проверь keychain: security find-identity -v -p codesigning)"
+    exit 1
+fi
 if [ "$SIGNED_ID" != "com.openswitcher.app" ]; then
     echo "ВНИМАНИЕ: подпись с идентификатором '$SIGNED_ID' вместо com.openswitcher.app — TCC-права не совпадут"
 fi

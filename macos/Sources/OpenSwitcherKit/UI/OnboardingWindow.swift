@@ -56,6 +56,9 @@ public final class OnboardingWindowController: NSWindowController, NSWindowDeleg
         // иначе hosting controller жмёт окно к fitting-минимуму SwiftUI
         // (у ScrollView он схлопывается — окно сжимается, текст обрезается)
         vc.sizingOptions = []
+        // sizingOptions=[] отключает автосообщение размера: окно принимает
+        // preferredContentSize, заданный явно (иначе NSWindow схлопывается до минимума)
+        vc.preferredContentSize = NSSize(width: 560, height: 470)
         contentViewController = vc
     }
 

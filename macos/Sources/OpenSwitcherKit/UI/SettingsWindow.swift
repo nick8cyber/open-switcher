@@ -26,6 +26,8 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
         m.load(engine.s)
         let vc = NSHostingController(rootView: SettingsRoot(engine: engine, model: m))
         vc.sizingOptions = [] // иначе hosting controller жмёт окно к fitting-минимуму
+        // sizingOptions=[] отключает автосообщение размера — задаём явно
+        vc.preferredContentSize = NSSize(width: 880, height: 660)
         self.contentViewController = vc
         vc.view.wantsLayer = true
         engine.uiSettingsActive = true
@@ -35,6 +37,9 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
 
     public func show() {
         window?.makeKeyAndOrderFront(nil)
+        if let f = window?.frame {
+            engine.logLine(String(format: "settings show: %.0fx%.0f", f.width, f.height))
+        }
         NSApp.activate(ignoringOtherApps: true)
         engine.uiSettingsActive = true
     }

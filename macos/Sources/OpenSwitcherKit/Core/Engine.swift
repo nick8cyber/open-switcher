@@ -816,6 +816,13 @@ public final class Engine {
             if autoLocked && (now - lastInputAt) >= sessionPause {
                 autoLocked = false
             }
+            // ручной лок защищает слово, печатавшееся в момент переключения
+            // (буфер и так режется gap-механизмом); новое слово — первое нажатие
+            // буквы в пустой буфер — конвертируется как обычно, иначе после
+            // каждого ручного переключения авто-конвертация молчит до паузы 3 с
+            if autoLocked && KeyCodeMap.isLetterKey(code) && buf.count == 0 {
+                autoLocked = false
+            }
             lastInputAt = now
         }
 
