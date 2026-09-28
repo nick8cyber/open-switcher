@@ -143,6 +143,32 @@ namespace OpenSwitcher
                     convert ? "CONVERT" : "keep", pass ? "" : "!!", curScore, altScore, c.Note));
             }
 
+            // ретро-флип одиночной буквы перед сконвертированным словом ('f␣ns' -> «а ты»):
+            // только «не-слово своего языка» -> «однобуквенное слово языка цели»
+            var retro = new[]
+            {
+                new object[] { "f", 1, "а", 0, true,  "f -> союз а" },
+                new object[] { "F", 1, "А", 0, true,  "заглавная в начале фразы" },
+                new object[] { "b", 1, "и", 0, true,  "b -> союз и" },
+                new object[] { "d", 1, "в", 0, true,  "d -> предлог в" },
+                new object[] { "z", 1, "я", 0, true,  "z -> я" },
+                new object[] { "x", 1, "ч", 0, false, "ч — не слово" },
+                new object[] { "a", 1, "ф", 0, false, "a — английское слово, неприкосновенно" },
+                new object[] { "i", 1, "ш", 0, false, "i — английское слово, неприкосновенно" },
+                new object[] { "ф", 0, "a", 1, true,  "ф -> a" },
+                new object[] { "ш", 0, "i", 1, true,  "ш -> i" },
+                new object[] { "в", 0, "d", 1, false, "в — русское слово, неприкосновенно" },
+                new object[] { ",", 1, "б", 0, false, "знак — не буква" }
+            };
+            foreach (object[] r in retro)
+            {
+                bool got = Engine.RetroFlipLetterOk((string)r[0], (int)r[1], (string)r[2], (int)r[3]);
+                bool pass = got == (bool)r[4];
+                if (!pass) fails++;
+                sb.AppendLine(string.Format("{0}: retro '{1}' -> '{2}' [{3}] {4} ({5})",
+                    pass ? "PASS" : "FAIL", r[0], r[2], got ? "FLIP" : "keep", pass ? "" : "!!", r[5]));
+            }
+
             sb.AppendLine(fails == 0 ? "ALL TESTS PASSED" : fails + " TEST(S) FAILED");
             try
             {

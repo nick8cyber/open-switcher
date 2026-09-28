@@ -112,6 +112,29 @@ public enum SelfTest {
             sb += "\(got ? "PASS" : "FAIL"): [xy] \(name)\(got ? "" : " !!")\n"
         }
 
+        // --- ретро-флип одиночной буквы перед сконвертированным словом ('f␣ns' -> «а ты»),
+        // паритет C# SelfTest: только «не-слово своего языка» -> «однобуквенное слово цели» ---
+        let retro: [(String, Int, String, Int, Bool, String)] = [
+            ("f", 1, "а", 0, true,  "f -> союз а"),
+            ("F", 1, "А", 0, true,  "заглавная в начале фразы"),
+            ("b", 1, "и", 0, true,  "b -> союз и"),
+            ("d", 1, "в", 0, true,  "d -> предлог в"),
+            ("z", 1, "я", 0, true,  "z -> я"),
+            ("x", 1, "ч", 0, false, "ч — не слово"),
+            ("a", 1, "ф", 0, false, "a — английское слово, неприкосновенно"),
+            ("i", 1, "ш", 0, false, "i — английское слово, неприкосновенно"),
+            ("ф", 0, "a", 1, true,  "ф -> a"),
+            ("ш", 0, "i", 1, true,  "ш -> i"),
+            ("в", 0, "d", 1, false, "в — русское слово, неприкосновенно"),
+            (",", 1, "б", 0, false, "знак — не буква"),
+        ]
+        for (typed, tl, target, gl, want, note) in retro {
+            let got = Engine.retroFlipLetterOk(typed, tl, target, gl)
+            let pass = got == want
+            if !pass { fails += 1 }
+            sb += "\(pass ? "PASS" : "FAIL"): retro '\(typed)' -> '\(target)' [\(got ? "FLIP" : "keep")] \(pass ? "" : "!!")(\(note))\n"
+        }
+
         sb += fails == 0 ? "ALL TESTS PASSED\n" : "\(fails) TEST(S) FAILED\n"
         try? sb.write(toFile: outPath, atomically: true, encoding: .utf8)
         print(sb, terminator: "")
