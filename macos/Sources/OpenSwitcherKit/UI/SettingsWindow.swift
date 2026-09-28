@@ -43,7 +43,7 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
     /// performKey(with:) вызывается окном ДО диспетчеризации keyDown first responder'у:
     /// во время захвата хоткея отдаём событие вниз — его съест HotkeyNsView.keyDown
     /// (отмена захвата, как сейчас), в остальных случаях закрываем — dirty-guard
-    /// в windowWillClose сработает сам.
+    /// в windowShouldClose сработает сам.
     public func performKey(with event: NSEvent) -> Bool {
         guard event.keyCode == 53 else { return false } // только Esc
         if let hk = window?.firstResponder as? HotkeyBox.HotkeyNsView, hk.capturing {
@@ -53,9 +53,10 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
         return true
     }
 
-    public func windowWillClose(_ notification: Notification) {
-        // dirty-guard (порт OnFormClosing SettingsForm.cs): несохранённые правки —
-        // спрашиваем; «Отмена» возвращает окно и не даёт закрыться
+    /// dirty-guard (порт OnFormClosing SettingsForm.cs): несохранённые правки —
+    /// спрашиваем; «Отмена» возвращает false и окно не закрывается вовсе
+    /// (windowWillClose так не умеет — окно уже не остановить).
+    public func windowShouldClose(_ sender: NSWindow) -> Bool {
         if uiModel.isDirty {
             let alert = NSAlert()
             alert.messageText = "Закрыть без сохранения?"
@@ -67,18 +68,32 @@ public final class SettingsWindowController: NSWindowController, NSWindowDelegat
             let resp = alert.runModal()
             switch resp {
             case .alertFirstButtonReturn:
-                applySettingsFromModel(engine: engine, model: uiModel)
+                guard applySettingsFromModel(engine: engine, model: uiModel) else {
+                    showSettingsSaveError()
+                    return false
+                }
             case .alertThirdButtonReturn:
-                window?.makeKeyAndOrderFront(nil)
-                return
+                return false
             default:
                 break // «Не сохранять» — закрываем без применения
             }
         }
+        return true
+    }
+
+    public func windowWillClose(_ notification: Notification) {
         engine.uiSettingsActive = false
         engine.sandboxFocused = false
         // окно закрывается — освобождаем ссылку в статус-айтеме через замыкание
         onClose?()
+    }
+
+    private func showSettingsSaveError() {
+        let alert = NSAlert()
+        alert.messageText = "Не удалось сохранить настройки"
+        alert.informativeText = "Проверьте доступ к папке Application Support и попробуйте снова."
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 }
 
@@ -135,11 +150,6 @@ public struct SettingsRoot: View {
         self.engine = engine
         _page = State(initialValue: initialPage)
         _model = ObservedObject(wrappedValue: model)
-    }
-
-    /// Единая точка применения настроек (футер и подтверждение закрытия).
-    func saveSettings() {
-        applySettingsFromModel(engine: engine, model: model)
     }
 
     public var body: some View {
@@ -522,28 +532,33 @@ struct AccentButton: View {
 
     var body: some View {
         let t = theme.t
-        Text(title)
-            .font(.system(size: 12, weight: .semibold))
-            .padding(.horizontal, 18)
-            .padding(.vertical, 8)
-            .background(
-                Group {
-                    if accent {
-                        // градиент Accent->AccentPressed, как RoundedButton в оригинале
-                        LinearGradient(colors: [hover ? t.accentHover : t.buttonAccent, t.accentPressed],
-                                       startPoint: .top, endPoint: .bottom)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    } else {
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(hover ? t.rowHover : t.chipBg)
+        // настоящий Button, а не Text+onTapGesture: клик не теряется, работает
+        // с клавиатуры и не съедается соседними жестами
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.horizontal, 18)
+                .padding(.vertical, 8)
+                .background(
+                    Group {
+                        if accent {
+                            // градиент Accent->AccentPressed, как RoundedButton в оригинале
+                            LinearGradient(colors: [hover ? t.accentHover : t.buttonAccent, t.accentPressed],
+                                           startPoint: .top, endPoint: .bottom)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        } else {
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(hover ? t.rowHover : t.chipBg)
+                        }
                     }
-                }
-            )
-            .overlay(RoundedRectangle(cornerRadius: 10)
-                .stroke(accent ? Color.clear : t.cardBorder))
-            .foregroundColor(accent ? .white : t.text)
-            .onTapGesture { action() }
-            .onHover { hover = $0 }
+                )
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .stroke(accent ? Color.clear : t.cardBorder))
+                .foregroundColor(accent ? .white : t.text)
+                .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
     }
 }
 
@@ -839,7 +854,9 @@ public final class SettingsUiModel: ObservableObject {
 
     public func refreshBaseline() { baseline = snapshotFields() }
 
-    public func load(_ s: Settings) {
+    /// refreshBaseline=false — «Сбросить»: поля показывают дефолты, но считаются
+    /// несохранёнными (isDirty), пока юзер не нажал «Сохранить».
+    public func load(_ s: Settings, refreshBaseline: Bool = true) {
         fixOnEnter = s.fixOnEnter
         autoConvert = s.autoConvertOnWordEnd
         lockAuto = s.lockAutoAfterManualSwitch
@@ -861,7 +878,7 @@ public final class SettingsUiModel: ObservableObject {
         devLog = s.devLog
         startWithSystem = s.startWithSystem
         exclusions = s.exclusions
-        refreshBaseline()
+        if refreshBaseline { self.refreshBaseline() }
     }
 
     public func write(_ s: Settings) {
@@ -892,18 +909,24 @@ public final class SettingsUiModel: ObservableObject {
 }
 
 /// Атомарное применение настроек, как Apply в C#: копия + подмена ссылки —
-/// тап между полями не увидит полуобновлённый хоткей.
-func applySettingsFromModel(engine: Engine, model: SettingsUiModel) {
+/// тап между полями не увидит полуобновлённый хоткей. false — ini не записался.
+@discardableResult
+func applySettingsFromModel(engine: Engine, model: SettingsUiModel) -> Bool {
     let wasEnabled = Autostart.isEnabled()
     let snapshot = Settings()
     snapshot.paused = engine.s.paused // пауза не из UI-модели
+    // ini-only поля нет в UI-модели: иначе каждый Save затирал бы их дефолтами
+    snapshot.minWordLen = engine.s.minWordLen
+    snapshot.spaceDedupMs = engine.s.spaceDedupMs
+    snapshot.defaultsV = engine.s.defaultsV
     model.write(snapshot)
-    SettingsStore.save(snapshot)
+    guard SettingsStore.save(snapshot) else { return false }
     if snapshot.startWithSystem != wasEnabled {
         Autostart.setEnabled(snapshot.startWithSystem)
     }
     engine.apply(snapshot)
     model.refreshBaseline()
+    return true
 }
 
 // ---------------------------------------------------------------- страницы
@@ -1136,6 +1159,8 @@ struct Footer: View {
     let engine: Engine
     @ObservedObject var model: SettingsUiModel
     @ObservedObject private var theme = ThemeEnv.shared
+    @State private var saveMessage: String?
+    @State private var saveSucceeded = false
 
     var body: some View {
         let t = theme.t
@@ -1144,11 +1169,18 @@ struct Footer: View {
                 .font(.system(size: 10))
                 .foregroundColor(t.dim)
             Spacer()
+            if let saveMessage {
+                Text(saveMessage)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(saveSucceeded ? t.ok : t.danger)
+            }
             AccentButton(title: "Сбросить", accent: false) {
-                model.load(Settings())
+                saveMessage = nil
+                model.load(Settings(), refreshBaseline: false)
             }
             AccentButton(title: "Сохранить", accent: true) {
-                applySettingsFromModel(engine: engine, model: model)
+                saveSucceeded = applySettingsFromModel(engine: engine, model: model)
+                saveMessage = saveSucceeded ? "Сохранено" : "Не удалось сохранить"
             }
         }
         .padding(.horizontal, 16)
