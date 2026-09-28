@@ -47,7 +47,6 @@ public final class Engine {
     private var shiftPairClean = false
     private var autoLocked = false
     private var lastInputAt: TimeInterval = 0
-    private let sessionPause: TimeInterval = 3.0
     private var lastResendSpaceAt: TimeInterval = 0
     private var lastSpaceTextTick: TimeInterval = 0 // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл ИЛИ нажатие) — для дедупа двойных (C# 3baec1e)
 
@@ -811,18 +810,11 @@ public final class Engine {
             keysSinceUndoPoint += 1
         }
 
-        // лок живёт только внутри сеанса набора
+        // Лок ручного переключения (решение владельца 2026-09-29): держится, пока
+        // активно то же поле ввода и в нём идёт печать, — паузы в наборе его НЕ
+        // снимают. Ушёл из поля (смена приложения или окна) → resetSession()
+        // снимает лок вместе с остальным сеансом ввода.
         if !KeyCodeMap.isModifier(code) {
-            if autoLocked && (now - lastInputAt) >= sessionPause {
-                autoLocked = false
-            }
-            // ручной лок защищает слово, печатавшееся в момент переключения
-            // (буфер и так режется gap-механизмом); новое слово — первое нажатие
-            // буквы в пустой буфер — конвертируется как обычно, иначе после
-            // каждого ручного переключения авто-конвертация молчит до паузы 3 с
-            if autoLocked && KeyCodeMap.isLetterKey(code) && buf.count == 0 {
-                autoLocked = false
-            }
             lastInputAt = now
         }
 
