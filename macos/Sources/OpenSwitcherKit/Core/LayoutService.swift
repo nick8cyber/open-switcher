@@ -105,27 +105,27 @@ public enum LayoutService {
     /// Текст, который дала бы эта раскладка при тех же нажатиях.
     public static func render(_ data: LayoutData, _ keys: [KeyRec]) -> String {
         var out = ""
-        for rec in keys {
-            var deadState: UInt32 = 0
-            var chars = [UniChar](repeating: 0, count: 8)
-            var count = 0
-            // UCKeyTranslate ждёт EventRecord.modifiers, сдвинутые >>8:
-            // shiftKey (0x0200) -> 0x02, alphaLock (0x0400) -> 0x04
-            var mods: UInt32 = 0
-            if rec.shift { mods |= 1 << 1 }
-            if rec.caps { mods |= 1 << 2 }
-            let kr = UCKeyTranslate(data.layout, UInt16(rec.code),
-                                    UInt16(kUCKeyActionDown),
-                                    mods, UInt32(LMGetKbdType()),
-                                    OptionBits(1 << kUCKeyTranslateNoDeadKeysBit),
-                                    &deadState, 8, &count, &chars)
-            if kr == noErr && count > 0 {
-                out += String(utf16CodeUnits: chars, count: Int(count))
-            } else {
-                out += "?"
-            }
-        }
+        for rec in keys { out += renderKey(data, rec) ?? "?" }
         return out
+    }
+
+    /// Символ одной клавиши; nil — раскладка его не дала. Отдельно от render: там сбой
+    /// заменяется '?', и настоящий знак '?' (Shift+/ в EN) было не отличить от сбоя.
+    public static func renderKey(_ data: LayoutData, _ rec: KeyRec) -> String? {
+        var deadState: UInt32 = 0
+        var chars = [UniChar](repeating: 0, count: 8)
+        var count = 0
+        // UCKeyTranslate ждёт EventRecord.modifiers, сдвинутые >>8:
+        // shiftKey (0x0200) -> 0x02, alphaLock (0x0400) -> 0x04
+        var mods: UInt32 = 0
+        if rec.shift { mods |= 1 << 1 }
+        if rec.caps { mods |= 1 << 2 }
+        let kr = UCKeyTranslate(data.layout, UInt16(rec.code),
+                                UInt16(kUCKeyActionDown),
+                                mods, UInt32(LMGetKbdType()),
+                                OptionBits(1 << kUCKeyTranslateNoDeadKeysBit),
+                                &deadState, 8, &count, &chars)
+        return kr == noErr && count > 0 ? String(utf16CodeUnits: chars, count: Int(count)) : nil
     }
 
     public static func layoutName(_ text: String) -> String {

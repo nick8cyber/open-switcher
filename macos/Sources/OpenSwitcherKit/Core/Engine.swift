@@ -18,6 +18,7 @@ public final class Engine {
     private var lastWord: [KeyRec] = []
     private var lastWordAt: TimeInterval = 0
     private var lastWordSepKey = 0        // разделитель сразу после последнего слова (0 = неизвестен/Enter)
+    private var lastWordSepShift = false  // ... набран с Shift ('?', '!', RU ',')
     private var lastWordApp: pid_t = 0    // приложение, где набрано последнее слово (0 = неизвестно)
     // ретро-флип одиночной буквы (§7, порт C#): 'f␣ns' -> «а ты». Одиночная буква + ровно один
     // пробел прямо перед текущим словом; слово конвертируется из ТОЙ ЖЕ раскладки — буква с ним
@@ -76,6 +77,7 @@ public final class Engine {
     // компенсация лага смены раскладки после тапа Shift
     private var gapActive = false
     private var gapLayout: LayoutService.LayoutData?
+    private var gapGen = 0               // поколение gap-окна: таймер досыла от прошлого тапа не трогает новое
     private var gapBuf: [KeyRec] = []
     private var gapDeadline: TimeInterval = 0
 
@@ -802,6 +804,10 @@ public final class Engine {
             lastResendSpaceAt = 0
         } else {
             lastResendSpaceAt = 0
+            // не пробел (F8-метка текст не трогает) — перед кареткой больше не наш пробел: дедуп
+            // глотает только пробел СРАЗУ после пробела ('слово, дальше' — пробел после запятой
+            // законный; раньше условие «пустой буфер» его ело), порт C# _spaceAtCaretTick
+            if code != 0x64 { lastSpaceTextTick = 0 }
         }
 
         // ---- guard отката: любые реальные нажатия, кроме исключений
@@ -843,6 +849,7 @@ public final class Engine {
                     if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
                     else { undoTailBroken = true }
                 }
+                if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) { lastSpaceTextTick = now } // пробел ушёл в текст
                 // в suppress слово не конвертируется — кандидата ретро-флипа не армим
                 prevSingle = nil
                 boundaryClean = code == KeyCodeMap.space && !shift && !(m.ctrl || m.alt || m.cmd)
@@ -884,7 +891,7 @@ public final class Engine {
             if undoApp == fgApp && age >= 0 && age < 15 {
                 undoPending = false
                 logLine("backspace-cancel: \(undoText)")
-                let bs2 = undoPrefixLen + undoLen + undoSepText.count + undoTail.count
+                let bs2 = undoPrefixLen + undoLen + undoTail.count // undoLen уже с досланным знаком
                 let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
                 let restore2 = undoPrefix + undoText + undoSepText + tailText
                 suppress(0.6)
@@ -892,6 +899,7 @@ public final class Engine {
                 TextConverter.sendUnicode(restore2)
                 prevSingle = nil
                 boundaryClean = undoSepText == " "
+                if restore2.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() }
                 if let ul = undoLayout {
                     switchLayoutOnMain(ul)
                     verifySwitch(target: ul)
@@ -1059,8 +1067,10 @@ public final class Engine {
             // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
             // при пустом буфере в пределах окна глотается — защита от рефлекса
             // двойного нажатия после конвертаций (порт C# Engine.cs:802-811)
-            if code == KeyCodeMap.space && !modified && !s.paused && s.spaceDedupMs > 0 &&
-                buf.count == 0 && lastSpaceTextTick != 0 && (now - lastSpaceTextTick) < Double(s.spaceDedupMs) {
+            // (now — в СЕКУНДАХ, окно — в мс: раньше сравнение без /1000 давало окно в 2000 с,
+            // и пробел после запятой/цифры съедался почти всегда). Shift+пробел — тоже пробел
+            if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) && !s.paused && s.spaceDedupMs > 0 &&
+                buf.count == 0 && lastSpaceTextTick != 0 && (now - lastSpaceTextTick) < Double(s.spaceDedupMs) / 1000.0 {
                 logLine("space: dedup swallowed")
                 return false // проглотить (в текст не идёт)
             }
@@ -1073,17 +1083,21 @@ public final class Engine {
             // Исключение — ретро-флип: буква переворачивается ВМЕСТЕ со следующим
             // сконвертированным словом ('f␣ns' -> «а ты»), см. tryConvertWord.
 
-            if !converted && !modified && s.autoConvertOnWordEnd && buf.count > 0 {
+            // Ctrl/Alt/Cmd — шорткат, не вмешиваемся; Shift — НЕ шорткат: '?', '!', '"', RU ','
+            // — текст и конец слова (порт C#, бой 29.09 19:24:37: слово+'?' не конвертилось)
+            let cmdMods = m.ctrl || m.alt || m.cmd
+            if !converted && !cmdMods && s.autoConvertOnWordEnd && buf.count > 0 {
                 let word = buf.snapshot()
                 converted = tryConvertWord(word, resendKey: code, resendShift: shift, manual: false)
             }
-            if buf.count > 0 && !modified {
+            if buf.count > 0 && !cmdMods {
                 lastWord = buf.snapshot()
                 lastWordAt = now
                 lastWordApp = fgApp
                 lastWordSepKey = code // разделитель сразу после слова — нужен точному перевороту
+                lastWordSepShift = shift // '?' = Shift+/ — перепечатать тем же знаком
             } else {
-                // второй разделитель подряд ('слово.␣', 'слово␣␣') или шифтованный знак —
+                // второй разделитель подряд ('слово.␣', 'слово␣␣') или сочетание-команда —
                 // после слова уже не ровно один известный символ (порт C#)
                 lastWordSepKey = 0
             }
@@ -1094,8 +1108,9 @@ public final class Engine {
                 else { undoTailBroken = true }
             }
             // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь (v3 §15)
+            // пробел ушёл в текст (досыл замены ставит тик сам) — следующий пробел подряд дедуп проглотит
+            if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) && !converted { lastSpaceTextTick = now }
             if code == KeyCodeMap.space && !modified {
-                if !converted { lastSpaceTextTick = now } // считаем только юзерские пробелы: пересланные/конвертные — нет (C#:891)
                 logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
             }
             // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
@@ -1144,6 +1159,7 @@ public final class Engine {
         optTapVk = 0          // Option+клик — реальное сочетание, не тап
         shiftPairClean = false // клик между Shift-down ломает «одновременность»
         prevSingle = nil      // каретка переехала: 'f␣' уже не перед словом
+        lastSpaceTextTick = 0 // и что перед ней — неизвестно (дедуп пробела снят)
         boundaryClean = true  // клик в поле — как начало ввода
         keysSinceUndoPoint += 1
         if undoPending { undoTailBroken = true }
@@ -1154,7 +1170,31 @@ public final class Engine {
         let str = LayoutService.render(gl, gapBuf)
         TextConverter.sendUnicode(str)
         logLine("gap: flushed \(gapBuf.count) keys as '\(str)'")
+        // досланные буквы — часть текущего слова и хвоста отката (порт C#): без этого
+        // следующая конвертация/откат стирали на столько символов меньше
+        for rec in gapBuf {
+            if buf.count == 0 { wordStartClean = boundaryClean }
+            buf.push(rec)
+            if undoPending && !undoTailBroken {
+                if undoTail.count < 16 { undoTail.append(rec) } else { undoTailBroken = true }
+            }
+        }
+        lastSpaceTextTick = 0
         gapBuf.removeAll()
+    }
+
+    /// Досыл gap-буфера по дедлайну, не дожидаясь следующей клавиши (порт C# ArmGapFlushTimer):
+    /// проглоченная в просвете буква иначе висела невидимой до следующего нажатия.
+    private func armGapFlushTimer() {
+        gapGen += 1
+        let gen = gapGen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) { [weak self] in
+            self?.performOnTapThread { [weak self] in
+                guard let self = self, gen == self.gapGen, self.gapActive else { return } // новый тап / окно сменилось
+                self.flushGap()
+                self.gapActive = false
+            }
+        }
     }
 
     // ------------------------------------------------------------------ действия
@@ -1191,6 +1231,7 @@ public final class Engine {
         if s.lockAutoAfterManualSwitch { autoLocked = true }
         gapActive = true; gapLayout = target; gapBuf.removeAll()
         gapDeadline = Engine.ms() + 0.8
+        armGapFlushTimer()
         fireInfo(lang == 0 ? "РУС" : "ENG")
     }
 
@@ -1212,6 +1253,7 @@ public final class Engine {
         if s.lockAutoAfterManualSwitch { autoLocked = true }
         gapActive = true; gapLayout = other; gapBuf.removeAll()
         gapDeadline = Engine.ms() + 0.8
+        armGapFlushTimer()
         fireInfo("Раскладка: \(name)")
     }
 
@@ -1367,13 +1409,17 @@ public final class Engine {
         suppress(0.6)
         TextConverter.sendBackspaces(word.count + retroPrefix.count)
         TextConverter.sendUnicode(retroText + bestText)
-        // разделитель рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
-        // читает живую currentLayout); та же строка идёт в точку отката
+        // набранный знак рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
+        // читает живую currentLayout) и идёт в точку отката; ДОСЫЛАЕМ его символом
+        // раскладки цели (порт C#): слово набрано не в той раскладке — и знак пальцы жали
+        // под целевую ('проверь' в EN + Shift+7 = '&', хотел '?'; '/' -> '.'; '@' <-> '"')
         let sepText = (resendKey != 0 && resendKey != KeyCodeMap.enter)
             ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : ""
+        let sentSep = Engine.sepInLayout(resendKey, resendShift, layouts.first(where: { $0.id == best.layoutID }), sepText)
+        if sentSep != sepText { logLine("convert sep: '\(sepText)' -> '\(sentSep)'") }
         if resendKey != 0 {
             if resendKey == KeyCodeMap.enter { TextConverter.sendEnter() }
-            else { TextConverter.sendUnicode(sepText) }
+            else { TextConverter.sendUnicode(sentSep) }
         }
         if resendKey == KeyCodeMap.space {
             lastResendSpaceAt = Engine.ms()
@@ -1392,7 +1438,9 @@ public final class Engine {
         if !injOk { logLine("convert warn: accessibility off — undo/learning not armed") }
         undoPending = resendKey != KeyCodeMap.enter && injOk
         undoText = cur.text
-        undoLen = bestText.count
+        // undoLen — ВСЁ, что напечатали вместо исходного: цель + досланный знак (он может
+        // отличаться от набранного: '?' вместо '&'); стирание отката считается только по нему
+        undoLen = bestText.count + sentSep.count
         // откат ретро-флипа возвращает и букву: переворот 'f' держался только на слове
         undoPrefix = retroPrefix
         undoPrefixLen = retroText.count
@@ -1416,6 +1464,14 @@ public final class Engine {
         // попап показывает цель с хвостом-знаком (и ретро-буквой)
         fireConverted(retroPrefix + cur.text, retroText + bestText)
         return true
+    }
+
+    /// Знак-разделитель в раскладке цели (порт C# SepInLayout): тот же физический знак, каким
+    /// его задумали пальцы. Сбой/не один символ — оставить набранный typed.
+    static func sepInLayout(_ code: Int, _ shift: Bool, _ layout: LayoutService.LayoutData?, _ typed: String) -> String {
+        guard !typed.isEmpty, let l = layout, let t = LayoutService.renderKey(l, KeyRec(code, shift, false)),
+              t.count == 1 else { return typed }
+        return t
     }
 
     /// Ретро-флип одиночной буквы (§7, порт C# RetroFlipLetterOk): переворачивается, только
@@ -1469,13 +1525,14 @@ public final class Engine {
         }
 
         // префикс — буква ретро-флипа ('а␣' -> 'f␣'): её переворот держался только на слове
-        let bs = undoPrefixLen + undoLen + undoSepText.count + undoTail.count
+        let bs = undoPrefixLen + undoLen + undoTail.count // undoLen уже с досланным знаком (раньше force-flip считал его дважды и съедал символ перед словом)
         let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
         let restore = undoPrefix + undoText + undoSepText + tailText
         suppress(0.6)
         TextConverter.sendBackspaces(bs)
         TextConverter.sendUnicode(restore)
         prevSingle = nil
+        if restore.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() } // 'слово␣' — перед кареткой пробел
         if let ul = undoLayout {
             switchLayoutOnMain(ul)
             verifySwitch(target: ul)
@@ -1532,7 +1589,7 @@ public final class Engine {
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
             lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
             logLine("force-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
-            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, skipRejected: true)
+            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true)
             return true
         }
         // честный отказ — паритет коду C# v3
@@ -1543,7 +1600,7 @@ public final class Engine {
     /// Принудительный переворот слова. skipRejected — не блокировать переворот
     /// выученно-отменённых слов (Option-пинг-понг: юзер гоняет слово туда-сюда
     /// руками); skipLearn — не писать в самообучение (чистый ручной инструмент).
-    private func forceConvertWord(_ word: [KeyRec], trailSepKey: Int,
+    private func forceConvertWord(_ word: [KeyRec], trailSepKey: Int, trailSepShift: Bool = false,
                                   skipRejected: Bool = false, skipLearn: Bool = false) -> Bool {
         updateForeground()
         if isExcludedHere() { logLine("force-flip skip: excluded app"); return false }
@@ -1577,11 +1634,16 @@ public final class Engine {
         // хвост-разделитель после слова уже в тексте приложения — стираем вместе
         // со словом и перепечатываем (иначе переворот съедает пробел/запятую) (v3 §9)
         let trailLen = trailSepKey != 0 ? 1 : 0
+        // знак после слова — в раскладке цели, как при авто-замене ('ghbdtn/' -> 'привет.');
+        // откат вернёт набранный (undoSepText ниже)
+        let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
+        let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
         TextConverter.sendBackspaces(word.count + trailLen)
         TextConverter.sendUnicode(best.text)
-        if trailSepKey != 0 {
-            TextConverter.sendUnicode(TextConverter.renderKeyChar(keyCode: trailSepKey, shift: false))
+        if !trailSent.isEmpty {
+            TextConverter.sendUnicode(trailSent)
         }
+        if trailSepKey == KeyCodeMap.space { lastSpaceTextTick = Engine.ms() } // перепечатанный пробел — перед кареткой
         // раскладку переключаем только при перевороте СЛОВА: одиночная буква
         // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
         if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
@@ -1595,10 +1657,10 @@ public final class Engine {
         // точка отката включает хвост-разделитель (порт C# 8e8af36): Break после
         // force-флипа 'ии␣' вернёт 'ии␣' целиком — раньше пробел съедался и
         // 'bb ␣ жрет' склеивалось в 'bиижрет'
-        undoLen = best.text.count + trailLen
+        undoLen = best.text.count + trailSent.count // всё напечатанное: слово + перепечатанный знак
         undoPrefix = ""; undoPrefixLen = 0 // force-flip ретро-букву не трогает
         prevSingle = nil
-        undoSepText = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: false) : ""
+        undoSepText = trailTyped // вернуть знак как набран
         undoLayout = layouts.first { $0.id == cur.layoutID }
         undoApp = fgApp
         undoAt = Engine.ms()
@@ -1635,7 +1697,7 @@ public final class Engine {
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
             lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
             logLine("caramba-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
-            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, skipRejected: true, skipLearn: true)
+            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true, skipLearn: true)
             return
         }
         // свежего слова нет (нет выделения юзера, слово >10 с или в другом

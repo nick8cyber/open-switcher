@@ -91,9 +91,10 @@ public enum TextConverter {
 
     /// Символ, который печатает клавиша в текущей раскладке (для досылки разделителей).
     public static func renderKeyChar(keyCode: Int, shift: Bool) -> String {
-        guard let data = LayoutService.currentLayout() else { return "" }
-        let s = LayoutService.render(data, [KeyRec(keyCode, shift, false)])
-        return s.isEmpty || s == "?" ? "" : s
+        // renderKey, а не render: у render сбой = '?', и настоящий '?' (Shift+/) тут терялся
+        guard let data = LayoutService.currentLayout(),
+              let s = LayoutService.renderKey(data, KeyRec(keyCode, shift, false)) else { return "" }
+        return s
     }
 
     // ---------------------------------------------------------------- буфер обмена

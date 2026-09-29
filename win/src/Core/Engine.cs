@@ -26,7 +26,19 @@ namespace OpenSwitcher.Core
         private List<KeyRec> _lastWord = new List<KeyRec>();
         private int _lastWordAt;             // тикант снимка последнего слова
         private int _lastWordSepVk;          // разделитель сразу после последнего слова (0 = неизвестен/Enter)
-        private int _lastSpacePassTick;      // когда последний пробел ушёл в текст (для дедупа двойных)
+        private bool _lastWordSepShift;      // ... набран с Shift ('?', '!', RU ',')
+        // когда пробел оказался в тексте ПРЯМО ПЕРЕД кареткой (досыл замены или нажатие); 0 — перед
+        // кареткой не наш пробел (после него была буква/знак/забой/Enter/клик...). Дедуп глотает
+        // пробел только сразу после пробела — 'слово, дальше' пробел после запятой не теряет
+        private int _spaceAtCaretTick;
+
+        // Глотание клавиши в LL-хуке — ТОЛЬКО ненулевым возвратом. return IntPtr.Zero (без
+        // CallNextHookEx) клавишу НЕ блокирует: она доходит до приложения ПОСЛЕ всего, что движок
+        // успел инжектировать внутри колбэка (проверено экспериментом 29.09: F24 с return 0 дошла,
+        // с return 1 — нет; инжекция из колбэка применяется раньше исходной клавиши). Так
+        // «проглоченный» пробел конвертации приходил вслед за досланным — 'привет␣␣' после каждой
+        // замены; дедуп, Backspace-отмена, gap-буфер и хоткеи тоже «глотали» мимо
+        private static readonly IntPtr SwallowKey = (IntPtr)1;
         private IntPtr _lastWordHwnd;        // окно, где набрано последнее слово (0 = неизвестно)
 
         // ретро-флип одиночной буквы (§7): 'f␣ns' -> «а ты». Одиночная буква + ровно один пробел
@@ -49,7 +61,6 @@ namespace OpenSwitcher.Core
         private bool _autoLocked;            // юзер сам выбрал раскладку — автодетект молчит до конца текущего сеанса набора
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
-        private int _lastSpaceTextTick;      // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл или нажатие) — для дедупа двойных
         private int _wdTicks;                // счётчик тиков watchdog'а (heartbeat раз в 10 тиков)
         private int _noFlipUntil;            // кулдаун после ручной правки: юзер чинит текст сам — не мешаем
         private int _markCount;              // счётчик пользовательских меток в журнале (Ctrl+F12)
@@ -80,6 +91,7 @@ namespace OpenSwitcher.Core
         // компенсация лага смены раскладки после тапа Shift
         private bool _gapActive;
         private IntPtr _gapHkl;              // целевая раскладка
+        private int _gapGen;                 // поколение gap-окна: таймер досыла от прошлого тапа не трогает новое
         private readonly List<KeyRec> _gapBuf = new List<KeyRec>();
         private int _gapDeadline;
         private System.Windows.Forms.Timer _hookWatchdog; // переустановка LL-хуков: Windows молча снимает их при таймаутах колбэка.
@@ -275,7 +287,7 @@ namespace OpenSwitcher.Core
                 if (TestInjectMode)
                     Log("window-switch: " + _fgHwnd.ToInt64().ToString("X") + " (was " + prevHwnd.ToInt64().ToString("X") + ")");
                 _autoLocked = false;
-                _lastSpaceTextTick = 0; // окно дедупа пробела не переносится в другое окно
+                _spaceAtCaretTick = 0; // окно дедупа пробела не переносится в другое окно
                 _undoPending = false;
                 _undoTailBroken = true;
                 _buf.Clear();
@@ -400,7 +412,7 @@ namespace OpenSwitcher.Core
                     if (!S.DevLog)
                     {
                         FireInfo("Журнал отключён — включите «Режим разработчика»");
-                        return IntPtr.Zero;
+                        return Native.CallNextHookEx(_kbHook, code, wParam, lParam); // F8 — дальше в приложение
                     }
                     Log("mark: proc=" + (_fgProc ?? "?") +
                         " hwnd=" + _fgHwnd.ToInt64().ToString("X") +
@@ -421,23 +433,26 @@ namespace OpenSwitcher.Core
                     FireInfo("Метка #" + _markCount + " записана в лог");
                 }
 
-                // дедуп двойных пробелов: ЛЮБОЙ пробел, прилетающий в пределах
-                // SpaceDedupMs после предыдущего пробела в тексте (досланного или
-                // нажатого), глотается — рефлекс двойного нажатия после конвертаций.
-                // Инжектированный досланный пробел сюда не попадает (treatAsReal=false),
-                // но сам досыл обновляет тик (см. исполнение замены)
-                if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
-                    (k.vkCode & 0xFF) == 0x20 && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
-                    _lastSpaceTextTick != 0 &&
-                    unchecked(Environment.TickCount - _lastSpaceTextTick) < S.SpaceDedupMs)
+                // дедуп двойных пробелов (SpaceDedupMs): пробел СРАЗУ ПОСЛЕ пробела (досланного
+                // заменой или нажатого, между ними — ничего) в пределах окна глотается.
+                // Любая другая клавиша снимает окно: пробел после запятой/цифры/буквы — законный
+                // (раньше условие «пустой буфер» ело бы пробел в 'слово, дальше' — не ело только
+                // потому, что глотание не работало вовсе). Инжекция движка сюда не попадает
+                // (treatAsReal=false) — тик ставят сами места, где пробел уходит в текст
+                if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode))
                 {
-                    Log("space: dedup swallowed");
-                    return IntPtr.Zero;
+                    int dv = (int)(k.vkCode & 0xFF);
+                    if (dv == 0x20 && !HeldCmdMods(k) && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
+                        _spaceAtCaretTick != 0 &&
+                        unchecked(Environment.TickCount - _spaceAtCaretTick) < S.SpaceDedupMs)
+                    {
+                        Log("space: dedup swallowed");
+                        return SwallowKey;
+                    }
+                    // не пробел (F8-метка текст не трогает) — перед кареткой больше не наш пробел;
+                    // хоткей отката/переворота, вернув 'слово␣', поставит тик сам
+                    if (dv != 0x20 && dv != 0x77) _spaceAtCaretTick = 0;
                 }
-                // ВАЖНО: печать букв окно дедупа НЕ сбрасывает — рефлекс двойного
-                // пробела срабатывает и после начала следующего слова; защита от
-                // ложного глотания — условие bufWas==0 (легитимный пробел после
-                // слова имеет буквы в буфере)
 
                 // guard отката: считаем ЛЮБЫЕ реальные нажатия — даже в suppress-окне
                 // после автозамены (иначе Break после быстрой печати портит текст).
@@ -468,11 +483,11 @@ namespace OpenSwitcher.Core
                 {
                     if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                     {
-                        if (treatAsReal && !OnKeyDown(k)) return IntPtr.Zero; // проглотить
+                        if (treatAsReal && !OnKeyDown(k)) return SwallowKey; // проглотить (см. SwallowKey)
                     }
                     else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
                     {
-                        if (treatAsReal && !OnKeyUp(k)) return IntPtr.Zero; // проглотить (Caps Lock и т.п.)
+                        if (treatAsReal && !OnKeyUp(k)) return SwallowKey; // проглотить (Caps Lock и т.п.)
                     }
                 }
                 else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
@@ -514,6 +529,7 @@ namespace OpenSwitcher.Core
                         if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(sv, sh, cp));
                         else _undoTailBroken = true;
                     }
+                    if (sv == 0x20 && !HeldCmdMods(k)) _spaceAtCaretTick = Environment.TickCount; // пробел ушёл в текст
                     // в suppress слово не конвертируется — кандидата ретро-флипа не армим
                     _prevSingle = null;
                     _boundaryClean = sv == 0x20 && !sh && !HeldCmdMods(k);
@@ -564,7 +580,38 @@ namespace OpenSwitcher.Core
             string s = LayoutService.Render(_gapHkl, _gapBuf);
             TextConverter.SendUnicode(s);
             Log("gap: flushed " + _gapBuf.Count + " keys as '" + s + "'");
+            // досланные буквы — часть текущего слова и хвоста отката: без этого следующая
+            // конвертация/откат стирали на столько символов меньше
+            foreach (KeyRec rec in _gapBuf)
+            {
+                if (_buf.Count == 0) _wordStartClean = _boundaryClean;
+                _buf.Push(rec);
+                if (_undoPending && !_undoTailBroken)
+                {
+                    if (_undoTail.Count < 16) _undoTail.Add(rec);
+                    else _undoTailBroken = true;
+                }
+            }
+            _spaceAtCaretTick = 0;
             _gapBuf.Clear();
+        }
+
+        /// <summary>Досыл gap-буфера по дедлайну, не дожидаясь следующей клавиши: буквы
+        /// в просвете теперь реально глотаются (SwallowKey) — без таймера последняя из них
+        /// висела бы невидимой до следующего нажатия.</summary>
+        private void ArmGapFlushTimer()
+        {
+            int gen = ++_gapGen;
+            var t = new System.Windows.Forms.Timer { Interval = 850 };
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                if (gen != _gapGen || !_gapActive) return; // новый тап / окно сменилось / уже досланы
+                FlushGap();
+                _gapActive = false;
+            };
+            t.Start();
         }
 
         /// <summary>Модификатор ли это (не считаем модификаторы «набором после слова»).</summary>
@@ -704,7 +751,7 @@ namespace OpenSwitcher.Core
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             Log("backspace-cancel: " + _undoText);
             _noFlipUntil = Environment.TickCount + 5000; // юзер правит сам — движок молчит
-            int bs2 = _undoPrefixLen + _undoLen + _undoSepText.Length + _undoTail.Count;
+            int bs2 = _undoPrefixLen + _undoLen + _undoTail.Count; // _undoLen уже с досланным знаком
                     string restore2 = _undoPrefix + _undoText + _undoSepText +
                                       (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
                     Suppress(600);
@@ -712,6 +759,7 @@ namespace OpenSwitcher.Core
                     TextConverter.SendUnicode(restore2);
                     _prevSingle = null;
                     _boundaryClean = _undoSepText == " ";
+                    if (restore2.EndsWith(" ")) _spaceAtCaretTick = Environment.TickCount;
                     LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
                     ExpectLayout(_undoHkl);
                     if (S.LockAutoAfterManualSwitch) _autoLocked = true;
@@ -903,20 +951,13 @@ namespace OpenSwitcher.Core
             // б/ю/ж/э/х/ъ/ё-клавиши — буквы (IsLetterVk), слово они не заканчивают
             if (IsSeparatorVk(vk))
             {
-                // при зажатых модификаторах (шорткаты) не вмешиваемся
-                bool modified = ctrl || alt || win || shift;
+                // при зажатых Ctrl/Alt/Win (шорткаты) не вмешиваемся. Shift — НЕ шорткат:
+                // '?', '!', '"', ',' (RU Shift+/) — текст и конец слова (бой 29.09 19:24:37 —
+                // слово+'?' не конвертилось вовсе, без строки в логе, и Break его не видел)
+                bool cmdMods = ctrl || alt || win;
+                bool modified = cmdMods || shift;
                 bool converted = false;
-
-                // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
-                // при пустом буфере в пределах окна глотается — защита от рефлекса
-                // двойного нажатия после конвертаций. Не глотаем при буквах в буфере
-                if (vk == 0x20 && !modified && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
-                    _lastSpacePassTick != 0 &&
-                    unchecked(Environment.TickCount - _lastSpacePassTick) < S.SpaceDedupMs)
-                {
-                    Log("space: dedup swallowed");
-                    return false; // проглотить (в текст не идёт)
-                }
+                // дедуп двойных пробелов — в KeyboardProc (до suppress): пробел сразу после пробела
 
                 // ОДИНОЧНЫЕ БУКВЫ НЕ КОНВЕРТИРУЮТСЯ АВТОМАТИЧЕСКИ (v2, после жалоб):
                 // у одной буквы нет сигнала намерения — wordness-флип то не срабатывал
@@ -925,22 +966,23 @@ namespace OpenSwitcher.Core
                 // Исключение — ретро-флип: буква переворачивается ВМЕСТЕ со следующим
                 // сконвертированным словом ('f␣ns' -> «а ты»), см. TryConvertWord.
 
-                if (!converted && !modified && S.AutoConvertOnWordEnd && _buf.Count > 0)
+                if (!converted && !cmdMods && S.AutoConvertOnWordEnd && _buf.Count > 0)
                 {
                     List<KeyRec> word = _buf.Snapshot();
                     // разделитель проглатывается и досылается ПОСЛЕ замены — иначе он
                     // доходит до приложения раньше backspace'ов и ломает слово
                     converted = TryConvertWord(word, vk, shift, false);
                 }
-                if (_buf.Count > 0 && !modified)
+                if (_buf.Count > 0 && !cmdMods)
                 {
                     _lastWord = _buf.Snapshot();
                     _lastWordAt = Environment.TickCount;
                     _lastWordHwnd = _fgHwnd; _lastWordSepVk = vk;       // разделитель сразу после слова — нужен точному перевороту
+                    _lastWordSepShift = shift;                         // '?' = Shift+/ — перепечатать тем же знаком
                 }
                 else
                 {
-                    // второй разделитель подряд ('слово.␣', 'слово␣␣') или шифтованный знак —
+                    // второй разделитель подряд ('слово.␣', 'слово␣␣') или сочетание-команда —
                     // после слова уже не ровно один известный символ: точный путь стёр бы
                     // 'слово+1' и зацепил чужую букву
                     _lastWordSepVk = 0;
@@ -956,13 +998,14 @@ namespace OpenSwitcher.Core
                     if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
                     else _undoTailBroken = true;
                 }
+                // пробел ушёл в текст (сам или досылом замены) — перед кареткой пробел: следующий
+                // пробел подряд дедуп проглотит. Ctrl/Alt/Win+пробел текста не вставляет
+                if (vk == 0x20 && !(ctrl || alt || win) && !converted) _spaceAtCaretTick = Environment.TickCount;
                 // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь
                 if (vk == 0x20 && !modified)
                 {
-                    if (!converted) _lastSpacePassTick = Environment.TickCount;
                     Log("space: " + (converted ? "flip+resend" : "pass") +
-                        " bufWas=" + _buf.Count +
-                        " echoInWindow=" + (unchecked(Environment.TickCount - _lastSpaceTextTick) < S.SpaceDedupMs ? "y" : "n"));
+                        " bufWas=" + _buf.Count);
                 }
                 // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
                 // для СЛЕДУЮЩЕГО слова ('f␣' ждёт 'ns'). 'b2b␣' — нет: 'b' начата после цифры
@@ -1005,6 +1048,7 @@ namespace OpenSwitcher.Core
                 _buf.Clear();
                 _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
                 _prevSingle = null;       // каретка переехала: 'f␣' уже не перед словом
+                _spaceAtCaretTick = 0;    // и что перед ней — неизвестно (дедуп пробела снят)
                 _boundaryClean = true;    // клик в поле — как начало ввода
                 _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
                 if (_undoPending) _undoTailBroken = true; // клик ломает откат (контракт)
@@ -1018,7 +1062,7 @@ namespace OpenSwitcher.Core
             if (TestInjectMode)
                 Log("fg-event: hwnd=" + hwnd.ToInt64().ToString("X") + " (was " + _fgHwnd.ToInt64().ToString("X") + ")");
             if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
-            _lastSpaceTextTick = 0; // окно дедупа не переносится в другое окно
+            _spaceAtCaretTick = 0; // окно дедупа не переносится в другое окно
             _buf.Clear();
             _prevSingle = null; _boundaryClean = true; // новое окно — начало ввода
             _anyKeySinceShift = true;
@@ -1090,6 +1134,7 @@ namespace OpenSwitcher.Core
             // компенсация лага: буквы в просвете доставим в целевой раскладке
             _gapActive = true; _gapHkl = target; _gapBuf.Clear();
             _gapDeadline = Environment.TickCount + 800;
+            ArmGapFlushTimer();
             FireInfo(lang == 0 ? "РУС" : "ENG");
             VerifySwitch(_fgHwnd, target);
         }
@@ -1188,6 +1233,15 @@ namespace OpenSwitcher.Core
             uint sc = Native.MapVirtualKeyEx((uint)vk, Native.MAPVK_VK_TO_VSC, hkl);
             int n = Native.ToUnicodeEx((uint)vk, sc, ks, sb, sb.Capacity, 0, hkl);
             return n > 0 ? sb.ToString(0, n) : "";
+        }
+
+        /// <summary>Знак-разделитель в раскладке hkl (цели): тот же физический знак, каким его
+        /// задумали пальцы. Пусто/мёртвая клавиша/не один символ — оставить набранный typed.</summary>
+        private static string SepInLayout(int vk, bool shift, IntPtr hkl, string typed)
+        {
+            if (string.IsNullOrEmpty(typed)) return "";
+            string t = RenderKeyChar(vk, hkl, shift);
+            return t.Length == 1 ? t : typed;
         }
 
         /// <summary>Попытка конвертации слова; manual=true — вызов явным хоткеем (игнорирует лок).
@@ -1412,8 +1466,16 @@ namespace OpenSwitcher.Core
             _prevSingle = null;
             string retroText = retroFrom != null ? retroTo + " " : "";
 
+            // разделитель досылаем СИМВОЛОМ РАСКЛАДКИ ЦЕЛИ: слово набрано не в той раскладке —
+            // значит, и знак после него пальцы жали под целевую ('проверь' в EN + Shift+7 = '&',
+            // а хотел '?'; '/' -> '.'; Shift+2 '@' <-> '"'; Shift+/ '?' <-> ','). Откат вернёт знак
+            // как набран (_undoSepText — в старой раскладке)
+            string typedSep = (resendVk != 0 && resendVk != 0x0D) ? RenderKeyChar(resendVk, _fgHkl, resendShift) : "";
+            string sentSep = SepInLayout(resendVk, resendShift, best.Hkl, typedSep);
+
             Log("convert OK: '" + cur.Text + "' -> '" + best.Text + "'" +
                 (retroFrom != null ? " (+retro '" + retroFrom + "' -> '" + retroTo + "')" : "") +
+                (sentSep != typedSep ? " (sep '" + typedSep + "' -> '" + sentSep + "')" : "") +
                 " (resend=" + resendVk +
                 ", mode=" + (TextConverter.InjectMode == 1 ? "msg" : "sendinput") + ")");
             _lastConvertInfo = "'" + (retroFrom != null ? retroFrom + " " : "") + cur.Text + "' -> '" + retroText + best.Text + "'";
@@ -1427,15 +1489,15 @@ namespace OpenSwitcher.Core
                 Log("inj: sendinput accepted " + TextConverter.LastSendInputResult + "/" +
                     TextConverter.LastSendInputRequested +
                     (TextConverter.LastSendInputResult == 0 ? " — BLOCKED (HIPS/антивирус?)" : ""));
-            // досылаем проглоченный разделитель СИМВОЛОМ, как его напечатал юзер в
-            // СТАРОЙ раскладке (',' остаётся ',', а не «б» от новой), Enter — клавишей,
-            // т.к. SendUnicode не передаёт \r
+            // досылаем проглоченный разделитель символом раскладки цели (см. sentSep выше),
+            // Enter — клавишей, т.к. SendUnicode не передаёт \r. Знаки-двойники на буквенных
+            // клавишах (',' = б, '.' = ю) сюда не попадают — они в слове, их решает хвост-двойник
             if (resendVk != 0)
             {
                 if (resendVk == 0x0D) TextConverter.SendKey(0x0D, false, false);
-                else TextConverter.SendUnicode(RenderKeyChar(resendVk, _fgHkl, resendShift));
+                else TextConverter.SendUnicode(sentSep);
             }
-            if (resendVk == 0x20) _lastSpaceTextTick = Environment.TickCount; // окно дедупа двойных пробелов
+            if (resendVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // досланный пробел — перед кареткой (дедуп)
             LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
             ExpectLayout(best.Hkl);
 
@@ -1449,13 +1511,13 @@ namespace OpenSwitcher.Core
             _lastConvertLang = best.Lang;
             _undoPending = resendVk != 0x0D && injOk;
             _undoText = cur.Text;
-            _undoLen = best.Text.Length;
+            // _undoLen — ВСЁ, что напечатали вместо исходного: цель + досланный знак (он может
+            // отличаться от набранного: '?' вместо '&'); стирание отката считается только по нему
+            _undoLen = best.Text.Length + sentSep.Length;
             // откат ретро-флипа возвращает и букву: переворот 'f' держался только на слове
             _undoPrefix = retroFrom != null ? retroFrom + " " : "";
             _undoPrefixLen = retroText.Length;
-            _undoSepText = (resendVk != 0 && resendVk != 0x0D)
-                ? RenderKeyChar(resendVk, _fgHkl, resendShift)
-                : "";
+            _undoSepText = typedSep; // вернуть знак как набран
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoFocus = _fgFocus;
@@ -1552,13 +1614,14 @@ namespace OpenSwitcher.Core
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             // префикс — буква ретро-флипа ('а␣' -> 'f␣'): её переворот держался только на слове
-            int bs = _undoPrefixLen + _undoLen + _undoSepText.Length + _undoTail.Count;
+            int bs = _undoPrefixLen + _undoLen + _undoTail.Count; // _undoLen уже с досланным знаком (раньше force-flip считал его дважды и съедал символ перед словом)
             string restore = _undoPrefix + _undoText + _undoSepText +
                              (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
             Suppress(600);
             TextConverter.SendBackspaces(bs);
             TextConverter.SendUnicode(restore);
             _prevSingle = null;
+            if (restore.EndsWith(" ")) _spaceAtCaretTick = Environment.TickCount; // 'слово␣' — перед кареткой пробел
             LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
             ExpectLayout(_undoHkl);
             if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
@@ -1625,7 +1688,7 @@ namespace OpenSwitcher.Core
             if (_buf.Count >= 2)
             {
                 Log("force-flip: current buffer (" + _buf.Count + " keys)");
-                ForceConvertWord(_buf.Snapshot(), 0);
+                ForceConvertWord(_buf.Snapshot(), 0, false);
                 _buf.Clear(); // флип живого буфера — буфер отработал
                 return true;
             }
@@ -1634,8 +1697,8 @@ namespace OpenSwitcher.Core
             if (_buf.Count == 0 && _lastWord.Count > 0 && _lastWordSepVk != 0 && _lastWordHwnd == _fgHwnd &&
                 unchecked(Environment.TickCount - _lastWordAt) < 10000)
             {
-                Log("force-flip: exact path (last word, sep=0x" + _lastWordSepVk.ToString("X") + ")");
-                ForceConvertWord(new List<KeyRec>(_lastWord), _lastWordSepVk);
+                Log("force-flip: exact path (last word, sep=0x" + _lastWordSepVk.ToString("X") + (_lastWordSepShift ? "+shift" : "") + ")");
+                ForceConvertWord(new List<KeyRec>(_lastWord), _lastWordSepVk, _lastWordSepShift);
                 return true;
             }
             // 3) слово не найти точно — честный отказ вместо порчи текста
@@ -1647,7 +1710,7 @@ namespace OpenSwitcher.Core
         /// trailSepVk — разделитель сразу после слова, уже дошедший до приложения:
         // его тоже стираем и перепечатываем (иначе переворот съедает пробел/запятую).
         /// Точка отката: повторный Break вернёт как было; пара запоминается в accepted.</summary>
-        private bool ForceConvertWord(List<KeyRec> word, int trailSepVk)
+        private bool ForceConvertWord(List<KeyRec> word, int trailSepVk, bool trailSepShift)
         {
             UpdateForeground();
             if (IsExcludedHere()) { Log("force-flip skip: excluded app"); return false; }
@@ -1689,10 +1752,15 @@ namespace OpenSwitcher.Core
             // хвост-разделитель после слова уже в тексте приложения — стираем вместе
             // со словом и перепечатываем (иначе переворот съедает пробел/запятую)
             int trailLen = trailSepVk != 0 ? 1 : 0;
+            // знак после слова — в раскладке цели, как и при авто-замене ('ghbdtn/' -> 'привет.');
+            // откат вернёт набранный (_undoSepText ниже)
+            string trailTyped = trailSepVk != 0 ? RenderKeyChar(trailSepVk, _fgHkl, trailSepShift) : "";
+            string trailSent = SepInLayout(trailSepVk, trailSepShift, best.Hkl, trailTyped);
             TextConverter.SendBackspaces(word.Count + trailLen);
             TextConverter.SendUnicode(best.Text);
-            if (trailSepVk != 0)
-                TextConverter.SendUnicode(RenderKeyChar(trailSepVk, _fgHkl, false));
+            if (trailSent.Length > 0)
+                TextConverter.SendUnicode(trailSent);
+            if (trailSepVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // перепечатанный пробел — перед кареткой
             // раскладку переключаем только при перевороте СЛОВА: одиночная буква
             // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
             if (word.Count > 1)
@@ -1705,10 +1773,10 @@ namespace OpenSwitcher.Core
             // отмена занесёт его в rejected — «самообучение» в обратную сторону
             _undoPending = true;
             _undoText = cur.Text;
-            _undoLen = best.Text.Length + trailLen;
+            _undoLen = best.Text.Length + trailSent.Length; // всё напечатанное: слово + перепечатанный знак
             _undoPrefix = ""; _undoPrefixLen = 0; // force-flip ретро-букву не трогает
             _prevSingle = null;
-            _undoSepText = trailSepVk != 0 ? RenderKeyChar(trailSepVk, cur.Hkl, false) : "";
+            _undoSepText = trailTyped; // вернуть знак как набран
             _undoHkl = cur.Hkl;
             _undoHwnd = _fgHwnd;
             _undoFocus = _fgFocus;
@@ -1967,6 +2035,7 @@ namespace OpenSwitcher.Core
             // компенсация лага: буквы в просвете доставим в целевой раскладке
             _gapActive = true; _gapHkl = other; _gapBuf.Clear();
             _gapDeadline = Environment.TickCount + 800;
+            ArmGapFlushTimer();
             FireInfo("Раскладка: " + name);
         }
 
