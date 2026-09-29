@@ -92,8 +92,15 @@ fi
 # Иначе (ad-hoc/нет plist при подписи) молча умирают TCC-права.
 SIGNED_ID="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Identifier=//p')"
 if [ -z "$SIGNED_ID" ]; then
-    echo "СБОРКА ПРЕРВАНА: бандл НЕ ПОДПИСАН — TCC не выдаст права (проверь keychain: security find-identity -v -p codesigning)"
-    exit 1
+    if [ -n "$CI" ]; then
+        # CI без сертификата: подпись делает следующий шаг workflow (Codesign). arm64 проходил
+        # гейт только за счёт авто-ad-hoc подписи линкера, x86_64 такой не получает —
+        # v1.2.3-beta6 Intel-сборка падала здесь при успешной компиляции
+        echo "CI: бандл не подписан — подпишет шаг Codesign workflow"
+    else
+        echo "СБОРКА ПРЕРВАНА: бандл НЕ ПОДПИСАН — TCC не выдаст права (проверь keychain: security find-identity -v -p codesigning)"
+        exit 1
+    fi
 fi
 if [ "$SIGNED_ID" != "com.openswitcher.app" ]; then
     echo "ВНИМАНИЕ: подпись с идентификатором '$SIGNED_ID' вместо com.openswitcher.app — TCC-права не совпадут"
