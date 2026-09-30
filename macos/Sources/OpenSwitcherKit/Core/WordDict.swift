@@ -64,7 +64,8 @@ public enum WordDict {
         hour minutes seconds welcome awesome perfect excellent amazing terrible \
         horrible beautiful interesting important available document documents \
         project projects issue issues ticket commit branch merge release update \
-        updates error errors better well done
+        updates error errors better well done \
+        ctrl alt shift esc del tab caps
         """
 
     static let ru: Set<String> = Make(ruSrc)
