@@ -827,11 +827,17 @@ public final class Engine {
         if now < suppressUntil {
             // suppress-окно: конвертация запрещена, но буфер синхронизируем
             if KeyCodeMap.isLetterKey(code) {
-                if buf.count == 0 { wordStartClean = boundaryClean }
-                buf.push(KeyRec(code, shift, caps))
-                if undoPending && !undoTailBroken {
-                    if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
-                    else { undoTailBroken = true }
+                // Cmd/Ctrl+буква — команда, не текст: буфер под ноль (как в основной ветке)
+                if m.cmd || m.ctrl {
+                    buf.clear(); lastWordSepKey = 0
+                    prevSingle = nil; boundaryClean = false
+                } else {
+                    if buf.count == 0 { wordStartClean = boundaryClean }
+                    buf.push(KeyRec(code, shift, caps))
+                    if undoPending && !undoTailBroken {
+                        if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
+                        else { undoTailBroken = true }
+                    }
                 }
             } else if KeyCodeMap.isSeparatorKey(code) {
                 // разделитель (пробел, цифры, знаки): граница слова обязана делить буфер,
@@ -982,6 +988,13 @@ public final class Engine {
                 gapActive = false
             } else {
                 if KeyCodeMap.isLetterKey(code) {
+                    // Cmd/Ctrl+буква в лаге смены раскладки — команда: в отложенные
+                    // буквы не пишем (та же фантомная «ф»), отдаём как есть
+                    if m.cmd || m.ctrl {
+                        flushGap()
+                        gapActive = false
+                        return true
+                    }
                     gapBuf.append(KeyRec(code, shift, caps))
                     return false // доставим после применения раскладки
                 }
@@ -999,6 +1012,15 @@ public final class Engine {
         if isExcludedHere() { buf.clear(); return true }
 
         if KeyCodeMap.isLetterKey(code) {
+            // Cmd/Ctrl+буква — сочетание-команда, а не текст (Cmd+A/C/V/Z, Ctrl+A):
+            // после него текст у каретки ненадёжен — как Tab/Esc, буфер под ноль.
+            // Пушить букву нельзя: фантомная «ф» от Cmd+A собирала «фты» -> 'ans'
+            // и переворачивала раскладку пинг-понгом (бой 23:31)
+            if m.cmd || m.ctrl {
+                buf.clear(); lastWordSepKey = 0
+                prevSingle = nil; boundaryClean = false
+                return true
+            }
             let rec = KeyRec(code, shift, caps)
             if buf.count == 0 { wordStartClean = boundaryClean } // что стоит перед словом (ретро-флип)
             buf.push(rec)
