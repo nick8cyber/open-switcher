@@ -495,15 +495,25 @@ namespace OpenSwitcher.Core
                 {
                     // suppress-окно: конвертация запрещена, но БУФЕР синхронизируем —
                     // иначе следующая конвертация сотрёт меньше, чем юзер успел набрать тут
-                    bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
-                    bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
-                    var recS = new KeyRec((int)(k.vkCode & 0xFF), sh, cp);
-                    if (_buf.Count == 0) _wordStartClean = _boundaryClean;
-                    _buf.Push(recS);
-                    if (_undoPending && !_undoTailBroken)
+                    // Ctrl/Alt/Win+буква — команда, не текст: буфер под ноль (как в OnKeyDown)
+                    if (HeldCmdMods(k))
                     {
-                        if (_undoTail.Count < 16) _undoTail.Add(recS);
-                        else _undoTailBroken = true;
+                        _buf.Clear();
+                        _lastWordSepVk = 0;
+                        _prevSingle = null; _boundaryClean = false;
+                    }
+                    else
+                    {
+                        bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+                        bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
+                        var recS = new KeyRec((int)(k.vkCode & 0xFF), sh, cp);
+                        if (_buf.Count == 0) _wordStartClean = _boundaryClean;
+                        _buf.Push(recS);
+                        if (_undoPending && !_undoTailBroken)
+                        {
+                            if (_undoTail.Count < 16) _undoTail.Add(recS);
+                            else _undoTailBroken = true;
+                        }
                     }
                 }
                 else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
@@ -851,6 +861,14 @@ namespace OpenSwitcher.Core
                 {
                     if (IsLetterVk(vk))
                     {
+                        // Ctrl/Alt/Win+буква в лаге смены раскладки — команда: в
+                        // отложенные буквы не пишем (та же фантомная 'a'), как есть
+                        if (heldMods)
+                        {
+                            FlushGap();
+                            _gapActive = false;
+                            return true;
+                        }
                         _gapBuf.Add(new KeyRec(vk, shift, caps));
                         return false; // глотаем: доставим после применения раскладки
                     }
@@ -870,6 +888,17 @@ namespace OpenSwitcher.Core
 
             if (IsLetterVk(vk))
             {
+                // Ctrl/Alt/Win+буква — сочетание-команда, а не текст (Ctrl+A/V/C/Z):
+                // после него текст у каретки ненадёжен — буфер под ноль. Пушить букву
+                // нельзя: фантомная 'a' от Ctrl+A собирала мусорное слово и дёргала
+                // конвертацию с флипом раскладки (бой mac 23:31)
+                if (heldMods)
+                {
+                    _buf.Clear();
+                    _lastWordSepVk = 0;
+                    _prevSingle = null; _boundaryClean = false;
+                    return true;
+                }
                 KeyRec rec = new KeyRec(vk, shift, caps);
                 if (_buf.Count == 0) _wordStartClean = _boundaryClean; // что стоит перед словом (ретро-флип)
                 _buf.Push(rec);

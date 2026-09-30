@@ -83,7 +83,11 @@ namespace OpenSwitcher.Core
             "hour minutes seconds welcome awesome perfect excellent amazing terrible " +
             "horrible beautiful interesting important available document documents " +
             "project projects issue issues ticket commit branch merge release update " +
-            "updates error errors better well done";
+            "updates error errors better well done " +
+            // клавиатурные сокращения: юзер пишет их в чатах, но автоправка не трогала
+            // (цель должна быть словарной); русско-раскладочные прочтения («скед»,
+            // «фде», «ышафе»...) не слова — ложных срабатываний нет
+            "ctrl alt shift esc del tab caps";
 
         private static readonly HashSet<string> Ru = Make(RuSrc);
         private static readonly HashSet<string> En = Make(EnSrc);
