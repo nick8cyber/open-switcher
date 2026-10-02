@@ -135,6 +135,20 @@ public enum SelfTest {
             sb += "\(pass ? "PASS" : "FAIL"): retro '\(typed)' -> '\(target)' [\(got ? "FLIP" : "keep")] \(pass ? "" : "!!")(\(note))\n"
         }
 
+        // --- форма цели авто-замены (паритет C#): буквы ИЛИ буквы + один знак в конце ---
+        let shapes: [(String, Bool, String)] = [
+            ("привет", true, "только буквы"), ("привет,", true, "буквы + знак в конце"),
+            ("тебя.", true, "хвост-двойник точкой"), ("et,e", false, "знак внутри — мусор"),
+            ("le,rf[", false, "знаки внутри и в конце"), ("e,,", false, "два знака в конце"),
+            (",", false, "без букв"),
+        ]
+        for (t, want, note) in shapes {
+            let got = Engine.targetShapeOk(t)
+            let pass = got == want
+            if !pass { fails += 1 }
+            sb += "\(pass ? "PASS" : "FAIL"): shape '\(t)' [\(got ? "ok" : "reject")] \(pass ? "" : "!!")(\(note))\n"
+        }
+
         sb += fails == 0 ? "ALL TESTS PASSED\n" : "\(fails) TEST(S) FAILED\n"
         try? sb.write(toFile: outPath, atomically: true, encoding: .utf8)
         print(sb, terminator: "")

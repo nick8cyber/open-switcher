@@ -1350,21 +1350,26 @@ public final class Engine {
                     (altCore.count >= 3 && LanguageTables.possibleWord(altCore, best.lang))
                 let baseValid = WordDict.has(baseCore, best.lang) ||
                     (baseCore.count >= 3 && LanguageTables.possibleWord(baseCore, best.lang))
-                if altValid && !baseValid { bestText = alt }
+                // словарное слово+знак сильнее несловарного «возможного» с лишней буквой
+                // ('nt,z.' -> «тебя.», а не «тебяю»; порт C#, бой 02.10 19:08:53)
+                let altDict = WordDict.has(altCore, best.lang), baseDict = WordDict.has(baseCore, best.lang)
+                if altValid && (!baseValid || (altDict && !baseDict)) { bestText = alt }
             }
-            // цель: [буквы][не более одного знака-хвоста] (v3 §5.11)
             let core = LanguageTables.lettersOnly(bestText)
-            let tail = String(bestText.dropFirst(core.count))
-            if core.isEmpty || tail.count > 1 {
-                logLine("convert skip: target-not-letters ('\(bestText)')")
-                return false
-            }
             // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (v3 §5.11)
             if !WordDict.has(core, best.lang) &&
                 (core.count < 3 || !LanguageTables.possibleWord(core, best.lang)) {
                 logLine("convert skip: target-not-in-dict ('\(bestText)')")
                 return false
             }
+        }
+
+        // форма цели (v3 §5.11): только буквы ИЛИ буквы + ОДИН знак в конце. Знак ВНУТРИ
+        // ('et,e' из русского слова с «б») — мусор всегда, и для выученных пар: старая
+        // проверка вычитала длину букв и пропускала знак в середине (порт C#, бой 02.10)
+        if !manual && !Engine.targetShapeOk(bestText) {
+            logLine("convert skip: target-not-letters ('\(bestText)')")
+            return false
         }
 
         var pass = LanguageTables.shouldConvert(curText: cur.text, curLang: cur.lang, curScore: cur.score,
@@ -1474,7 +1479,11 @@ public final class Engine {
         undoTail.removeAll()
         undoTailBroken = false
 
-        if injOk && cur.text.count >= 3 {
+        // RU->EN заучиваем ТОЛЬКО в словарную EN-цель (порт C#): ошибочная замена русского
+        // слова, поправленная руками, иначе через 15 с становилась «выученной» навсегда
+        let learnable = cur.lang != 0 || best.lang != 1 ||
+            WordDict.has(LanguageTables.lettersOnly(bestText), 1)
+        if injOk && cur.text.count >= 3 && learnable {
             // принятие честное: через 15 с, если юзер не откатил (v3 §12)
             let acceptedTyped = cur.text.lowercased()
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -1486,6 +1495,14 @@ public final class Engine {
         // попап показывает цель с хвостом-знаком (и ретро-буквой)
         fireConverted(retroPrefix + cur.text, retroText + bestText)
         return true
+    }
+
+    /// Цель авто-замены по форме (порт C# TargetShapeOk): только буквы, либо буквы + ровно
+    /// один знак В КОНЦЕ.
+    public static func targetShapeOk(_ t: String) -> Bool {
+        let core = LanguageTables.lettersOnly(t)
+        if core.isEmpty { return false }
+        return t == core || (t.count == core.count + 1 && t.hasPrefix(core))
     }
 
     /// Знак-разделитель в раскладке цели (порт C# SepInLayout): тот же физический знак, каким

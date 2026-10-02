@@ -169,6 +169,26 @@ namespace OpenSwitcher
                     pass ? "PASS" : "FAIL", r[0], r[2], got ? "FLIP" : "keep", pass ? "" : "!!", r[5]));
             }
 
+            // форма цели авто-замены: буквы ИЛИ буквы + один знак в конце; знак внутри — мусор
+            var shapes = new[]
+            {
+                new object[] { "привет",  true,  "только буквы" },
+                new object[] { "привет,", true,  "буквы + знак в конце" },
+                new object[] { "тебя.",   true,  "хвост-двойник точкой" },
+                new object[] { "et,e",    false, "знак внутри (русское слово с «б») — мусор" },
+                new object[] { "le,rf[",  false, "знаки внутри и в конце" },
+                new object[] { "e,,",     false, "два знака в конце" },
+                new object[] { ",",       false, "без букв" }
+            };
+            foreach (object[] r in shapes)
+            {
+                bool got = Engine.TargetShapeOk((string)r[0]);
+                bool pass = got == (bool)r[1];
+                if (!pass) fails++;
+                sb.AppendLine(string.Format("{0}: shape '{1}' [{2}] {3} ({4})",
+                    pass ? "PASS" : "FAIL", r[0], got ? "ok" : "reject", pass ? "" : "!!", r[2]));
+            }
+
             sb.AppendLine(fails == 0 ? "ALL TESTS PASSED" : fails + " TEST(S) FAILED");
             try
             {

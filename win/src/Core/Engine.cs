@@ -1377,16 +1377,14 @@ namespace OpenSwitcher.Core
                             (altCore.Length >= 3 && LanguageTables.PossibleWord(altCore, best.Lang));
                         bool baseValid = WordDict.Has(baseCore, best.Lang) ||
                             (baseCore.Length >= 3 && LanguageTables.PossibleWord(baseCore, best.Lang));
-                        if (altValid && !baseValid) best.Text = alt;
+                        // словарное слово+знак сильнее несловарного «возможного» с лишней буквой:
+                        // 'nt,z.' -> «тебя.», а не «тебяю» (бой 02.10 19:08:53 — «тебяю» проходило
+                        // как possible-word, и правило хвоста молчало)
+                        bool altDict = WordDict.Has(altCore, best.Lang), baseDict = WordDict.Has(baseCore, best.Lang);
+                        if (altValid && (!baseValid || (altDict && !baseDict))) best.Text = alt;
                     }
                 }
                 string core = LanguageTables.LettersOnly(best.Text);
-                string tail = best.Text.Substring(core.Length);
-                if (core.Length == 0 || tail.Length > 1)
-                {
-                    Log("convert skip: target-not-letters ('" + cur.Text + "' -> '" + best.Text + "')");
-                    return false;
-                }
                 // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (все пары
                 // букв встречаются в языковой модели) — покрывает формы, не вошедшие в
                 // словарь ('нажимал', 'изучи'); 2-буквенные цели — только словарь
@@ -1400,6 +1398,15 @@ namespace OpenSwitcher.Core
                 // wrong-layout набор ('руддщ', 'ghbdtn') тоже состоит из валидных русских
                 // пар, этим guard'ом убивается ядро программы (ghbdtn->привет).
                 // Дискриминатор правильного текста — мусорность ЧУЖОГО прочтения (ворота выше)
+            }
+
+            // форма цели (§5.11): только буквы ИЛИ буквы + ОДИН знак в конце ('привет,').
+            // Знак ВНУТРИ ('et,e' из русского слова с «б») — мусор всегда, и для выученных пар:
+            // старая проверка вычитала длину букв и пропускала знак в середине (бой 02.10 19:08:52)
+            if (!manual && !TargetShapeOk(best.Text))
+            {
+                Log("convert skip: target-not-letters ('" + cur.Text + "' -> '" + best.Text + "')");
+                return false;
             }
 
             bool pass = LanguageTables.ShouldConvert(cur.Text, cur.Lang, cur.Score,
@@ -1561,7 +1568,13 @@ namespace OpenSwitcher.Core
             // права вечно портить ввод из-за одного случайного переворота. Коротким
             // парам — осознанное обучение через Break (ForceConvertWord).
             // Принятие честное: через 15 с, если юзер не откатил (откат кладёт в rejected)
-            if (injOk && cur.Text.Length >= 3)
+            // RU->EN заучиваем ТОЛЬКО в словарную EN-цель: юзер пишет по-русски, и ошибочная
+            // замена русского слова, которую он поправил руками (не Break'ом), иначе через 15 с
+            // становилась «выученной» и дальше переворачивалась ВСЕГДА в обход ворот
+            // (бой 02.10 19:08:52/57 — русское слово дважды в 'et,e'-мусор)
+            bool learnable = cur.Lang != 0 || best.Lang != 1 ||
+                             WordDict.Has(LanguageTables.LettersOnly(best.Text), 1);
+            if (injOk && cur.Text.Length >= 3 && learnable)
             {
                 string acceptedTyped = cur.Text.ToLowerInvariant();
                 var acceptTimer = new System.Windows.Forms.Timer { Interval = 15000 };
@@ -1576,6 +1589,15 @@ namespace OpenSwitcher.Core
 
             FireConverted((retroFrom != null ? retroFrom + " " : "") + cur.Text, retroText + best.Text);
             return true;
+        }
+
+        /// <summary>Цель авто-замены по форме: только буквы, либо буквы + ровно один знак В КОНЦЕ.</summary>
+        public static bool TargetShapeOk(string t)
+        {
+            if (string.IsNullOrEmpty(t)) return false;
+            string core = LanguageTables.LettersOnly(t);
+            if (core.Length == 0) return false;
+            return t == core || (t.Length == core.Length + 1 && t.StartsWith(core, StringComparison.Ordinal));
         }
 
         /// <summary>Ретро-флип одиночной буквы (§7): переворачивается, только если набранное —
