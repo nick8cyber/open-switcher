@@ -46,7 +46,7 @@ namespace OpenSwitcher.Core
         public int SpaceDedupMs = 0;          // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
         public bool StartWithWindows = false;
         public bool Paused = false;
-        public string Exclusions = "";
+        public string Exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe"; // популярные игры: инжекция/конвертация в них только мешает (чат всё равно руками)
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
         public int DefaultsV = 7; // версия дефолтов (7 = ввод сообщениями окна включён; 6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
     }
