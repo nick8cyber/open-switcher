@@ -163,7 +163,11 @@ public final class Engine {
     private func startLayoutRefreshTimer() {
         layoutRefreshTimer?.invalidate()
         LayoutService.refreshOnMain() // прогрев: кэш жив до первого тика
-        let t = Timer(timeInterval: 0.25, repeats: true) { _ in LayoutService.refreshOnMain() }
+        PasswordGuard.refreshOnMain()
+        let t = Timer(timeInterval: 0.25, repeats: true) { _ in
+            LayoutService.refreshOnMain()
+            PasswordGuard.refreshOnMain() // флаг «в фокусе поле пароля» для гейта конвертации
+        }
         RunLoop.main.add(t, forMode: .common)
         layoutRefreshTimer = t
     }
@@ -1307,6 +1311,9 @@ public final class Engine {
             why = "too-short (\(word.count)\(letter))"
         }
         else if !manual && s.lockAutoAfterManualSwitch && autoLocked { why = "locked" }
+        // Поле пароля (AXSecureTextField): конвертации там нет ВОВСЕ — буквы
+        // невидимы, любой флип раскладки посреди ввода ломает пароль целиком
+        else if !manual && PasswordGuard.isSecureFocused { why = "password field" }
         if let why = why { logLine("convert skip: \(why)"); return false }
 
         updateForeground()
