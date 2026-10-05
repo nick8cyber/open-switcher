@@ -47,6 +47,17 @@ public final class Engine {
     // «чистая пара» обоих Shift (вкл/выкл автопереключения): любой keyDown гасит
     private var shiftPairClean = false
     private var autoLocked = false
+    /// Когда был поставлен лок ручного переключения (для «переключил раскладку
+    /// ДО ввода» — лок переживает смену поля/окна в коротком окне, пароль-кейс)
+    private var autoLockedAt: TimeInterval = 0
+
+    /// Поставить лок ручного переключения (все ручные смены раскладки)
+    private func lockAutoSwitch() {
+        if s.lockAutoAfterManualSwitch {
+            autoLocked = true
+            autoLockedAt = Engine.ms()
+        }
+    }
     private var lastInputAt: TimeInterval = 0
     private var lastResendSpaceAt: TimeInterval = 0
     private var lastSpaceTextTick: TimeInterval = 0 // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл ИЛИ нажатие) — для дедупа двойных (C# 3baec1e)
@@ -471,7 +482,11 @@ public final class Engine {
         undoPending = false
         undoTailBroken = true
         gapActive = false; gapBuf.removeAll()
-        autoLocked = false
+        // Лок ручного переключения переживает смену поля/окна, если переключение
+        // было только что (<10 с): юзер сменил раскладку ДО ввода — под следующий
+        // ввод (поле пароля в другом приложении), и снос лока на клике ломал пароль.
+        // Остальные случаи — лок от старого поля умирает вместе с сеансом.
+        if !(autoLocked && Engine.ms() - autoLockedAt < 10) { autoLocked = false }
         expectedLayoutID = nil // как _expectedValid=false в C#
         lastResendSpaceAt = 0
         lastSpaceTextTick = 0 // окно дедупа не переносится в другое окно  // окно эха не переносится в другое окно
@@ -510,7 +525,7 @@ public final class Engine {
         // раскладка сменилась вне движка — юзер задал язык явно: лок автодетекта
         if let expected = expectedLayoutID, fgApp == expectedApp, cur.id != expected,
            s.lockAutoAfterManualSwitch, Engine.ms() >= expectGraceUntil {
-            autoLocked = true
+            lockAutoSwitch()
         }
         expectedLayoutID = cur.id
         expectedApp = fgApp
@@ -684,8 +699,11 @@ public final class Engine {
         // в оригинале KEYUP в suppress-окне не диспетчеризуется — тап не срабатывает
         if now < suppressUntil { return true }
         let m = heldModsFromFlags(flags)
+        // тап короче 120 мс — случайный задев при наборе (в поле пароля такой флип
+        // ломает все следующие символы; бой 00:44:51: RShift 88 мс -> флип в EN),
+        // осознанный тап держат дольше
         let alone = tapAlone && !m.ctrl && !m.alt && !m.cmd
-            && (now - tapDownAt) >= 0 && (now - tapDownAt) < 0.7
+            && (now - tapDownAt) >= 0.12 && (now - tapDownAt) < 0.7
         if !alone, s.devLog {
             logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, now - tapDownAt, now < suppressUntil ? 1 : 0))
         }
@@ -911,7 +929,7 @@ public final class Engine {
                     verifySwitch(target: ul)
                     expectLayout(ul)
                 }
-                if s.lockAutoAfterManualSwitch { autoLocked = true }
+                lockAutoSwitch()
                 let w = undoText.lowercased()
                 rememberRejected(w) // персистентность как у hotkey-undo: слово в learned.txt переживёт рестарт
                 removeAccepted(w)
@@ -1250,7 +1268,7 @@ public final class Engine {
         switchLayoutOnMain(target)
         verifySwitch(target: target)
         expectLayout(target)
-        if s.lockAutoAfterManualSwitch { autoLocked = true }
+        lockAutoSwitch()
         gapActive = true; gapLayout = target; gapBuf.removeAll()
         gapDeadline = Engine.ms() + 0.8
         armGapFlushTimer()
@@ -1272,7 +1290,7 @@ public final class Engine {
         switchLayoutOnMain(other)
         verifySwitch(target: other)
         expectLayout(other)
-        if s.lockAutoAfterManualSwitch { autoLocked = true }
+        lockAutoSwitch()
         gapActive = true; gapLayout = other; gapBuf.removeAll()
         gapDeadline = Engine.ms() + 0.8
         armGapFlushTimer()
@@ -1587,7 +1605,7 @@ public final class Engine {
             verifySwitch(target: ul)
             expectLayout(ul)
         }
-        if s.lockAutoAfterManualSwitch { autoLocked = true }
+        lockAutoSwitch()
         let learned = undoText
         rememberRejected(learned)
         removeAccepted(learned)
@@ -1873,7 +1891,7 @@ public final class Engine {
             verifySwitch(target: target)
             expectLayout(target)
         }
-        if s.lockAutoAfterManualSwitch { autoLocked = true }
+        lockAutoSwitch()
 
         if s.restoreClipboard { scheduleClipboardRestore(text) }
 
