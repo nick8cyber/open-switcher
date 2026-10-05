@@ -1330,6 +1330,16 @@ public final class Engine {
             return false
         }
 
+        // РУ->EN: набранное — правильное русское (словарь ИЛИ морфология 55k-корпуса)
+        // => EN-прочтение не рассматривается вовсе. Порт C# 81ae150, расширенный со
+        // словаря на possibleWord: «ебаная», «говно», «твого» вне словаря, но это
+        // явно русский текст — скачировать их против EN-мусора — мина (бой 00:39)
+        if !manual && !acceptedWord && cur.lang == 0 && best.lang == 1 &&
+            (WordDict.has(cur.text, 0) || LanguageTables.possibleWord(cur.text, 0)) {
+            logLine("convert skip: ru->en real ('\(cur.text)' -> '\(best.text)')")
+            return false
+        }
+
         // Кулдаун после ручной правки — первым делом (v3 §6.2)
         if !manual && !acceptedWord && Engine.ms() < noFlipUntil {
             logLine("convert skip: cool-down after manual fix")
