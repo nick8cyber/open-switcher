@@ -9,6 +9,9 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
+rem каталог компилятора: UIA-сборки лежат не рядом с csc.exe, а в подпапке WPF
+for %%I in ("%CSC%") do set "CSCDIR=%%~dpI"
+
 if not exist tools\app.ico (
     powershell -NoProfile -ExecutionPolicy Bypass -File tools\make-icon.ps1
 )
@@ -18,6 +21,7 @@ if not exist tools\app.ico (
   /win32icon:tools\app.ico ^
   /win32manifest:app.manifest ^
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
+  /r:"%CSCDIR%WPF\UIAutomationClient.dll" /r:"%CSCDIR%WPF\UIAutomationTypes.dll" ^
   src\*.cs src\Core\*.cs src\UI\*.cs
 
 if errorlevel 1 (

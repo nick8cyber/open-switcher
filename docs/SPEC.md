@@ -508,13 +508,17 @@ ShouldConvert: margin = 0.22/max(0.3, sens); best+RowBoost < cur+margin → no;
 | Автозапуск | LaunchAgent (SMAppService) |
 | %APPDATA%\OpenSwitcher | `~/Library/Application Support/OpenSwitcher/` |
 
+**Парольные поля — кросс-платформенно (06.10):** авто-конвертация не ходит
+в парольные поля ВОВСЕ — в secure-поле буквы невидимы, любой флип ломает
+пароль. Windows: синхронно в хуке только ES_PASSWORD (GetWindowLongW
+GWL_STYLE&0x20) и TTL-кэш 300 мс; UIA `IsPasswordProperty` — строго вне
+хука (UI-поток через Defer), ответ в кэш к следующему нажатию — UIA-вызов
+в LL-колбэке = снятие хука. macOS: AX-опрос с TTL-кэшем 0.25 с (75fa0f7).
+Manual-путь (Break) в парольных полях работает.
+
 **mac-only поведение (пока без вин-эквивалента — ГЭП для Windows):**
-- **PasswordGuard:** авто-конвертация не ходит в парольные поля ВОВСЕ
-  (AX-опрос фокусного элемента, TTL-кэш 0.25 с: RoleDescription содержит
-  `secure`, либо AXTextField с нечитаемым AXNumberOfCharacters) — в
-  secure-поле буквы невидимы, любой флип ломает пароль (75fa0f7). Windows:
-  нужен аналог через UI Automation (UIA_IsPasswordPropertyId).
-- **Тап Shift короче 120 мс** — случайный задев, не переключает (8cf7674).
+- **Тап короче 120 мс не переключает** — кросс-платформенно с 06.10
+  (вин: heldMs < 120 в keyup-ветке тапа, все тап-клавиши; мак: 8cf7674).
 - **Лок ручного переключения переживает смену поля/окна в окне 10 с** —
   «сменил раскладку ДО ввода» (8cf7674).
 - **Расширение раннего отказа РУ→EN:** правильное русское по possible_word

@@ -122,6 +122,15 @@ namespace OpenSwitcher.Core
         public IntPtr UiFormHandle;
         public IntPtr SandboxHandle;
 
+        // ---- PasswordGuard (порт с мак): авто-конвертация не заходит в парольные поля.
+        // UIA-опрос IsPassword занимает десятки мс — вызывать из LL-колбэка НЕЛЬЗЯ (Windows
+        // молча снимает хуки при таймауте колбэка, см. watchdog): синхронно в хуке живёт
+        // только чтение кэша и стиль окна (ES_PASSWORD — одна syscall); UIA уезжает в Defer
+        // (UI-поток, вне колбэка) и кладёт ответ в кэш к следующему нажатию
+        private struct PwdCacheEntry { public bool IsPwd; public int Tick; }
+        private readonly Dictionary<IntPtr, PwdCacheEntry> _pwdCache = new Dictionary<IntPtr, PwdCacheEntry>();
+        private const int PwdCacheTtlMs = 300; // жизнь ответа: дольше — фокус уже мог уйти в другое поле
+
         /// <summary>(старый текст, новый текст) — для всплывашки.</summary>
         public event Action<string, string> Converted;
         /// <summary>Информационное сообщение без пары "было/стало".</summary>
@@ -376,6 +385,71 @@ namespace OpenSwitcher.Core
                 if (_fgProc == p) return true;
             }
             return false;
+        }
+
+        // ------------------------------------------------------------------PasswordGuard
+
+        /// <summary>Фокус в парольном поле — авто-конвертации там ВОВСЕ нет (порт с мак:
+        /// буквы в пароле невидимы, флип раскладки посреди ввода ломает пароль целиком).
+        /// Синхронная часть вызывается ИЗ LL-хука: только кэш и стиль окна; UIA (Chromium
+        /// и современные приложения стиль ES не выставляют) — медленный, уходит в Defer.</summary>
+        private bool IsPasswordField()
+        {
+            // каретка важнее переднего окна: фокус может лежать глубже в окне
+            IntPtr hwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
+            if (hwnd == IntPtr.Zero) return false;
+
+            PwdCacheEntry e;
+            if (_pwdCache.TryGetValue(hwnd, out e) &&
+                unchecked(Environment.TickCount - e.Tick) < PwdCacheTtlMs)
+                return e.IsPwd; // свежий ответ — хук только читает
+
+            // протухшие записи выкидываем, чтобы словарь не рос бесконечно за сеанс;
+            // перебор 64 мелких записей дешевле, чем утечка на каждый просмотренный hwnd
+            if (_pwdCache.Count > 64)
+            {
+                int nowT = Environment.TickCount;
+                List<IntPtr> dead = new List<IntPtr>();
+                foreach (var kv in _pwdCache)
+                    if (unchecked(nowT - kv.Value.Tick) >= PwdCacheTtlMs) dead.Add(kv.Key);
+                foreach (IntPtr k in dead) _pwdCache.Remove(k);
+            }
+
+            // нативные EDIT-поля видны по стилю: GetWindowLong — одна syscall, в хуке допустимо
+            if ((Native.GetWindowLongW(hwnd, -16 /*GWL_STYLE*/) & 0x20 /*ES_PASSWORD*/) != 0)
+            {
+                e.IsPwd = true; e.Tick = Environment.TickCount; _pwdCache[hwnd] = e;
+                return true;
+            }
+
+            // «не пароль» (насколько видно без UIA) кэшируем сразу — повторные нажатия
+            // не дёргают тяжёлую проверку; UIA-ответ (может, всё-таки пароль) попадёт
+            // в кэш к следующему нажатию — текущее слово решится по-старому, зато
+            // хук не тормозит и не рискует быть снятым системой
+            e.IsPwd = false; e.Tick = Environment.TickCount; _pwdCache[hwnd] = e;
+            Defer(delegate { UiaCheckPassword(hwnd); });
+            return false;
+        }
+
+        /// <summary>UIA-опрос IsPasswordProperty: ДЕСЯТКИ мс — только с UI-потока и вне
+        /// LL-колбэка (иначе молчаливая смерть хуков). В кэш кладём лишь положительный
+        /// ответ: «не пароль» уже лежит, а ложный «не пароль» от UIA просто истечёт по TTL.</summary>
+        private void UiaCheckPassword(IntPtr hwnd)
+        {
+            try
+            {
+                System.Windows.Automation.AutomationElement el =
+                    System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                if (el == null) return;
+                object v = el.GetCurrentPropertyValue(
+                    System.Windows.Automation.AutomationElement.IsPasswordProperty, true);
+                if (v is bool && (bool)v)
+                {
+                    _pwdCache[hwnd] = new PwdCacheEntry { IsPwd = true, Tick = Environment.TickCount };
+                    Log("password guard: UIA flagged hwnd=" + hwnd.ToInt64().ToString("X"));
+                }
+            }
+            catch (Exception) { } // окно умерло / UIA-прокси нет — не беда, кэш уже «не пароль»
         }
 
         // ------------------------------------------------------------------ Hook
@@ -1125,6 +1199,15 @@ namespace OpenSwitcher.Core
 
             bool swallow = IsSwallowableTap(vk);
             int now = Environment.TickCount;
+            // тап короче 120 мс — случайный задев клавиши (порт с мак 8cf7674): как
+            // и на маке, раскладку не переключаем; сброс _tapAlone делает alone=false
+            // ниже — свитча нет, клавиша уходит в приложение как обычно
+            int heldMs = unchecked(now - _tapDownTick);
+            if (heldMs >= 0 && heldMs < 120)
+            {
+                Log("tap too short: " + heldMs + " ms");
+                _tapAlone = false;
+            }
             // тап засчитывается только «голой» клавишей: Ctrl/Alt/Win рядом — чужое сочетание
             bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
             bool alt = (k.flags & Native.LLKHF_ALTDOWN) != 0 || (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
@@ -1283,6 +1366,9 @@ namespace OpenSwitcher.Core
             // нет ('ye'->'ну', 'yt'->'не'); словарные 'to','ok','he' защищены
             // cur-in-dict. Одиночные буквы не обрабатываем вовсе — сигнала ноль.
             if (S.Paused) why = "paused";
+            // поле пароля (порт с мак): конвертации там ВОВСЕ нет — буквы невидимы,
+            // любой флип посреди ввода ломает пароль целиком; ручной путь (Break) не режем
+            else if (!manual && IsPasswordField()) why = "password field";
             else if (word == null || word.Count < 2)
                 // сама буква в логе: без неё не отличить законное «в» от брошенного 'f' перед 'ns'->'ты'
                 why = "too-short (" + (word == null ? 0 : word.Count) +

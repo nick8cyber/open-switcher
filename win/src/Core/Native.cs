@@ -139,5 +139,7 @@ namespace OpenSwitcher.Core
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
         [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+        // GWL_STYLE = -16; из LL-хука можно (одна syscall, без UIA-маршалинга)
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] public static extern int GetWindowLongW(IntPtr hWnd, int nIndex);
     }
 }
