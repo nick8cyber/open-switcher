@@ -1199,14 +1199,19 @@ namespace OpenSwitcher.Core
 
             bool swallow = IsSwallowableTap(vk);
             int now = Environment.TickCount;
-            // тап короче 120 мс — случайный задев клавиши (порт с мак 8cf7674): как
-            // и на маке, раскладку не переключаем; сброс _tapAlone делает alone=false
-            // ниже — свитча нет, клавиша уходит в приложение как обычно
-            int heldMs = unchecked(now - _tapDownTick);
-            if (heldMs >= 0 && heldMs < 120)
+            // Тап короче TapMinMs — случайный задев клавиши: раскладку не переключаем
+            // (сброс _tapAlone делает alone=false ниже — свитча нет, клавиша уходит
+            // в приложение как обычно). Настройка TapMinMs, 0 = ВЫКЛ (дефолт):
+            // жёсткий порог 120 мс ел РЕАЛЬНЫЕ рефлекторные тапы юзера — фильтр
+            // включается только осознанно, значением в ini
+            if (S.TapMinMs > 0)
             {
-                Log("tap too short: " + heldMs + " ms");
-                _tapAlone = false;
+                int heldMs = unchecked(now - _tapDownTick);
+                if (heldMs >= 0 && heldMs < S.TapMinMs)
+                {
+                    Log("tap too short: " + heldMs + " ms");
+                    _tapAlone = false;
+                }
             }
             // тап засчитывается только «голой» клавишей: Ctrl/Alt/Win рядом — чужое сочетание
             bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;

@@ -44,6 +44,7 @@ namespace OpenSwitcher.Core
         public bool RestoreClipboard = true;
         public bool DevLog = false;           // режим разработчика: вести журнал решений в файл
         public int SpaceDedupMs = 0;          // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
+        public int TapMinMs = 0;              // тап короче N мс не переключает раскладку (случайный задев); 0 = выкл — жёсткий порог ел реальные тапы
         public bool StartWithWindows = false;
         public bool Paused = false;
         public string Exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe"; // популярные игры: инжекция/конвертация в них только мешает (чат всё равно руками)
@@ -162,6 +163,7 @@ namespace OpenSwitcher.Core
                 case "RestoreClipboard": s.RestoreClipboard = v == "1"; break;
                 case "DevLog": s.DevLog = v == "1"; break;
                 case "SpaceDedupMs": { int n; if (int.TryParse(v, out n)) s.SpaceDedupMs = Math.Max(0, Math.Min(3000, n)); break; }
+                case "TapMinMs": { int n; if (int.TryParse(v, out n)) s.TapMinMs = Math.Max(0, Math.Min(500, n)); break; }
                 case "StartWithWindows": s.StartWithWindows = v == "1"; break;
                 case "Paused": s.Paused = v == "1"; break;
                 case "MinWordLen": { int n; if (int.TryParse(v, out n)) s.MinWordLen = Math.Max(2, Math.Min(8, n)); break; }
@@ -199,6 +201,7 @@ namespace OpenSwitcher.Core
                 sb.AppendLine("RestoreClipboard=" + (s.RestoreClipboard ? "1" : "0"));
                 sb.AppendLine("DevLog=" + (s.DevLog ? "1" : "0"));
                 sb.AppendLine("SpaceDedupMs=" + s.SpaceDedupMs);
+                sb.AppendLine("TapMinMs=" + s.TapMinMs);
                 sb.AppendLine("StartWithWindows=" + (s.StartWithWindows ? "1" : "0"));
                 sb.AppendLine("Paused=" + (s.Paused ? "1" : "0"));
                 sb.AppendLine("MinWordLen=" + s.MinWordLen);
