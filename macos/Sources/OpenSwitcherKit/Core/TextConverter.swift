@@ -59,7 +59,11 @@ public enum TextConverter {
 
     public static func sendBackspaces(_ n: Int) {
         guard n > 0 else { return }
-        for _ in 0..<n {
+        for i in 0..<n {
+            // микро-пауза между парами: непрерывный burst в очереди целевого
+            // процесса часть приложений интерпретирует как залипание (одно
+            // нажатие = удаление множества символов, «отрезало строку сзади»)
+            if i > 0 { usleep(2000) }
             let d = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: true)
             let u = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: false)
             if let d = d { post(d) }
