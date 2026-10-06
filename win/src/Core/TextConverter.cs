@@ -114,19 +114,23 @@ namespace OpenSwitcher.Core
             }
             else
             {
+                // микро-пауза между парами: непрерывный burst часть приложений
+                // интерпретирует как залипание (одно нажатие = удаление множества
+                // символов, «отрезало строку сзади»; порт mac-фикса 0db1985)
                 uint sc = Native.MapVirtualKeyEx(8, Native.MAPVK_VK_TO_VSC, IntPtr.Zero);
-                var inputs = new Native.INPUT[n * 2];
+                var pair = new Native.INPUT[2];
                 for (int i = 0; i < n; i++)
                 {
-                    inputs[2 * i].type = 1;
-                    inputs[2 * i].u.ki.wVk = 8;
-                    inputs[2 * i].u.ki.wScan = (ushort)sc;
-                    inputs[2 * i + 1].type = 1;
-                    inputs[2 * i + 1].u.ki.wVk = 8;
-                    inputs[2 * i + 1].u.ki.wScan = (ushort)sc;
-                    inputs[2 * i + 1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                    if (i > 0) Thread.Sleep(2);
+                    pair[0].type = 1;
+                    pair[0].u.ki.wVk = 8;
+                    pair[0].u.ki.wScan = (ushort)sc;
+                    pair[1].type = 1;
+                    pair[1].u.ki.wVk = 8;
+                    pair[1].u.ki.wScan = (ushort)sc;
+                    pair[1].u.ki.dwFlags = Native.KEYEVENTF_KEYUP;
+                    SendInputs(pair);
                 }
-                SendInputs(inputs);
             }
         }
         public static void SendKey(int vk, bool extended)
