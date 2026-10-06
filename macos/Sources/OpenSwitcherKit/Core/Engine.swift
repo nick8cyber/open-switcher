@@ -932,6 +932,7 @@ public final class Engine {
                 let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
                 let restore2 = undoPrefix + undoText + undoSepText + tailText
                 suppress(0.6)
+                screenProbe()
                 TextConverter.sendBackspaces(bs2)
                 TextConverter.sendUnicode(restore2)
                 prevSingle = nil
@@ -1273,6 +1274,19 @@ public final class Engine {
         }
     }
 
+    /// Замер экрана вокруг инжекции: текст фокусного поля до и через 0.4 с после —
+    /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
+    private func screenProbe() {
+        DispatchQueue.main.async { [weak self] in
+            let before = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
+            self?.logLine("screen-before: '\(before)'")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                let after = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
+                self?.logLine("screen-after: '\(after)'")
+            }
+        }
+    }
+
     public func switchToLanguage(_ lang: Int) {
         performOnTapThread { [weak self] in self?.switchToLanguageOnTap(lang) }
     }
@@ -1486,6 +1500,7 @@ public final class Engine {
         lastWord = word
 
         suppress(0.6)
+        screenProbe()
         TextConverter.sendBackspaces(word.count + retroPrefix.count)
         TextConverter.sendUnicode(retroText + bestText)
         // набранный знак рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
@@ -1622,6 +1637,7 @@ public final class Engine {
         let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
         let restore = undoPrefix + undoText + undoSepText + tailText
         suppress(0.6)
+        screenProbe()
         TextConverter.sendBackspaces(bs)
         TextConverter.sendUnicode(restore)
         prevSingle = nil
@@ -1731,6 +1747,7 @@ public final class Engine {
         // откат вернёт набранный (undoSepText ниже)
         let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
         let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
+        screenProbe()
         TextConverter.sendBackspaces(word.count + trailLen)
         TextConverter.sendUnicode(best.text)
         if !trailSent.isEmpty {

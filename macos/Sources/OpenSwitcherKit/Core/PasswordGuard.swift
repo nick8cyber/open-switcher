@@ -22,6 +22,22 @@ public enum PasswordGuard {
         return secure
     }
 
+    /// ПРАВДИВЫЙ прибор: текст сфокусированного элемента с экрана (не самоотчёт
+    /// движка). Зывать только с main. nil — поле не отдало значение (не AX-текст).
+    public static func focusedText() -> String? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
+                                            &focused) == .success,
+              let el = focused else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el as! AXUIElement, kAXValueAttribute as CFString,
+                                            &value) == .success,
+              let s = value as? String else { return nil }
+        return s
+    }
+
     /// Единственная точка AX-опроса. Зывать только с main.
     public static func refreshOnMain() {
         lock.lock()
