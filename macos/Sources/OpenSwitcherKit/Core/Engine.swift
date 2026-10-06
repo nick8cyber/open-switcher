@@ -1116,6 +1116,9 @@ public final class Engine {
             let modified = m.ctrl || m.alt || m.cmd || shift
             var converted = false
             let bufWas = buf.count
+            // эхо-состояние ДО конвертации: она сама ставит тик досыла —
+            // флаг, снятый после, всегда 'y' (артефакт, морочил диагностику)
+            let echoBefore = lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6
 
             // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
             // при пустом буфере в пределах окна глотается — защита от рефлекса
@@ -1167,7 +1170,7 @@ public final class Engine {
                 // текст слова в лог: полный транскрипт — любое «порезанное» слово
                 // видно в логе даже при отказе конвертации
                 let wordText = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "?") : "-"
-                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) word='\(wordText)' echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
+                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) word='\(wordText)' echoInWindow=\(echoBefore ? "y" : "n")")
             }
             // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
             // для СЛЕДУЮЩЕГО слова ('f␣' ждёт 'ns'). 'b2b␣' — нет: 'b' начата после цифры
@@ -1476,7 +1479,9 @@ public final class Engine {
         let retroLog = retroFrom != nil ? " (+retro '" + (retroFrom ?? "") + "' -> '" + retroTo + "')" : ""
 
         lastWordSepKey = 0 // ручной/беспраздельный путь: точный force-flip разоружаем (C#:1236)
-        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey))")
+        // bs= в лог: сколько символов реально стирается перед инжекцией —
+        // «отрезало лишнее сзади» ловится сверкой этого числа с текстом
+        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey) bs=\(word.count + retroPrefix.count))")
         lastConvertInfo = "'\(retroPrefix)\(cur.text)' -> '\(retroText)\(bestText)'"
         lastWord = word
 
