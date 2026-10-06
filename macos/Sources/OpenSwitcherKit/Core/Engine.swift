@@ -304,8 +304,12 @@ public final class Engine {
     /// краш в TSMGetInputSourceProperty с потока тапа): из тап-контекста уводим
     /// на main. Порядок инжекции не зависит от TISSelect — юникод-инжекция идёт
     /// сразу, сама смена раскладки применяется асинхронно (verifySwitch/gap это
-    /// уже покрывают).
-    private func switchLayoutOnMain(_ data: LayoutService.LayoutData) {
+    /// уже покрывают). ВСЕ смены раскладки движка идут через эту точку —
+    /// источник пишется в лог: «переворот без записи в лог» невозможен.
+    private func switchLayoutOnMain(_ data: LayoutService.LayoutData, source: String) {
+        let from = LayoutService.currentLayout()?.id.prefix(8) ?? "?"
+        let to = data.id.prefix(8)
+        logLine("layout switch: \(from) -> \(to) (\(source))")
         DispatchQueue.main.async { LayoutService.switchTo(data) }
     }
 
@@ -318,6 +322,7 @@ public final class Engine {
             guard let self = self, self.switchSerial == serial else { return }
             if LayoutService.currentLayout()?.id == target.id { return }
             self.logLine("switch lag/ignored -> TISSelect retry")
+            self.logLine("layout switch: ? -> \(target.id.prefix(8)) (verify-retry)")
             _ = LayoutService.switchTo(target)
         }
     }
@@ -929,11 +934,11 @@ public final class Engine {
                 boundaryClean = undoSepText == " "
                 if restore2.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() }
                 if let ul = undoLayout {
-                    switchLayoutOnMain(ul)
+                    switchLayoutOnMain(ul, source: "backspace-cancel")
                     verifySwitch(target: ul)
                     expectLayout(ul)
                 }
-                lockAutoSwitch()
+                if s.lockAutoAfterManualSwitch { lockAutoSwitch() }
                 let w = undoText.lowercased()
                 rememberRejected(w) // персистентность как у hotkey-undo: слово в learned.txt переживёт рестарт
                 removeAccepted(w)
@@ -1155,7 +1160,10 @@ public final class Engine {
             // пробел ушёл в текст (досыл замены ставит тик сам) — следующий пробел подряд дедуп проглотит
             if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) && !converted { lastSpaceTextTick = now }
             if code == KeyCodeMap.space && !modified {
-                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
+                // текст слова в лог: полный транскрипт — любое «порезанное» слово
+                // видно в логе даже при отказе конвертации
+                let wordText = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "?") : "-"
+                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) word='\(wordText)' echoInWindow=\(lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6 ? "y" : "n")")
             }
             // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
             // для СЛЕДУЮЩЕГО слова ('f␣' ждёт 'ns'). 'b2b␣' — нет: 'b' начата после цифры
@@ -1269,7 +1277,7 @@ public final class Engine {
             fireInfo(lang == 0 ? "Русская раскладка не найдена" : "Английская раскладка не найдена")
             return
         }
-        switchLayoutOnMain(target)
+        switchLayoutOnMain(target, source: "switch-to-lang")
         verifySwitch(target: target)
         expectLayout(target)
         lockAutoSwitch()
@@ -1291,7 +1299,7 @@ public final class Engine {
               let other = layouts.first(where: { $0.id != curID }) else { return }
         let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
         let name = LanguageTables.langOf(LayoutService.render(other, probe)) == 0 ? "РУС" : "ENG"
-        switchLayoutOnMain(other)
+        switchLayoutOnMain(other, source: "switch-other")
         verifySwitch(target: other)
         expectLayout(other)
         lockAutoSwitch()
@@ -1488,7 +1496,7 @@ public final class Engine {
             lastSpaceTextTick = Engine.ms() // окно дедупа двойных пробелов учитывает и досыл
         }
         if let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            switchLayoutOnMain(bl)
+            switchLayoutOnMain(bl, source: "convert")
             verifySwitch(target: bl)
             expectLayout(bl)
         }
@@ -1608,7 +1616,7 @@ public final class Engine {
         prevSingle = nil
         if restore.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() } // 'слово␣' — перед кареткой пробел
         if let ul = undoLayout {
-            switchLayoutOnMain(ul)
+            switchLayoutOnMain(ul, source: "undo-hotkey")
             verifySwitch(target: ul)
             expectLayout(ul)
         }
@@ -1721,7 +1729,7 @@ public final class Engine {
         // раскладку переключаем только при перевороте СЛОВА: одиночная буква
         // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
         if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            switchLayoutOnMain(bl)
+            switchLayoutOnMain(bl, source: "force-flip")
             verifySwitch(target: bl)
             expectLayout(bl)
         }
@@ -1894,6 +1902,7 @@ public final class Engine {
         }
 
         if let target = LayoutService.findLayoutByLang(lang == 1 ? 0 : 1) {
+            logLine("layout switch: ? -> \(target.id.prefix(8)) (fix-selection)")
             LayoutService.switchTo(target)
             verifySwitch(target: target)
             expectLayout(target)
@@ -2056,7 +2065,7 @@ public final class Engine {
             try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
             let p = SettingsStore.dir + "/log.txt"
             if let attr = try? FileManager.default.attributesOfItem(atPath: p),
-               let size = attr[.size] as? Int, size > 2 * 1024 * 1024 {
+               let size = attr[.size] as? Int, size > 10 * 1024 * 1024 {
                 let _ = try? "".write(toFile: p, atomically: true, encoding: .utf8)
             }
             if !FileManager.default.fileExists(atPath: p) {
