@@ -1441,7 +1441,8 @@ namespace OpenSwitcher.Core
                                ContainsPunctTwinChar(cur.Text) &&
                                best.Text == LanguageTables.LettersOnly(best.Text) &&
                                LanguageTables.PossibleWord(LanguageTables.LettersOnly(best.Text), 0) &&
-                               !WordDict.Has(LanguageTables.LettersOnly(cur.Text), 1);
+                               !WordDict.Has(LanguageTables.LettersOnly(cur.Text), 1) &&
+                               LanguageTables.LettersOnly(best.Text).Length >= 5;
             if (!pass && punctSignal)
             {
                 pass = true;
@@ -1534,8 +1535,14 @@ namespace OpenSwitcher.Core
                 else TextConverter.SendUnicode(sentSep);
             }
             if (resendVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // досланный пробел — перед кареткой (дедуп)
-            LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
-            ExpectLayout(best.Hkl);
+            // РАСКЛАДКУ НА ЭНТЕРЕ НЕ МЕНЯЕМ (юзер запретил; бой 06.10 20:51
+            // 'pd.:'->'звюЖ' на Enter дёрнул HKL, когда сообщение уже ушло):
+            // слово перед отправкой поправили — и хватит, раскладка остаётся как была
+            if (resendVk != 0x0D)
+            {
+                LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
+                ExpectLayout(best.Hkl);
+            }
 
             // точка отката: Break вернёт исходное слово и раскладку.
             // Только для замен по разделителю — после Enter строка уже ушла в

@@ -1495,7 +1495,9 @@ public final class Engine {
             lastResendSpaceAt = Engine.ms()
             lastSpaceTextTick = Engine.ms() // окно дедупа двойных пробелов учитывает и досыл
         }
-        if let bl = layouts.first(where: { $0.id == best.layoutID }) {
+        // РАСКЛАДКУ НА ЭНТЕРЕ НЕ МЕНЯЕМ (юзер запретил; порт C# 06.10):
+        // слово перед отправкой поправили — и хватит, раскладка остаётся как была
+        if resendKey != KeyCodeMap.enter, let bl = layouts.first(where: { $0.id == best.layoutID }) {
             switchLayoutOnMain(bl, source: "convert")
             verifySwitch(target: bl)
             expectLayout(bl)
