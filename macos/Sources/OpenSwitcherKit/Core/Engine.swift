@@ -708,11 +708,15 @@ public final class Engine {
         // в оригинале KEYUP в suppress-окне не диспетчеризуется — тап не срабатывает
         if now < suppressUntil { return true }
         let m = heldModsFromFlags(flags)
-        // тап короче 120 мс — случайный задев при наборе (в поле пароля такой флип
-        // ломает все следующие символы; бой 00:44:51: RShift 88 мс -> флип в EN),
-        // осознанный тап держат дольше
+        // Тап короче tapMinMs — задев: раскладку не переключаем. НАСТРОЙКА
+        // tapMinMs, ДЕФОЛТ 0 = ВЫКЛ: жёсткий порог 0.12 с ел РЕАЛЬНЫЕ
+        // рефлекторные тапы юзера на вин (бой 07.10 — переключения перестали
+        // работать, откат 5f390d9). Включать только осознанно после калибровки
+        // по логу ('tap not fired ... dt=')
+        let dt = now - tapDownAt
+        let minHold = Double(s.tapMinMs) / 1000.0
         let alone = tapAlone && !m.ctrl && !m.alt && !m.cmd
-            && (now - tapDownAt) >= 0.12 && (now - tapDownAt) < 0.7
+            && (minHold <= 0 || dt >= minHold) && dt < 0.7
         if !alone, s.devLog {
             logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, now - tapDownAt, now < suppressUntil ? 1 : 0))
         }

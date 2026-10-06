@@ -45,6 +45,7 @@ public final class Settings {
     public var restoreClipboard = true
     public var devLog = false  // режим разработчика: вести журнал решений в файл (DevLog в C#; для опенсорса — ВЫКЛ)
     public var spaceDedupMs = 0 // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
+    public var tapMinMs = 0 // тап короче N мс не переключает раскладку (случайный задев); 0 = выкл — жёсткий порог ел реальные тапы
     public var startWithSystem = false
     public var paused = false
     public var exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe" // популярные игры (вин/мак общий список, .exe на маке матчится как подстрока)
@@ -118,6 +119,7 @@ public enum SettingsStore {
         case "StartWithWindows", "StartWithSystem": s.startWithSystem = v == "1"
         case "Paused": s.paused = v == "1"
         case "SpaceDedupMs": s.spaceDedupMs = max(0, min(3000, Int(v) ?? 0))  // 0 = выкл, как в C#
+        case "TapMinMs": s.tapMinMs = max(0, min(500, Int(v) ?? 0))  // 0 = выкл, паритет C#
         case "MinWordLen": s.minWordLen = max(2, min(8, Int(v) ?? 3))
         case "Sensitivity": s.sensitivity = Double(v) ?? 1.0
         case "HotFixWordVk": s.hotFixWordVk = Int(v) ?? s.hotFixWordVk  // битое значение — дефолт, как в C#
@@ -157,6 +159,7 @@ public enum SettingsStore {
             "RestoreClipboard=\(s.restoreClipboard ? 1 : 0)",
             "DevLog=\(s.devLog ? 1 : 0)",
             "SpaceDedupMs=\(s.spaceDedupMs)",
+            "TapMinMs=\(s.tapMinMs)",
             "StartWithSystem=\(s.startWithSystem ? 1 : 0)",
             "Paused=\(s.paused ? 1 : 0)",
             "MinWordLen=\(s.minWordLen)",
