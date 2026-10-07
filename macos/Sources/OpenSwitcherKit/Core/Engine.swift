@@ -626,6 +626,12 @@ public final class Engine {
             }
             lastShiftDown = now
             anyKeySinceShift = false
+            // парольное поле: Shift там — заглавные/символы, тап не армим вовсе
+            if PasswordGuard.isSecureFocused {
+                anyKeySinceShift = true
+                tapAlone = false
+                return true
+            }
             if (s.hotRuMods == 0 && s.hotRuVk == code) || (s.hotEnMods == 0 && s.hotEnVk == code) {
                 // дребезг/авторепит: тап быстрее 200 мс после предыдущего не армится
                 // (двойное переключение «туда-обратно» рвёт слово посреди набора — C# 942c5ba)
@@ -721,6 +727,13 @@ public final class Engine {
             logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, now - tapDownAt, now < suppressUntil ? 1 : 0))
         }
         if alone {
+            // парольное поле: Shift там жмут ради ЗАГЛАВНЫХ/СИМВОЛОВ — тап-переключение
+            // в secure-поле не ходит вовсе (каждый Shift для 'A' переворачивал раскладку
+            // вслепую; бой 05:03:42-54: четыре ручных перебора раскладки в одном пароле)
+            if PasswordGuard.isSecureFocused {
+                logLine("tap skip: password field")
+                return true
+            }
             logLine("tap fired: lang=\(tapTarget)")
             lastTapDoneAt = now
             updateForeground()
