@@ -1734,7 +1734,7 @@ public final class Engine {
             logLine("force-flip skip: no other reading"); return false
         }
 
-        logLine("force-flip: '\(cur.text)' -> '\(best.text)' (bs=\(word.count + trailLen))")
+        logLine("force-flip: '\(cur.text)' -> '\(best.text)' (bs=\(word.count + (trailSepKey != 0 ? 1 : 0)))")
         lastConvertInfo = "force '\(cur.text)' -> '\(best.text)'"
         if wasRejected && !skipLearn {
             removeRejected(cur.text.lowercased())
