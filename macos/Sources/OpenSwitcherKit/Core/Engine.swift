@@ -1519,9 +1519,12 @@ public final class Engine {
             lastResendSpaceAt = Engine.ms()
             lastSpaceTextTick = Engine.ms() // окно дедупа двойных пробелов учитывает и досыл
         }
-        // РАСКЛАДКУ НА ЭНТЕРЕ НЕ МЕНЯЕМ (юзер запретил; порт C# 06.10):
-        // слово перед отправкой поправили — и хватит, раскладка остаётся как была
-        if resendKey != KeyCodeMap.enter, let bl = layouts.first(where: { $0.id == best.layoutID }) {
+        // РАСКЛАДКА НА ЭНТЕРЕ — только для «уверенных» конвертаций (решение
+        // юзера 07.10, порт C#): словарная цель или выученная пара переключают
+        // раскладку на правильную ('chatgpt'-бой: фикс без смены оставлял RU на
+        // следующее слово); мусорные пути без словаря HKL на энтере не трогают
+        let sureFix = acceptedWord || WordDict.has(LanguageTables.lettersOnly(bestText), best.lang)
+        if resendKey != KeyCodeMap.enter || sureFix, let bl = layouts.first(where: { $0.id == best.layoutID }) {
             switchLayoutOnMain(bl, source: "convert")
             verifySwitch(target: bl)
             expectLayout(bl)

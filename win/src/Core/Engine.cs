@@ -1626,10 +1626,14 @@ namespace OpenSwitcher.Core
                 else TextConverter.SendUnicode(sentSep);
             }
             if (resendVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // досланный пробел — перед кареткой (дедуп)
-            // РАСКЛАДКУ НА ЭНТЕРЕ НЕ МЕНЯЕМ (юзер запретил; бой 06.10 20:51
-            // 'pd.:'->'звюЖ' на Enter дёрнул HKL, когда сообщение уже ушло):
-            // слово перед отправкой поправили — и хватит, раскладка остаётся как была
-            if (resendVk != 0x0D)
+            // РАСКЛАДКА НА ЭНТЕРЕ — только для «уверенных» конвертаций (решение
+            // юзера 07.10 после боя 'chatgpt': фикс без смены оставлял RU на
+            // следующее слово). Уверенная = словарная цель или выученная пара —
+            // юзер их подтвердил. Мусорные пути без словаря (punct-twin 'звюЖ')
+            // на энтере HKL не трогают: бой 06.10 20:51 — дёрганье раскладки при
+            // отправке мусора и было исходной жалобой
+            bool sureFix = acceptedWord || WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang);
+            if (resendVk != 0x0D || sureFix)
             {
                 LayoutService.SwitchForegroundTo(_fgHwnd, best.Hkl);
                 ExpectLayout(best.Hkl);
