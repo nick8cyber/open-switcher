@@ -821,40 +821,11 @@ namespace OpenSwitcher.Core
 
             // ---- ручные действия: работают всегда (и в паузе, и в исключённых приложениях)
 
-            // Backspace сразу после автозамены — отмена как в Caramba:
-            // вернуть слово + разделитель и запомнить слово как отменённое
-            if (vk == 0x08 && _undoPending && _keysSinceUndoPoint == 0 && !heldMods && !S.Paused)
-            {
-                UpdateForeground();
-                int age = unchecked(Environment.TickCount - _undoTick);
-                if (_undoHwnd == _fgHwnd && age >= 0 && age < 15000)
-                {
-                    _undoPending = false;
-            TextConverter.ReleaseModifiers();
-            TextConverter.InjectMode = S.InputMode;
-            TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-            Log("backspace-cancel: " + _undoText);
-            _noFlipUntil = Environment.TickCount + 5000; // юзер правит сам — движок молчит
-            int bs2 = _undoPrefixLen + _undoLen + _undoTail.Count; // _undoLen уже с досланным знаком
-                    string restore2 = _undoPrefix + _undoText + _undoSepText +
-                                      (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
-                    Suppress(600);
-                    TextConverter.SendBackspaces(bs2);
-                    TextConverter.SendUnicode(restore2);
-                    _prevSingle = null;
-                    _boundaryClean = _undoSepText == " ";
-                    if (restore2.EndsWith(" ")) _spaceAtCaretTick = Environment.TickCount;
-                    LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
-                    ExpectLayout(_undoHkl);
-                    if (S.LockAutoAfterManualSwitch) _autoLocked = true;
-                    string w = _undoText.ToLowerInvariant();
-                    _rejected.Add(w);
-                    Defer(delegate { RememberRejected(w); });
-                    RemoveAccepted(w);
-                    FireInfo("Отменено: " + restore2);
-                    return false; // глотаем Backspace
-                }
-            }
+            // Backspace после автозамены — ОБЫЧНЫЙ ЗАБОЙ (юзер запретил
+            // backspace-cancel 07.10: в Caramba/Punto отмена — только Break,
+            // хоткей ниже; он же кладёт слово в rejected). Забой при пустом
+            // хвосте ломает точку отката (_undoTailBroken в обработчике 0x08) —
+            // Break после правки честно откажется, force-flip подхватит
 
             // отмена последней автозамены (Break по умолчанию)
             if (S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))

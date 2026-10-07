@@ -920,38 +920,11 @@ public final class Engine {
 
         // ---- ручные действия: работают всегда
 
-        // Backspace сразу после автозамены — отмена как в Caramba
-        if code == KeyCodeMap.backspace && undoPending && keysSinceUndoPoint == 0
-            && !m.ctrl && !m.alt && !m.cmd && !s.paused {
-            updateForeground()
-            let age = now - undoAt
-            if undoApp == fgApp && age >= 0 && age < 15 {
-                undoPending = false
-                logLine("backspace-cancel: \(undoText)")
-                let bs2 = undoPrefixLen + undoLen + undoTail.count // undoLen уже с досланным знаком
-                let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
-                let restore2 = undoPrefix + undoText + undoSepText + tailText
-                suppress(0.6)
-                screenProbe()
-                TextConverter.sendBackspaces(bs2)
-                TextConverter.sendUnicode(restore2)
-                prevSingle = nil
-                boundaryClean = undoSepText == " "
-                if restore2.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() }
-                if let ul = undoLayout {
-                    switchLayoutOnMain(ul, source: "backspace-cancel")
-                    verifySwitch(target: ul)
-                    expectLayout(ul)
-                }
-                if s.lockAutoAfterManualSwitch { lockAutoSwitch() }
-                let w = undoText.lowercased()
-                rememberRejected(w) // персистентность как у hotkey-undo: слово в learned.txt переживёт рестарт
-                removeAccepted(w)
-                noFlipUntil = Engine.ms() + 5.0 // юзер правит сам — движок молчит 5 с (v3 §6.2)
-                fireInfo("Отменено: \(restore2) · больше не исправлять")
-                return false // глотаем Backspace
-            }
-        }
+        // Backspace после автозамены — ОБЫЧНЫЙ ЗАБОЙ (порт C# 07.10, юзер
+        // запретил backspace-cancel: в Caramba/Punto отмена — только Break,
+        // хоткей ниже; он же кладёт слово в rejected). Забой при пустом хвосте
+        // ломает точку отката (undoTailBroken в обработчике backspace) —
+        // Break после правки честно откажется, force-flip подхватит
 
         // отмена последней автозамены
         if matchHot(codeEvent: code, event, vkHot: s.hotUndoVk, modsHot: s.hotUndoMods) {
