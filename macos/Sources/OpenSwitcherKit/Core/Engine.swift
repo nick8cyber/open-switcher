@@ -1262,6 +1262,8 @@ public final class Engine {
 
     /// Замер экрана вокруг инжекции: текст фокусного поля до и через 0.4 с после —
     /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
+    /// Текст не изменился после инжекции = цель не съела замену («определил,
+    /// но не заменил») — фиксируется явно.
     private func screenProbe() {
         DispatchQueue.main.async { [weak self] in
             let before = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
@@ -1269,6 +1271,9 @@ public final class Engine {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 let after = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
                 self?.logLine("screen-after: '\(after)'")
+                if before == after && after != "?" {
+                    self?.logLine("INJECTION NOT APPLIED: текст не изменился — цель не съела замену")
+                }
             }
         }
     }
@@ -1479,9 +1484,9 @@ public final class Engine {
         let retroLog = retroFrom != nil ? " (+retro '" + (retroFrom ?? "") + "' -> '" + retroTo + "')" : ""
 
         lastWordSepKey = 0 // ручной/беспраздельный путь: точный force-flip разоружаем (C#:1236)
-        // bs= в лог: сколько символов реально стирается перед инжекцией —
-        // «отрезало лишнее сзади» ловится сверкой этого числа с текстом
-        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey) bs=\(word.count + retroPrefix.count))")
+        // bs= и app= в лог: сколько символов стирается и КУДА ушла инжекция —
+        // «определил, но не заменил» = целевой процесс не съел инжекцию
+        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey) bs=\(word.count + retroPrefix.count) app=\(fgProc))")
         lastConvertInfo = "'\(retroPrefix)\(cur.text)' -> '\(retroText)\(bestText)'"
         lastWord = word
 
@@ -1720,7 +1725,7 @@ public final class Engine {
             logLine("force-flip skip: no other reading"); return false
         }
 
-        logLine("force-flip: '\(cur.text)' -> '\(best.text)' (bs=\(word.count + (trailSepKey != 0 ? 1 : 0)))")
+        logLine("force-flip: '\(cur.text)' -> '\(best.text)' (bs=\(word.count + (trailSepKey != 0 ? 1 : 0)) app=\(fgProc))")
         lastConvertInfo = "force '\(cur.text)' -> '\(best.text)'"
         if wasRejected && !skipLearn {
             removeRejected(cur.text.lowercased())
