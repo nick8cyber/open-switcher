@@ -38,6 +38,34 @@ public enum PasswordGuard {
         return s
     }
 
+    /// Текст фокусного элемента + позиция каретки (в UTF-16-единицах значения).
+    /// nil — поле не отдало значение (не AX-текст). Каретка nil — диапазон выделения
+    /// не читается (вызывающий считает каретку в конце поля). Зывать только с main.
+    public static func focusedTextAndCaret() -> (text: String, caret: Int?)? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
+                                            &focused) == .success,
+              let el = focused else { return nil }
+        let axEl = el as! AXUIElement
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString,
+                                            &value) == .success,
+              let s = value as? String else { return nil }
+        var caret: Int? = nil
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString,
+                                         &rangeRef) == .success,
+           let ref = rangeRef, CFGetTypeID(ref) == AXValueGetTypeID() {
+            var r = CFRange()
+            if AXValueGetValue(ref as! AXValue, .cfRange, &r) {
+                caret = r.location + r.length // каретка = конец выделения; выделение ≠ 0 — стирать нельзя
+            }
+        }
+        return (s, caret)
+    }
+
     /// Единственная точка AX-опроса. Зывать только с main.
     public static func refreshOnMain() {
         lock.lock()

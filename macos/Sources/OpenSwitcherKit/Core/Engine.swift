@@ -20,6 +20,10 @@ public final class Engine {
     private var lastWordSepKey = 0        // разделитель сразу после последнего слова (0 = неизвестен/Enter)
     private var lastWordSepShift = false  // ... набран с Shift ('?', '!', RU ',')
     private var lastWordApp: pid_t = 0    // приложение, где набрано последнее слово (0 = неизвестно)
+    // последний забой: после него «слово+разд» у каретки уже могло не остаться —
+    // точный переворот по памяти (lastWord) вслепую стирал чужой текст
+    // (бой 23.10.2026 23:20: юзер стёр 'ujdyj', тап стёр 'весь ui - там ui' — 4 слова)
+    private var lastBsAt: TimeInterval = 0
     // ретро-флип одиночной буквы (§7, порт C#): 'f␣ns' -> «а ты». Одиночная буква + ровно один
     // пробел прямо перед текущим словом; слово конвертируется из ТОЙ ЖЕ раскладки — буква с ним
     private var prevSingle: [KeyRec]? = nil   // nil — кандидата нет
@@ -826,6 +830,10 @@ public final class Engine {
         let m = heldMods(event)
         let now = Engine.ms()
 
+        // любой реальный забой двигает каретку влево — снимает доверие к
+        // «слово+разд стоят прямо у каретки» (гейт точного переворота)
+        if code == KeyCodeMap.backspace { lastBsAt = now }
+
         anyKeySinceShift = true
         // ЛЮБАЯ клавиша между нажатием и отпусканием тап-клавиши отменяет тап —
         // иначе Shift→буква→отпускание switching раскладку на каждой заглавной
@@ -1278,6 +1286,41 @@ public final class Engine {
         }
     }
 
+    /// Хвост у каретки по экрану (AX): совпадает ли с тем, что собираемся стереть.
+    /// AX-запросы допустимы только с main: с потока тапа — семафорный заход на main
+    /// (main нигде не ждёт поток тапа — deadlock невозможен). available=false —
+    /// значение фокусного элемента не читается (не AX-текст / нет доступа).
+    private func screenTailAtCaret(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
+        var available = false
+        var matches = false
+        var actual = ""
+        let read = {
+            guard let focused = PasswordGuard.focusedTextAndCaret() else { return }
+            let (text, caret) = focused
+            // позиция каретки приходит в UTF-16-единицах значения — режем по ним же
+            let before: String
+            if let c = caret, c >= 0, c <= text.utf16.count {
+                before = String(decoding: text.utf16.prefix(c), as: UTF16.self)
+            } else {
+                before = text // каретка не читается — считаем её в конце поля
+            }
+            available = true
+            actual = String(before.suffix(expectedTail.count + 4))
+            matches = before.hasSuffix(expectedTail)
+        }
+        if Thread.isMainThread {
+            read()
+        } else {
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                read()
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 0.2)
+        }
+        return (available, matches, actual)
+    }
+
     public func switchToLanguage(_ lang: Int) {
         performOnTapThread { [weak self] in self?.switchToLanguageOnTap(lang) }
     }
@@ -1688,9 +1731,11 @@ public final class Engine {
             return true
         }
         // слово только что завершилось, известен разделитель после него, каретка
-        // сразу за разделителем — точный переворот куском [слово+разд] (v3: ≤10 с, то же окно)
+        // сразу за разделителем — точный переворот куском [слово+разд] (v3: ≤10 с, то же окно).
+        // Забой после слова отменяет доверие: юзер уже правил хвост, память о слове
+        // может не совпадать с экраном (порт-надбавка к C#, у того хук не теряет события)
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
-            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
+            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 && lastBsAt <= lastWordAt {
             logLine("force-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
             _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true)
             return true
@@ -1741,6 +1786,25 @@ public final class Engine {
         // откат вернёт набранный (undoSepText ниже)
         let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
         let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
+        // ГЕЙТ ПО ЭКРАНУ перед стиранием (главный урок боя 23.10.2026 23:20): память
+        // мак-тапа расходится с реальным вводом (события теряются — в логе того боя
+        // буфер не совпал с нажатыми клавишами), и вслепую посчитанные backspace'ы
+        // стёрли 4 чужих слова. Сверяем хвост у каретки с тем, что собираемся стереть;
+        // не совпало — честный отказ без инжекции. Экран не читается (AX молчит,
+        // как в telegram) — работаем как раньше, вслепую (паритет C#).
+        let expectedTail = cur.text + trailTyped
+        let gate = screenTailAtCaret(expectedTail)
+        if gate.available {
+            if gate.matches {
+                logLine("force-flip verify: хвост '\(expectedTail)' у каретки подтверждён")
+            } else {
+                logLine("force-flip REFUSED: у каретки '\(gate.actual)' вместо '\(expectedTail)' — стирание по памяти отменено")
+                fireInfo("У курсора другое слово — переворот отменён")
+                return false
+            }
+        } else {
+            logLine("force-flip verify: экран не читается — стираю вслепую (паритет C#)")
+        }
         screenProbe()
         TextConverter.sendBackspaces(word.count + trailLen)
         TextConverter.sendUnicode(best.text)
@@ -1797,9 +1861,10 @@ public final class Engine {
             return
         }
         // свежее последнее слово (≤10 с, разделитель известен, то же приложение) —
-        // точный переворот куском [слово+разд]
+        // точный переворот куском [слово+разд]; забой после слова — доверие снято
+        // (бой 23.10.2026: стёртое юзером слово флипался «по памяти» и ел соседние)
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
-            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 {
+            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 && lastBsAt <= lastWordAt {
             logLine("caramba-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
             _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true, skipLearn: true)
             return
