@@ -1489,6 +1489,26 @@ public final class Engine {
             logLine("convert: dict-over-score ('\(cur.text)' -> '\(bestText)')")
         }
 
+        // ЗНАК-ДВОЙНИК ВНУТРИ НАБРАННОГО ('buhf.cm': '.' — это «ю» в RU): в настоящем
+        // английском точка/запятая/апостроф внутри «слова» почти невозможна — это
+        // русский текст с б/ю/ж/э, набранный в EN-раскладке (Caramba: «невозможность
+        // знака»). Цель чисто буквенная и возможная по корпусу → конвертим без словаря
+        // и без запаса скора. НО НЕ если буквенное ядро — настоящее EN-слово:
+        // 'twitter,' — это слово+запятая, а не русский текст с «б» на конце.
+        // Порт C# (d7470ab; порог 5 букв — 38aada3: короткие четвёрки-мусоры
+        // биграммами больше не спасаются). ПРАВИЛО ОТСУТСТВОВАЛО В МАКЕ — найдено
+        // сравнением с Windows 01.11
+        let bestCore = LanguageTables.lettersOnly(bestText)
+        if !pass && !acceptedWord && cur.lang == 1 && best.lang == 0 &&
+            cur.text.contains(where: { ",.;'".contains($0) }) &&
+            bestText == bestCore &&
+            LanguageTables.possibleWord(bestCore, 0) &&
+            !WordDict.has(LanguageTables.lettersOnly(cur.text), 1) &&
+            bestCore.count >= 5 {
+            pass = true
+            logLine("convert: punct-twin signal ('\(cur.text)' -> '\(bestText)')")
+        }
+
         // цель не словарная (только «возможная» по биграммам): авто-переворот
         // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
         // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
