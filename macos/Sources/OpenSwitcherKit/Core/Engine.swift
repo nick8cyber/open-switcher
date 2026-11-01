@@ -682,8 +682,11 @@ public final class Engine {
             if isPress {
                 anyKeySinceShift = true
                 if code != tapVk { tapAlone = false }
-                buf.clear() // Option — не набор (паритет с прочими модификаторами)
-                prevSingle = nil; boundaryClean = false // дальше — сочетание: текст у каретки неизвестен
+                // Буфер НЕ чистим: голый тап Option = «переверни слово, которое я
+                // печатаю прямо сейчас» (Caramba). Чистка на down убивала живой
+                // путь: тап посреди слова (ещё без пробела) всегда отказывал —
+                // 4 отказа подряд 30-31.10 ('no fresh word') при живом буфере.
+                // Чужие сочетания гасятся disarm'ом в keyDown и веткой alt-буквы.
                 // армим только голый Option: зажатые Ctrl/Cmd/Shift — чужое сочетание
                 let mOpt = heldModsFromFlags(flags)
                 if s.optionFlip && !mOpt.ctrl && !mOpt.cmd && !flags.contains(.maskShift) {
@@ -691,6 +694,8 @@ public final class Engine {
                     optTapDownAt = now
                 } else {
                     optTapVk = 0
+                    buf.clear() // Option-чорд — не набор
+                    prevSingle = nil; boundaryClean = false
                 }
             } else {
                 fireOptionTapIfArmed(code: code, now: now, flags: flags)
@@ -879,8 +884,8 @@ public final class Engine {
         if now < suppressUntil {
             // suppress-окно: конвертация запрещена, но буфер синхронизируем
             if KeyCodeMap.isLetterKey(code) {
-                // Cmd/Ctrl+буква — команда, не текст: буфер под ноль (как в основной ветке)
-                if m.cmd || m.ctrl {
+                // Cmd/Ctrl/Alt+буква — команда/спецзнак, не текст: буфер под ноль (как в основной ветке)
+                if m.cmd || m.ctrl || m.alt {
                     buf.clear(); lastWordSepKey = 0
                     prevSingle = nil; boundaryClean = false
                 } else {
@@ -1038,11 +1043,12 @@ public final class Engine {
         if isExcludedHere() { buf.clear(); return true }
 
         if KeyCodeMap.isLetterKey(code) {
-            // Cmd/Ctrl+буква — сочетание-команда, а не текст (Cmd+A/C/V/Z, Ctrl+A):
-            // после него текст у каретки ненадёжен — как Tab/Esc, буфер под ноль.
-            // Пушить букву нельзя: фантомная «ф» от Cmd+A собирала «фты» -> 'ans'
-            // и переворачивала раскладку пинг-понгом (бой 23:31)
-            if m.cmd || m.ctrl {
+            // Cmd/Ctrl/Alt+буква — сочетание-команда или спецзнак (Cmd+A/C/V/Z,
+            // Option+буква = ™/œ/…), а не текст: после него текст у каретки
+            // ненадёжен — как Tab/Esc, буфер под ноль. Пушить букву нельзя:
+            // фантомная «ф» от Cmd+A собирала «фты» -> 'ans' и переворачивала
+            // раскладку пинг-понгом (бой 23:31)
+            if m.cmd || m.ctrl || m.alt {
                 buf.clear(); lastWordSepKey = 0
                 prevSingle = nil; boundaryClean = false
                 return true
