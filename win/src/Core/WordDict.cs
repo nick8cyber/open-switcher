@@ -139,13 +139,17 @@ namespace OpenSwitcher.Core
         /// 'смотри' (1), 'првиет' → 'привет' (2 — смежная транспозиция = 2 замены).
         /// Умный режим (решение владельца 01.11, порт mac 469df98). Пороги против
         /// «погрешности»: 1 замена — от 4 букв, 2 замены — от 6; маржа скора —
-        /// 1x для dist1, 2x для dist2 (решение о марже — в ворота Engine).</summary>
-        public static (string Neighbor, int Dist)? DictNeighbor(string word, int lang, int maxSubs)
+        /// 1x для dist1, 2x для dist2 (решение о марже — в ворота Engine).
+        /// ВНИМАНИЕ: сборка — легаси csc .NET 4.0 (C# 5): без туплов, out var,
+        /// ?. и интерполяции (build.cmd, release.yml).</summary>
+        public static string DictNeighbor(string word, int lang, int maxSubs, out int dist)
         {
+            dist = 0;
             if (string.IsNullOrEmpty(word)) return null;
             string w = word.Trim().ToLowerInvariant();
             if (w.Length < 4 || w.Length > 16) return null;
-            if (!Alphabets.TryGetValue(lang, out var alphabet)) return null;
+            char[] alphabet;
+            if (!Alphabets.TryGetValue(lang, out alphabet)) return null;
             var chars = w.ToCharArray();
             if (maxSubs >= 1)
             {
@@ -157,7 +161,7 @@ namespace OpenSwitcher.Core
                         if (ch == orig) continue;
                         chars[i] = ch;
                         string candidate = new string(chars);
-                        if (Has(candidate, lang)) { chars[i] = orig; return (candidate, 1); }
+                        if (Has(candidate, lang)) { chars[i] = orig; dist = 1; return candidate; }
                     }
                     chars[i] = orig;
                 }
@@ -178,7 +182,11 @@ namespace OpenSwitcher.Core
                                 chars[i] = ch1;
                                 chars[j] = ch2;
                                 string candidate = new string(chars);
-                                if (Has(candidate, lang)) { chars[i] = oi; chars[j] = oj; return (candidate, 2); }
+                                if (Has(candidate, lang))
+                                {
+                                    chars[i] = oi; chars[j] = oj;
+                                    dist = 2; return candidate;
+                                }
                             }
                         }
                         chars[i] = oi; chars[j] = oj;

@@ -1416,7 +1416,7 @@ namespace OpenSwitcher.Core
             // Исключения: ручной путь (Break/Ctrl+Space) и выученные пары (accepted) —
             // их юзер подтвердил руками.
             // Кулдаун после ручной правки — первым делом (до рендера раскладок)
-            (string Neighbor, int Dist)? fuzzyNeighbor = null; // умный режим: цель ≈ словарное слово на дистанции 1-2
+            string fuzzyNeighbor = null; int fuzzyDist = 2; // умный режим: цель ≈ словарное слово на дистанции 1-2 (C# 5: без туплов)
             if (!manual && !acceptedWord)
             {
                 if (unchecked(Environment.TickCount - _noFlipUntil) < 0)
@@ -1465,14 +1465,14 @@ namespace OpenSwitcher.Core
                     if (core.Length >= 4 && !WordDict.Has(curCore, cur.Lang) &&
                         !(curCore.Length >= 3 && LanguageTables.PossibleWord(curCore, cur.Lang)))
                     {
-                        fuzzyNeighbor = WordDict.DictNeighbor(core, best.Lang, 2);
+                        fuzzyNeighbor = WordDict.DictNeighbor(core, best.Lang, 2, out fuzzyDist);
                     }
                     if (fuzzyNeighbor == null)
                     {
                         Log("convert skip: target-not-in-dict ('" + cur.Text + "' -> '" + best.Text + "')");
                         return false;
                     }
-                    Log("convert: fuzzy-target ('" + best.Text + "' ~= '" + fuzzyNeighbor.Value.Neighbor + "' dist" + fuzzyNeighbor.Value.Dist + ")");
+                    Log("convert: fuzzy-target ('" + best.Text + "' ~= '" + fuzzyNeighbor + "' dist" + fuzzyDist + ")");
                 }
                 // ВНИМАНИЕ: «набранное — возможное русское слово» здесь проверять НЕЛЬЗЯ —
                 // wrong-layout набор ('руддщ', 'ghbdtn') тоже состоит из валидных русских
@@ -1537,8 +1537,8 @@ namespace OpenSwitcher.Core
                 !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
             {
                 // словарная цель — обычный порог; умный режим: dist1 — 1x (сильный
-                // сигнал), dist2 — 2x (слабее — полный запас несловарной цели)
-                double need = ((fuzzyNeighbor?.Dist ?? 2) == 1 ? 1 : 2) * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
+                // сигнал), dist2/нет — 2x (полный запас несловарной цели)
+                double need = (fuzzyDist == 1 ? 1 : 2) * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
                 if (best.Score - cur.Score < need)
                 {
                     Log("convert skip: non-dict margin ('" + cur.Text + "' -> '" + best.Text + "')");
