@@ -97,6 +97,11 @@ namespace OpenSwitcher.Core
         private static readonly HashSet<string> RuBig = Make(WordData.RuAll);
         private static readonly HashSet<string> EnBig = Make(WordData.EnAll);
 
+        /// <summary>Расширенное МЕМБЕРСТВО (WordDataHuge: топ 200k RU / 150k EN, ADR-003).
+        /// На PossibleWord не влияет — биграммы только из WordData.</summary>
+        private static readonly HashSet<string> RuHuge = Make(WordDataHuge.RuHugeAll);
+        private static readonly HashSet<string> EnHuge = Make(WordDataHuge.EnHugeAll);
+
         private static HashSet<string> Make(string src)
         {
             var set = new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
@@ -109,13 +114,18 @@ namespace OpenSwitcher.Core
         }
 
         /// <summary>Есть ли слово (в нижнем регистре) в словаре языка: 0 = ru, 1 = en.</summary>
+        /// <summary>Решения v3 — исключены навсегда (расширения словаря их не возвращают):
+        /// 'iban' — RU-прочтение с тех же клавиш = «шифт» (96f7c2b).</summary>
+        private static readonly HashSet<string> V3Removed = new HashSet<string> { "iban" };
+
         public static bool Has(string word, int lang)
         {
             if (string.IsNullOrEmpty(word)) return false;
             string w = word.Trim().ToLowerInvariant();
             if (w.Length < 2) return false;
-            if (lang == 0) return Ru.Contains(w) || RuBig.Contains(w);
-            if (lang == 1) return En.Contains(w) || EnBig.Contains(w);
+            if (V3Removed.Contains(w)) return false;
+            if (lang == 0) return Ru.Contains(w) || RuBig.Contains(w) || RuHuge.Contains(w);
+            if (lang == 1) return En.Contains(w) || EnBig.Contains(w) || EnHuge.Contains(w);
             return false;
         }
 

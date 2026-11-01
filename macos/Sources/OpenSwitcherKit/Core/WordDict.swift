@@ -71,9 +71,21 @@ public enum WordDict {
     static let ru: Set<String> = Make(ruSrc)
     static let en: Set<String> = Make(enSrc)
 
-    /// Частотники OpenSubtitles (RU 35k / EN 20k) — WordData, покрывают живую лексику
+    /// Частотники OpenSubtitles (RU 35k / EN 20k) — WordData, покрывают живую лексику.
+    /// Этот же корпус — источник биграмм possibleWord (НЕ расширять без нужды:
+    /// «глубокий мусор» умного режима обязан быть биграммно невозможным)
     static let ruBig: Set<String> = Make(WordData.ruAll)
     static let enBig: Set<String> = Make(WordData.enAll)
+
+    /// Расширенное МЕМБЕРСТВО (WordDataHuge: топ 200k RU / 150k EN OpenSubtitles,
+    /// ADR-003): редкие/книжные/профессиональные слова. На possibleWord не влияет
+    static let ruHuge: Set<String> = Make(WordDataHuge.ruHugeAll)
+    static let enHuge: Set<String> = Make(WordDataHuge.enHugeAll)
+
+    /// Решения v3 — исключены из словаря НАВСЕГДА, любые расширения их не
+    /// возвращают: 'iban' — его RU-прочтение с тех же клавиш = «шифт», слово
+    /// переворачивалось в 'iban' при каждом наборе (96f7c2b)
+    static let v3Removed: Set<String> = ["iban"]
 
     /// Однобуквенные слова языка (предлоги/союзы) — «неприкасаемые» Caramba
     static let ruSingles = "аивкосуя"
@@ -100,8 +112,9 @@ public enum WordDict {
         if word.isEmpty { return false }
         let w = word.trimmingCharacters(in: .whitespaces).lowercased()
         if w.count < 2 { return false }
-        if lang == 0 { return ru.contains(w) || ruBig.contains(w) }
-        if lang == 1 { return en.contains(w) || enBig.contains(w) }
+        if v3Removed.contains(w) { return false }
+        if lang == 0 { return ru.contains(w) || ruBig.contains(w) || ruHuge.contains(w) }
+        if lang == 1 { return en.contains(w) || enBig.contains(w) || enHuge.contains(w) }
         return false
     }
 

@@ -101,6 +101,12 @@ public enum SelfTest {
             ("fuzzy-дискр: 'hellp' possible EN", LanguageTables.possibleWord("hellp", 1), true),
             ("fuzzy-дискр: 'cvjmhb' не possible", LanguageTables.possibleWord("cvjmhb", 1), false),
             ("fuzzy-дискр: 'смоьри' не possible", LanguageTables.possibleWord("смоьри", 0), false),
+            // расширенное членство (ADR-003): редкие слова — в Huge, НЕ в старом топе
+            ("huge: 'перкуссия' в словаре",      WordDict.has("перкуссия", 0), true),
+            ("huge: 'каллиграфия' в словаре",    WordDict.has("каллиграфия", 0), true),
+            ("huge: 'callback' в словаре",       WordDict.has("callback", 1), true),
+            ("huge: 'перкуссия' НЕ в старом топе", !WordDict.ruBig.contains("перкуссия"), true),
+            ("huge: возможное не сломано ('кшмрре')", LanguageTables.possibleWord("кшмрре", 0), false),
         ]
         for (name, got, want) in v3checks {
             let pass = got == want
