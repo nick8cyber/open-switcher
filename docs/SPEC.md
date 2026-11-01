@@ -233,6 +233,12 @@ function try_convert(word_keys, sep_vk, sep_shift, manual):
 
 ```
 screen_gate([retro_prefix] + cur_text)   # ГЕЙТ ПО ЭКРАНУ (mac, 86aba4a):
+                                     # + ретрай 60 мс и допуск недостающего
+                                     # хвоста (≤2 последних букв и ≤ половины
+                                     # слова) — AX-снимок Electron отстаёт от
+                                     # поля (бой 22:28 'lf ltkfq': гейт видел
+                                     # 'l'/'ltkf'); недостающие буквы уже в
+                                     # очереди приложения (FIFO)
                                      # хвост у каретки (AX value + SelectedTextRange,
                                      # UTF-16-единицы; с потока тапа — семафорный
                                      # заход на main) обязан равняться тому, что

@@ -1308,6 +1308,36 @@ public final class Engine {
         return box ?? nil
     }
 
+    /// Верификация хвоста для инжекции: однократное чтение AX может отставать
+    /// от поля (Electron/Chromium обновляют AX-дерево с лагом: бой 22:28 'lf
+    /// ltkfq' — гейт видел 'l'/'ltkf' и зря отказывал; 04:57 'cltkf'/'cltkfq').
+    /// Схема: прочитали → не совпало → пауза 60 мс и повтор → всё ещё не
+    /// совпало → допуск НЕДОСТАЮЩЕГО хвоста (не более 2 последних букв и не
+    /// более половины слова): недостающие буквы уже в очереди приложения,
+    /// posted-события доставляются ПОСЛЕ накопленных (FIFO) — к моменту
+    /// исполнения забоёв поле кончится полным словом. Доступность/совпадение
+    /// — та же форма, что у screenTailAtCaret (drop-in для всех гейтов).
+    private func verifyTailForInjection(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
+        let first = screenTailAtCaret(expectedTail)
+        if !first.available { return (false, false, first.actual) }
+        if first.matches { return (true, true, first.actual) }
+        usleep(60_000)
+        let second = screenTailAtCaret(expectedTail)
+        if second.available && second.matches { return (true, true, second.actual) }
+        let best = second.available ? second : first
+        let n = expectedTail.count
+        var k = n - 1
+        let kMin = max(1, n - 2, (n + 1) / 2)
+        while k >= kMin {
+            if best.actual.hasSuffix(String(expectedTail.prefix(k))) {
+                logLine("verify: принят хвост с лагом AX (совпадение \(k)/\(n)) — недостающее в очереди приложения")
+                return (true, true, best.actual)
+            }
+            k -= 1
+        }
+        return (true, false, best.actual)
+    }
+
     /// Хвост у каретки по экрану (AX): совпадает ли с тем, что собираемся стереть.
     /// AX-запросы допустимы только с main: с потока тапа — семафорный заход на main
     /// (main нигде не ждёт поток тапа — deadlock невозможен). available=false —
@@ -1597,7 +1627,7 @@ public final class Engine {
         // доставится обычным путём (converted=false), юзер перевернёт руками.
         // Экран не читается (AX молчит) — инжектируем как раньше (паритет C#).
         let expectedTail = retroPrefix + cur.text
-        let gate = screenTailAtCaret(expectedTail)
+        let gate = verifyTailForInjection(expectedTail)
         if gate.available {
             if gate.matches {
                 logLine("convert verify: хвост '\(expectedTail)' у каретки подтверждён")
@@ -1759,7 +1789,7 @@ public final class Engine {
         // гейт по экрану (паритет с флипом/авто-заменой): откат стирает [префикс+слово+
         // знак+хвост] — до 16+ символов хвоста; при расхождении памяти тапа с полем
         // вслепую стирал соседние слова. Не совпало — отказ без инжекции
-        let gate = screenTailAtCaret(restore)
+        let gate = verifyTailForInjection(restore)
         if gate.available {
             if gate.matches {
                 logLine("undo verify: хвост '\(restore)' у каретки подтверждён")
@@ -1891,7 +1921,7 @@ public final class Engine {
         // не совпало — честный отказ без инжекции. Экран не читается (AX молчит,
         // как в telegram) — работаем как раньше, вслепую (паритет C#).
         let expectedTail = cur.text + trailTyped
-        let gate = screenTailAtCaret(expectedTail)
+        let gate = verifyTailForInjection(expectedTail)
         if gate.available {
             if gate.matches {
                 logLine("force-flip verify: хвост '\(expectedTail)' у каретки подтверждён")
