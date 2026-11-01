@@ -393,6 +393,7 @@ public final class Engine {
 
     private func tapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            logLine("tap DISABLED by system (\(type == .tapDisabledByTimeout ? "timeout" : "user input")) — events were LOST, reviving") // момент потери событий: память разошлась с полем, все гейты это видят
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             // события могли быть потеряны пока тап был мёртв — parity flagsChanged
             // инвертирован: сбрасываем, иначе отпускание читается как нажатие и
@@ -1699,6 +1700,21 @@ public final class Engine {
         let bs = undoPrefixLen + undoLen + undoTail.count // undoLen уже с досланным знаком (раньше force-flip считал его дважды и съедал символ перед словом)
         let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
         let restore = undoPrefix + undoText + undoSepText + tailText
+        // гейт по экрану (паритет с флипом/авто-заменой): откат стирает [префикс+слово+
+        // знак+хвост] — до 16+ символов хвоста; при расхождении памяти тапа с полем
+        // вслепую стирал соседние слова. Не совпало — отказ без инжекции
+        let gate = screenTailAtCaret(restore)
+        if gate.available {
+            if gate.matches {
+                logLine("undo verify: хвост '\(restore)' у каретки подтверждён")
+            } else {
+                logLine("undo REFUSED: у каретки '\(gate.actual)' вместо '\(restore)' — стирание по памяти отменено")
+                fireInfo("Откат невозможен — текст у курсора не совпадает")
+                return
+            }
+        } else {
+            logLine("undo verify: экран не читается — откат вслепую (паритет C#)")
+        }
         suppress(0.6)
         screenProbe()
         TextConverter.sendBackspaces(bs)
