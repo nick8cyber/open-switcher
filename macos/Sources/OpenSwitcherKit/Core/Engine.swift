@@ -1526,6 +1526,26 @@ public final class Engine {
         let retroText = retroFrom != nil ? retroTo + " " : "" // «а␣» — чем заменяем
         let retroLog = retroFrom != nil ? " (+retro '" + (retroFrom ?? "") + "' -> '" + retroTo + "')" : ""
 
+        // ГЕЙТ ПО ЭКРАНУ перед стиранием (регулярные стирания слов у юзера, бой
+        // 23.10 23:20): память мак-тапа расходится с реальным вводом (события
+        // теряются), и вслепую посчитанные backspace'ы стирают соседние слова
+        // НАСОВСЕМ. Сверяем хвост у каретки с тем, что собираемся стереть;
+        // не совпало — отказ без инжекции: слово остаётся как набрано, разделитель
+        // доставится обычным путём (converted=false), юзер перевернёт руками.
+        // Экран не читается (AX молчит) — инжектируем как раньше (паритет C#).
+        let expectedTail = retroPrefix + cur.text
+        let gate = screenTailAtCaret(expectedTail)
+        if gate.available {
+            if gate.matches {
+                logLine("convert verify: хвост '\(expectedTail)' у каретки подтверждён")
+            } else {
+                logLine("convert REFUSED: у каретки '\(gate.actual)' вместо '\(expectedTail)' — стирание по памяти отменено")
+                return false
+            }
+        } else {
+            logLine("convert verify: экран не читается — инжектирую вслепую (паритет C#)")
+        }
+
         lastWordSepKey = 0 // ручной/беспраздельный путь: точный force-flip разоружаем (C#:1236)
         // bs= и app= в лог: сколько символов стирается и КУДА ушла инжекция —
         // «определил, но не заменил» = целевой процесс не съел инжекцию
