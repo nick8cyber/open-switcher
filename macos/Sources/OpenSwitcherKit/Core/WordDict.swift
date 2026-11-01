@@ -110,20 +110,42 @@ public enum WordDict {
         1: Array("abcdefghijklmnopqrstuvwxyz"),
     ]
 
-    /// Словарное слово на дистанции ровно 1 (ЗАМЕНА одной буквы): 'смоьри' → 'смотри'.
-    /// Умный режим (решение владельца 01.11): цель с одной опечаткой — переворот
-    /// всё равно. Замена без вставок/удалений + порог 4 буквы — минимизация
-    /// ложных срабатываний («погрешности»).
-    public static func neighborAtDistance1(_ word: String, _ lang: Int) -> String? {
+    /// Словарное слово на дистанции ≤ maxSubs (ТОЛЬКО замены букв): 'смоьри' →
+    /// 'смотри' (1), 'првиет' → 'привет' (2 — смежная транспозиция = 2 замены).
+    /// Умный режим (решение владельца 01.11; дистанция 2 — там же вечером).
+    /// Пороги против «погрешности»: 1 замена — от 4 букв, 2 замены — от 6
+    /// (для коротких две замены — полслова, сходство теряет смысл); возврат —
+    /// сосед и дистанция (1 → маржа скора 1x, 2 → маржа 2x).
+    public static func dictNeighbor(_ word: String, _ lang: Int, maxSubs: Int) -> (neighbor: String, dist: Int)? {
         let w = Array(word.lowercased())
         guard w.count >= 4, w.count <= 16, let alphabet = alphabets[lang] else { return nil }
-        for i in w.indices {
-            let orig = w[i]
-            for ch in alphabet where ch != orig {
-                var candidate = w
-                candidate[i] = ch
-                let s = String(candidate)
-                if has(s, lang) { return s }
+        if maxSubs >= 1 {
+            for i in w.indices {
+                let orig = w[i]
+                for ch in alphabet where ch != orig {
+                    var c = w
+                    c[i] = ch
+                    let s = String(c)
+                    if has(s, lang) { return (s, 1) }
+                }
+            }
+        }
+        if maxSubs >= 2, w.count >= 6 {
+            for i in w.indices {
+                let oi = w[i]
+                for j in w.indices where j > i {
+                    let oj = w[j]
+                    for ch1 in alphabet {
+                        for ch2 in alphabet {
+                            if ch1 == oi && ch2 == oj { continue } // обе на месте — это dist 0
+                            var c = w
+                            c[i] = ch1
+                            c[j] = ch2
+                            let s = String(c)
+                            if has(s, lang) { return (s, 2) }
+                        }
+                    }
+                }
             }
         }
         return nil

@@ -125,28 +125,55 @@ namespace OpenSwitcher.Core
             { 1, "abcdefghijklmnopqrstuvwxyz".ToCharArray() },
         };
 
-        /// <summary>Словарное слово на дистанции ровно 1 (ЗАМЕНА одной буквы): 'смоьри' → 'смотри'.
-        /// Умный режим (решение владельца 01.11, порт mac 469df98): цель с одной
-        /// опечаткой — переворот всё равно. Только замена (без вставок/удалений)
-        /// и порог 4 буквы — минимизация ложных срабатываний.</summary>
-        public static string NeighborAtDistance1(string word, int lang)
+        /// <summary>Словарное слово на дистанции ≤ maxSubs (ТОЛЬКО замены букв): 'смоьри' →
+        /// 'смотри' (1), 'првиет' → 'привет' (2 — смежная транспозиция = 2 замены).
+        /// Умный режим (решение владельца 01.11, порт mac 469df98). Пороги против
+        /// «погрешности»: 1 замена — от 4 букв, 2 замены — от 6; маржа скора —
+        /// 1x для dist1, 2x для dist2 (решение о марже — в ворота Engine).</summary>
+        public static (string Neighbor, int Dist)? DictNeighbor(string word, int lang, int maxSubs)
         {
             if (string.IsNullOrEmpty(word)) return null;
             string w = word.Trim().ToLowerInvariant();
             if (w.Length < 4 || w.Length > 16) return null;
             if (!Alphabets.TryGetValue(lang, out var alphabet)) return null;
             var chars = w.ToCharArray();
-            for (int i = 0; i < chars.Length; i++)
+            if (maxSubs >= 1)
             {
-                char orig = chars[i];
-                foreach (char ch in alphabet)
+                for (int i = 0; i < chars.Length; i++)
                 {
-                    if (ch == orig) continue;
-                    chars[i] = ch;
-                    string candidate = new string(chars);
-                    if (Has(candidate, lang)) { chars[i] = orig; return candidate; }
+                    char orig = chars[i];
+                    foreach (char ch in alphabet)
+                    {
+                        if (ch == orig) continue;
+                        chars[i] = ch;
+                        string candidate = new string(chars);
+                        if (Has(candidate, lang)) { chars[i] = orig; return (candidate, 1); }
+                    }
+                    chars[i] = orig;
                 }
-                chars[i] = orig;
+            }
+            if (maxSubs >= 2 && chars.Length >= 6)
+            {
+                for (int i = 0; i < chars.Length; i++)
+                {
+                    char oi = chars[i];
+                    for (int j = i + 1; j < chars.Length; j++)
+                    {
+                        char oj = chars[j];
+                        foreach (char ch1 in alphabet)
+                        {
+                            foreach (char ch2 in alphabet)
+                            {
+                                if (ch1 == oi && ch2 == oj) continue; // обе на месте — dist 0
+                                chars[i] = ch1;
+                                chars[j] = ch2;
+                                string candidate = new string(chars);
+                                if (Has(candidate, lang)) { chars[i] = oi; chars[j] = oj; return (candidate, 2); }
+                            }
+                        }
+                        chars[i] = oi; chars[j] = oj;
+                    }
+                }
             }
             return null;
         }

@@ -1457,7 +1457,7 @@ public final class Engine {
         }
 
         var bestText = best.text
-        var fuzzyNeighbor: String? = nil // умный режим: цель ≈ словарное слово на дистанции 1
+        var fuzzyNeighbor: (neighbor: String, dist: Int)? = nil // умный режим: цель ≈ словарное слово на дистанции 1-2
         if !manual && !acceptedWord {
             // хвостовая клавиша-«двойник» (б/ю/ж/э в конце слова): пробуем трактовать её
             // как ЗНАК — «ghbdtn,» должно стать «привет,», а не «приветб». Если
@@ -1481,24 +1481,25 @@ public final class Engine {
             if !WordDict.has(core, best.lang) &&
                 (core.count < 3 || !LanguageTables.possibleWord(core, best.lang)) {
                 // УМНЫЙ РЕЖИМ (решение владельца 01.11): цель — словарное слово с
-                // ОДНОЙ опечаткой (замена одной буквы: 'смоьри' ≈ 'смотри', бой
-                // 17:29 'cvjmhb'), набранное — глубокий мусор своего языка (не
+                // опечаткой в 1-2 буквы (только замены: 'смоьри' ≈ 'смотри' —
+                // dist1, бой 17:29 'cvjmhb'; 'првиет' ≈ 'привет' — dist2, смежная
+                // транспозиция), набранное — глубокий мусор своего языка (не
                 // словарное И по биграммам невозможное: 'hellp' — possibleWord,
                 // это опечатка EN-слова и НЕ трогается). Переворот всё равно,
                 // буквы сохраняются как набраны — опечатку правит юзер. Защита
-                // от «погрешности»: порог 4 буквы, только замена, 1x-запас скора
-                // вместо 2x (margin-гейт ниже)
+                // от «погрешности»: dist1 от 4 букв, dist2 от 6; маржа скора —
+                // 1x для dist1, 2x для dist2 (margin-гейт ниже)
                 let curCore = LanguageTables.lettersOnly(cur.text)
                 if core.count >= 4,
                    !WordDict.has(curCore, cur.lang),
                    !(curCore.count >= 3 && LanguageTables.possibleWord(curCore, cur.lang)) {
-                    fuzzyNeighbor = WordDict.neighborAtDistance1(core, best.lang)
+                    fuzzyNeighbor = WordDict.dictNeighbor(core, best.lang, maxSubs: 2)
                 }
-                guard let neighbor = fuzzyNeighbor else {
+                guard let fuzzy = fuzzyNeighbor else {
                     logLine("convert skip: target-not-in-dict ('\(bestText)')")
                     return false
                 }
-                logLine("convert: fuzzy-target ('\(bestText)' ≈ '\(neighbor)' dist1)")
+                logLine("convert: fuzzy-target ('\(bestText)' ≈ '\(fuzzy.neighbor)' dist\(fuzzy.dist))")
             }
         }
 
@@ -1550,9 +1551,9 @@ public final class Engine {
         // «both-not-in-dict» опечаточный мусор пропускал)
         if pass && !acceptedWord &&
             !WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) {
-            // словарная цель — обычный порог; умный режим (сосед на дистанции 1)
-            // — 1x вместо 2x: сосед даёт уверенность, но скор всё же проверяется
-            let need = (fuzzyNeighbor != nil ? 1 : 2) * LanguageTables.baseMargin / max(0.3, s.sensitivity)
+            // словарная цель — обычный порог; умный режим: dist1 — 1x (сильный
+            // сигнал), dist2 — 2x (слабее — полный запас несловарной цели)
+            let need = ((fuzzyNeighbor?.dist ?? 2) == 1 ? 1 : 2) * LanguageTables.baseMargin / max(0.3, s.sensitivity)
             if best.score - cur.score < need {
                 logLine("convert skip: non-dict margin ('\(cur.text)' -> '\(bestText)')")
                 return false

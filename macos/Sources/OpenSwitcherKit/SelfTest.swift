@@ -88,10 +88,13 @@ public enum SelfTest {
             ("possible: 'pfgectnb' EN-пар",    LanguageTables.possibleWord("pfgectnb", 1), true),
             ("dict v3: 'нажимал' в корпусе",   WordDict.has("нажимал", 0), true),
             ("dict v3: 'iban' удалён",         WordDict.has("iban", 1), false),
-            // умный режим (решение владельца 01.11): цель с одной опечаткой
-            ("fuzzy: 'смоьри' ≈ сосед (смотри)", WordDict.neighborAtDistance1("смоьри", 0) != nil, true),
-            ("fuzzy: 'hellp' ≈ сосед (hello)",   WordDict.neighborAtDistance1("hellp", 1) != nil, true),
-            ("fuzzy: 'cvjmhb' — соседа нет",     WordDict.neighborAtDistance1("cvjmhb", 1) == nil, true),
+            // умный режим (решение владельца 01.11): цель с опечаткой 1-2 буквы
+            ("fuzzy: 'смоьри' dist1 сосед",      WordDict.dictNeighbor("смоьри", 0, maxSubs: 2)?.dist == 1, true),
+            ("fuzzy: 'hellp' dist1 сосед",       WordDict.dictNeighbor("hellp", 1, maxSubs: 2)?.dist == 1, true),
+            ("fuzzy: 'првиет' dist2 (транспоз)", WordDict.dictNeighbor("првиет", 0, maxSubs: 2)?.dist == 2, true),
+            ("fuzzy: 'пкивед' dist2-сосед (6 букв)", WordDict.dictNeighbor("пкивед", 0, maxSubs: 2)?.dist == 2, true),
+            ("fuzzy: dist2 не ищется <6 букв",   WordDict.dictNeighbor("пкиве", 0, maxSubs: 2)?.neighbor == WordDict.dictNeighbor("пкиве", 0, maxSubs: 1)?.neighbor, true),
+            ("fuzzy: dist1-поиск не находит dist2-слово", WordDict.dictNeighbor("пкивед", 0, maxSubs: 1) == nil, true),
             // дискриминатор умного режима: опечатка СВОЕГО языка ('hellp') —
             // possible → НЕ трогается; чужеродный мусор ('cvjmhb') — невозможен
             // → переворот разрешён
