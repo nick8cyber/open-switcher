@@ -104,4 +104,28 @@ public enum WordDict {
         if lang == 1 { return en.contains(w) || enBig.contains(w) }
         return false
     }
+
+    private static let alphabets: [Int: [Character]] = [
+        0: Array("абвгдеёжзийклмнопрстуфхцчшщъыьэюя"),
+        1: Array("abcdefghijklmnopqrstuvwxyz"),
+    ]
+
+    /// Словарное слово на дистанции ровно 1 (ЗАМЕНА одной буквы): 'смоьри' → 'смотри'.
+    /// Умный режим (решение владельца 01.11): цель с одной опечаткой — переворот
+    /// всё равно. Замена без вставок/удалений + порог 4 буквы — минимизация
+    /// ложных срабатываний («погрешности»).
+    public static func neighborAtDistance1(_ word: String, _ lang: Int) -> String? {
+        let w = Array(word.lowercased())
+        guard w.count >= 4, w.count <= 16, let alphabet = alphabets[lang] else { return nil }
+        for i in w.indices {
+            let orig = w[i]
+            for ch in alphabet where ch != orig {
+                var candidate = w
+                candidate[i] = ch
+                let s = String(candidate)
+                if has(s, lang) { return s }
+            }
+        }
+        return nil
+    }
 }

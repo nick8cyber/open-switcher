@@ -88,6 +88,16 @@ public enum SelfTest {
             ("possible: 'pfgectnb' EN-пар",    LanguageTables.possibleWord("pfgectnb", 1), true),
             ("dict v3: 'нажимал' в корпусе",   WordDict.has("нажимал", 0), true),
             ("dict v3: 'iban' удалён",         WordDict.has("iban", 1), false),
+            // умный режим (решение владельца 01.11): цель с одной опечаткой
+            ("fuzzy: 'смоьри' ≈ сосед (смотри)", WordDict.neighborAtDistance1("смоьри", 0) != nil, true),
+            ("fuzzy: 'hellp' ≈ сосед (hello)",   WordDict.neighborAtDistance1("hellp", 1) != nil, true),
+            ("fuzzy: 'cvjmhb' — соседа нет",     WordDict.neighborAtDistance1("cvjmhb", 1) == nil, true),
+            // дискриминатор умного режима: опечатка СВОЕГО языка ('hellp') —
+            // possible → НЕ трогается; чужеродный мусор ('cvjmhb') — невозможен
+            // → переворот разрешён
+            ("fuzzy-дискр: 'hellp' possible EN", LanguageTables.possibleWord("hellp", 1), true),
+            ("fuzzy-дискр: 'cvjmhb' не possible", LanguageTables.possibleWord("cvjmhb", 1), false),
+            ("fuzzy-дискр: 'смоьри' не possible", LanguageTables.possibleWord("смоьри", 0), false),
         ]
         for (name, got, want) in v3checks {
             let pass = got == want
