@@ -1288,6 +1288,7 @@ public final class Engine {
                 self?.logLine("screen-after: '\(after)'")
                 if before == after && after != "?" {
                     self?.logLine("INJECTION NOT APPLIED: текст не изменился — цель не съела замену")
+                    self?.fireInfo("Замена не применилась этим приложением — переверни вручную") // 04:57: тап «молча не сработал» — юзер не знал почему
                 }
             }
         }
@@ -1866,6 +1867,7 @@ public final class Engine {
             }
         } else {
             logLine("force-flip verify: экран не читается — стираю вслепую (паритет C#)")
+            fireInfo("Переворот вслепую: \(cur.text) → \(best.text)") // единственное место, где гейт не видит текст — юзер должен знать
         }
         screenProbe()
         TextConverter.sendBackspaces(word.count + trailLen)
