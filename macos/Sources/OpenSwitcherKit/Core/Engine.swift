@@ -1294,6 +1294,20 @@ public final class Engine {
         }
     }
 
+    /// Выделенный текст фокусного элемента: с потока тапа — семафорный заход на
+    /// main (AX только там — инвариант TSM-краша fa5235a). nil/пусто — выделения нет.
+    private func selectedTextOnMain() -> String? {
+        if Thread.isMainThread { return PasswordGuard.selectedText() }
+        var box: String?? = nil
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            box = PasswordGuard.selectedText()
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 0.2)
+        return box ?? nil
+    }
+
     /// Хвост у каретки по экрану (AX): совпадает ли с тем, что собираемся стереть.
     /// AX-запросы допустимы только с main: с потока тапа — семафорный заход на main
     /// (main нигде не ждёт поток тапа — deadlock невозможен). available=false —
@@ -1922,6 +1936,15 @@ public final class Engine {
             logLine("caramba-flip: live buffer (\(buf.count) keys)")
             _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true, skipLearn: true)
             buf.clear() // флип живого буфера — буфер отработал
+            return
+        }
+        // выделение юзера — переворот ВЫДЕЛЕННОГО (двойной клик по слову + тап):
+        // мусорное слово может быть не последним или старше 10 с — точный путь
+        // его не достанет, а плашка отказа обещает «выдели и нажми ещё раз».
+        // Гейт вставки внутри (выделение == скопированному) уже стоит (69826de)
+        if buf.count == 0, let sel = selectedTextOnMain(), !sel.isEmpty, sel.count <= 200 {
+            logLine("caramba-flip: user selection ('\((sel.count > 30 ? String(sel.prefix(30)) + "…" : sel))')")
+            beginFixSelection(fromFixWord: false)
             return
         }
         // свежее последнее слово (≤10 с, разделитель известен, то же приложение) —
