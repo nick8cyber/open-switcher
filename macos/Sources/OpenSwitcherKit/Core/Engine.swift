@@ -24,6 +24,10 @@ public final class Engine {
     // точный переворот по памяти (lastWord) вслепую стирал чужой текст
     // (бой 23.10.2026 23:20: юзер стёр 'ujdyj', тап стёр 'весь ui - там ui' — 4 слова)
     private var lastBsAt: TimeInterval = 0
+    // свежая вставка (Cmd+V): paste в Electron коммитится асинхронно — инжекция
+    // в этом окне гонится с недокоммиченным текстом (боя 02:54; паритет: C# страдал
+    // тем же классом, но SendInput-порядок делал гонку невозможной)
+    private var lastPasteAt: TimeInterval = 0
     // ретро-флип одиночной буквы (§7, порт C#): 'f␣ns' -> «а ты». Одиночная буква + ровно один
     // пробел прямо перед текущим словом; слово конвертируется из ТОЙ ЖЕ раскладки — буква с ним
     private var prevSingle: [KeyRec]? = nil   // nil — кандидата нет
@@ -839,6 +843,9 @@ public final class Engine {
         // любой реальный забой двигает каретку влево — снимает доверие к
         // «слово+разд стоят прямо у каретки» (гейт точного переворота)
         if code == KeyCodeMap.backspace { lastBsAt = now }
+        // Cmd+V = вставка: поле Electron коммитит её асинхронно — инжекции
+        // дают дорогу (0.4 с), иначе гонка с недокоммиченным текстом
+        if m.cmd && code == KeyCodeMap.ansiCode(ofLatin: "v") { lastPasteAt = now }
 
         anyKeySinceShift = true
         // ЛЮБАЯ клавиша между нажатием и отпусканием тап-клавиши отменяет тап —
@@ -1626,6 +1633,13 @@ public final class Engine {
         // не совпало — отказ без инжекции: слово остаётся как набрано, разделитель
         // доставится обычным путём (converted=false), юзер перевернёт руками.
         // Экран не читается (AX молчит) — инжектируем как раньше (паритет C#).
+        // свежая Cmd+V-вставка: поле ещё асинхронно коммитит её — стирание
+        // сейчас гонится с недообработанным текстом (бой 02:54). Честный
+        // отказ: слово как набрано, переворот позже руками
+        if Engine.ms() - lastPasteAt < 0.4 {
+            logLine("convert skip: свежая вставка (paste race) — поле ещё коммитит")
+            return false
+        }
         let expectedTail = retroPrefix + cur.text
         let gate = verifyTailForInjection(expectedTail)
         if gate.available {
@@ -1920,6 +1934,11 @@ public final class Engine {
         // стёрли 4 чужих слова. Сверяем хвост у каретки с тем, что собираемся стереть;
         // не совпало — честный отказ без инжекции. Экран не читается (AX молчит,
         // как в telegram) — работаем как раньше, вслепую (паритет C#).
+        if Engine.ms() - lastPasteAt < 0.4 {
+            logLine("force-flip REFUSED: свежая вставка (paste race) — поле ещё коммитит")
+            fireInfo("Только что была вставка — переверни словом позже")
+            return false
+        }
         let expectedTail = cur.text + trailTyped
         let gate = verifyTailForInjection(expectedTail)
         if gate.available {

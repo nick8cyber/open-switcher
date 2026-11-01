@@ -16,11 +16,16 @@ public enum TextConverter {
 
     private static func post(_ event: CGEvent) {
         event.setIntegerValueField(userField, value: selfMagic)
-        if targetPid > 0 {
-            event.postToPid(targetPid)
-        } else {
-            event.post(tap: .cghidEventTap)
-        }
+        // ВОССТАНОВЛЕН паритет с C# SendInput: глобальная HID-очередь, событие
+        // встаёт СТРОГО после недообработанных клавиш юзера. PostToPid (порт
+        // v3 §16) вставлял события в голову очереди ПРИЛОЖЕНИЯ — в Electron
+        // с асинхронным paste-коммитом забои обгоняли его недообработанный
+        // ввод и СТИРАЛИ ЧУЖОЙ ТЕКСТ (бой 02:54: bs=7 по 'ybrfrb ' съел
+        // 'сам - opus 5.5 xhigh,'); там же — корень «INJECTION NOT APPLIED»
+        // (01:23): часть Electron-полей PostToPid-события не съедали вовсе.
+        // Риск cghidEventTap: смена окна в полёте уводит текст — покрывается
+        // suppress-окном и редкостью (окно не меняется за 100 мс инжекции)
+        event.post(tap: .cghidEventTap)
     }
 
     /// Отпустить все модификаторы физически не нужно — CGEvent-комбо несут свои флаги.

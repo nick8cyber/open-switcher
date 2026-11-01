@@ -554,7 +554,7 @@ ShouldConvert: margin = 0.22/max(0.3, sens); best+RowBoost < cur+margin → no;
 |---|---|
 | LL keyboard hook (WH_KEYBOARD_LL), swallow = вернуть **ненулевое** (1). `return 0` без CallNextHookEx клавишу НЕ блокирует — она доходит до приложения ПОСЛЕ инжекции из колбэка (эксперимент 29.09; так каждая конвертация давала 'привет␣␣') | **Активный** `CGEventTap` (`kCGEventTapOptionDefault`; listen-only НЕ умеет глотать); права Accessibility + Input Monitoring; ОС молча отключает тап по таймауту — watchdog пересоздаёт тап + `CGEventTapEnable` |
 | Распознавание своих инжекций (флаг 0x10) | приватный `CGEventSource` (свои события помечаются источником) |
-| SendInput / KEYEVENTF_UNICODE | `CGEventCreateKeyboardEvent` + `CGEventKeyboardSetUnicodeString`, post через `CGEventPostToPid` (PostToPSN устарел) |
+| SendInput / KEYEVENTF_UNICODE | `CGEventCreateKeyboardEvent` + `CGEventKeyboardSetUnicodeString`, post в `.cghidEventTap` — ГЛОБАЛЬНАЯ очередь, паритет SendInput. PostToPid ЗАПРЕЩЁН (боя 01.11 02:54: вставлял события в голову очереди приложения — в Electron забои обгоняли асинхронный paste-коммит и стирали чужой текст; там же корень «INJECTION NOT APPLIED» — часть полей PostToPid не съедали вовсе) + paste-гейт 0.4 с после Cmd+V |
 | Backspace-инжекция | `kVK_Delete` события |
 | WM_INPUTLANGCHANGEREQUEST | `TISSelectInputSource` (per-app input source); после смены проверять применение и иметь fallback |
 | Текущая раскладка чужого потока | `TISCopyCurrentKeyboardInputSource` (для чужого приложения — приблизительно, через frontmost) |
