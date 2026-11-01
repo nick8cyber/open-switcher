@@ -1416,6 +1416,7 @@ namespace OpenSwitcher.Core
             // Исключения: ручной путь (Break/Ctrl+Space) и выученные пары (accepted) —
             // их юзер подтвердил руками.
             // Кулдаун после ручной правки — первым делом (до рендера раскладок)
+            string fuzzyNeighbor = null; // умный режим: цель ≈ словарное слово на дистанции 1
             if (!manual && !acceptedWord)
             {
                 if (unchecked(Environment.TickCount - _noFlipUntil) < 0)
@@ -1453,8 +1454,25 @@ namespace OpenSwitcher.Core
                 if (!WordDict.Has(core, best.Lang) &&
                     (core.Length < 3 || !LanguageTables.PossibleWord(core, best.Lang)))
                 {
-                    Log("convert skip: target-not-in-dict ('" + cur.Text + "' -> '" + best.Text + "')");
-                    return false;
+                    // УМНЫЙ РЕЖИМ (решение владельца 01.11, порт mac 469df98): цель —
+                    // словарное слово с ОДНОЙ опечаткой (замена одной буквы:
+                    // 'смоьри' ≈ 'смотри'), набранное — глубокий мусор своего языка
+                    // (∉ словарь И не possible-word: опечатка своего языка 'hellp' —
+                    // possible-word и НЕ трогается). Переворот всё равно, буквы как
+                    // набраны (опечатку правит юзер); запас скора 1x вместо 2x ниже.
+                    // Порог 4 буквы, только замена — минимизация ложных срабатываний
+                    string curCore = LanguageTables.LettersOnly(cur.Text);
+                    if (core.Length >= 4 && !WordDict.Has(curCore, cur.Lang) &&
+                        !(curCore.Length >= 3 && LanguageTables.PossibleWord(curCore, cur.Lang)))
+                    {
+                        fuzzyNeighbor = WordDict.NeighborAtDistance1(core, best.Lang);
+                    }
+                    if (fuzzyNeighbor == null)
+                    {
+                        Log("convert skip: target-not-in-dict ('" + cur.Text + "' -> '" + best.Text + "')");
+                        return false;
+                    }
+                    Log("convert: fuzzy-target ('" + best.Text + "' ~= '" + fuzzyNeighbor + "' dist1)");
                 }
                 // ВНИМАНИЕ: «набранное — возможное русское слово» здесь проверять НЕЛЬЗЯ —
                 // wrong-layout набор ('руддщ', 'ghbdtn') тоже состоит из валидных русских
@@ -1518,7 +1536,8 @@ namespace OpenSwitcher.Core
             if (pass && !acceptedWord && !punctSignal &&
                 !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
             {
-                double need = 2 * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
+                // словарная цель — обычный порог; умный режим (сосед на дистанции 1) — 1x
+                double need = (fuzzyNeighbor != null ? 1 : 2) * LanguageTables.BaseMargin / Math.Max(0.3, S.Sensitivity);
                 if (best.Score - cur.Score < need)
                 {
                     Log("convert skip: non-dict margin ('" + cur.Text + "' -> '" + best.Text + "')");

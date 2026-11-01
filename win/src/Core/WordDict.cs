@@ -119,6 +119,38 @@ namespace OpenSwitcher.Core
             return false;
         }
 
+        private static readonly Dictionary<int, char[]> Alphabets = new Dictionary<int, char[]>
+        {
+            { 0, "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".ToCharArray() },
+            { 1, "abcdefghijklmnopqrstuvwxyz".ToCharArray() },
+        };
+
+        /// <summary>Словарное слово на дистанции ровно 1 (ЗАМЕНА одной буквы): 'смоьри' → 'смотри'.
+        /// Умный режим (решение владельца 01.11, порт mac 469df98): цель с одной
+        /// опечаткой — переворот всё равно. Только замена (без вставок/удалений)
+        /// и порог 4 буквы — минимизация ложных срабатываний.</summary>
+        public static string NeighborAtDistance1(string word, int lang)
+        {
+            if (string.IsNullOrEmpty(word)) return null;
+            string w = word.Trim().ToLowerInvariant();
+            if (w.Length < 4 || w.Length > 16) return null;
+            if (!Alphabets.TryGetValue(lang, out var alphabet)) return null;
+            var chars = w.ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+            {
+                char orig = chars[i];
+                foreach (char ch in alphabet)
+                {
+                    if (ch == orig) continue;
+                    chars[i] = ch;
+                    string candidate = new string(chars);
+                    if (Has(candidate, lang)) { chars[i] = orig; return candidate; }
+                }
+                chars[i] = orig;
+            }
+            return null;
+        }
+
         // однобуквенные слова языка (предлоги/союзы/местоимения) — Caramba «неприкасаемые»
         private const string RuSingles = "аивкосуя";
         private const string EnSingles = "ai";
