@@ -66,6 +66,22 @@ public enum PasswordGuard {
         return (s, caret)
     }
 
+    /// Выделенный текст фокусного элемента (AXSelectedText). nil — не читается.
+    /// Зывать только с main.
+    public static func selectedText() -> String? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
+                                            &focused) == .success,
+              let el = focused else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el as! AXUIElement, kAXSelectedTextAttribute as CFString,
+                                            &value) == .success,
+              let s = value as? String else { return nil }
+        return s
+    }
+
     /// Единственная точка AX-опроса. Зывать только с main.
     public static func refreshOnMain() {
         lock.lock()

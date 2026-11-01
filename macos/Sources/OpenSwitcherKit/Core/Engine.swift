@@ -1913,8 +1913,18 @@ public final class Engine {
         }
         // свежего слова нет (нет выделения юзера, слово >10 с или в другом
         // приложении) — ЧЕСТНЫЙ ОТКАЗ: иначе тап схватит кусок предложения
-        // слева от каретки и «затрёт» его конвертацией (бой 2026-09-24 22:31)
-        logLine("caramba-flip: no fresh word at caret -> refuse")
+        // слева от каретки и «затрёт» его конвертацией (бой 2026-09-24 22:31).
+        // Причина в лог ПОЭЛЕМЕНТНО: иначе отказ «без причины» неотличим от
+        // расходится памяти тапа (бой 30-31.10: 4 отказа — буфер был жив, но
+        // его чистил Option-down; теперь видно по buf>0)
+        var why: [String] = []
+        if buf.count > 0 { why.append("buf=\(buf.count)") }
+        if lastWord.isEmpty { why.append("no lastWord") }
+        if lastWordSepKey == 0 { why.append("no sep") }
+        if lastWordApp != fgApp { why.append("app \(fgProc) != \(lastWordApp)") }
+        if Engine.ms() - lastWordAt >= 10 { why.append(String(format: "word %.1fs old", Engine.ms() - lastWordAt)) }
+        if lastBsAt > lastWordAt { why.append(String(format: "bs %.2fs after word", lastBsAt - lastWordAt)) }
+        logLine("caramba-flip: refuse (\(why.isEmpty ? "?" : why.joined(separator: ", ")))")
         fireInfo("Нет свежего слова у курсора — выдели текст и нажми Option ещё раз")
     }
 
@@ -2019,6 +2029,13 @@ public final class Engine {
             return
         }
         let converted = CharMaps.mapText(text, toRu: lang == 1)
+        // гейт вставки: выделение обязано быть ровно тем, что скопировали, —
+        // иначе Cmd+V затрёт чужой текст (выделение съехало/схлопнулось)
+        if let sel = PasswordGuard.selectedText(), sel != text {
+            logLine("sel REFUSED: выделение '\(sel)' != скопированному '\(text)' — вставка отменена")
+            fireInfo("Выделение изменилось — конвертация отменена")
+            return
+        }
         TextConverter.setClipboardText(converted)
         TextConverter.targetPid = selApp
         TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
