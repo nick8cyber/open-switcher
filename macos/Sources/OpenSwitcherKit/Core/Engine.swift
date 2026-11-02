@@ -1460,7 +1460,17 @@ public final class Engine {
             let letter = word.count == 1 ? (LayoutService.currentLayout().map { " '\(LayoutService.render($0, word))'" } ?? "") : ""
             why = "too-short (\(word.count)\(letter))"
         }
-        else if !manual && s.lockAutoAfterManualSwitch && autoLocked { why = "locked" }
+        else if !manual && s.lockAutoAfterManualSwitch && autoLocked {
+            // ЛИМИТ ЖИЗНИ ЛОКА — 10 с (бой 18:24 01.11: юзер тапнул раскладку ради
+            // 'bb', через 36 с набрал 'ye ghjdthzq' как русский текст — лок без
+            // срока молчал всё это время; экспирация была только в resetSession,
+            // т.е. никогда, пока юзер в том же поле). Замысел 8cf7674: лок прикрывает
+            // СРАЗУ предстоящий ввод (поле пароля и т.п.), а не весь сеанс в поле
+            if Engine.ms() - autoLockedAt >= 10 {
+                autoLocked = false
+                logLine("lock expired (10s) — авто-детект снова работает")
+            } else { why = "locked" }
+        }
         // Поле пароля (AXSecureTextField): конвертации там нет ВОВСЕ — буквы
         // невидимы, любой флип раскладки посреди ввода ломает пароль целиком
         else if !manual && PasswordGuard.isSecureFocused { why = "password field" }
