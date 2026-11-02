@@ -843,6 +843,16 @@ public final class Engine {
         // любой реальный забой двигает каретку влево — снимает доверие к
         // «слово+разд стоят прямо у каретки» (гейт точного переворота)
         if code == KeyCodeMap.backspace { lastBsAt = now }
+        // паритет C# (SessionPauseMs=3000): лок живёт только внутри сеанса
+        // набора — пауза длиннее 3 с кончает сеанс, следующий ввод начинается
+        // с чистым автодетектом (бой 18:24: пауза 35 с, лок всё ещё молчал)
+        if !KeyCodeMap.isModifier(code) {
+            if autoLocked && (now - lastInputAt) >= 3.0 {
+                autoLocked = false
+                logLine(String(format: "auto-unlock: session pause %.0f ms", (now - lastInputAt) * 1000))
+            }
+            lastInputAt = now
+        }
         // Cmd+V = вставка: поле Electron коммитит её асинхронно — инжекции
         // дают дорогу (0.4 с), иначе гонка с недокоммиченным текстом
         if m.cmd && code == KeyCodeMap.ansiCode(ofLatin: "v") { lastPasteAt = now }
@@ -885,9 +895,7 @@ public final class Engine {
         // активно то же поле ввода и в нём идёт печать, — паузы в наборе его НЕ
         // снимают. Ушёл из поля (смена приложения или окна) → resetSession()
         // снимает лок вместе с остальным сеансом ввода.
-        if !KeyCodeMap.isModifier(code) {
-            lastInputAt = now
-        }
+        if !KeyCodeMap.isModifier(code) { lastInputAt = now } // (пауза-экспирация лока — выше, до этого)
 
         if now < suppressUntil {
             // suppress-окно: конвертация запрещена, но буфер синхронизируем

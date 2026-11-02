@@ -189,6 +189,35 @@ namespace OpenSwitcher
                     pass ? "PASS" : "FAIL", r[0], got ? "ok" : "reject", pass ? "" : "!!", r[2]));
             }
 
+            // словарь членства (ADR-003) + deny-list v3 + умный режим (СПЕКА §5 11а)
+            var dictChecks = new[]
+            {
+                new object[] { "перкуссия", 0, true,  "huge: редкое RU-слово в словаре" },
+                new object[] { "callback",  1, true,  "huge: редкое EN-слово в словаре" },
+                new object[] { "iban",      1, false, "deny-list v3: RU-прочтение с клавиш = «шифт»" },
+                new object[] { "vel",       1, false, "3-буквенный мусор субтитров — не член (мин. 4 буквы)" }
+            };
+            foreach (object[] r in dictChecks)
+            {
+                bool got = WordDict.Has((string)r[0], (int)r[1]);
+                bool pass = got == (bool)r[2];
+                if (!pass) fails++;
+                sb.AppendLine(string.Format("{0}: dict '{1}' [{2}] {3} ({4})",
+                    pass ? "PASS" : "FAIL", r[0], got ? "в словаре" : "нет", pass ? "" : "!!", r[4]));
+            }
+            int fuzzyDist;
+            string fuzzyNeighbor = WordDict.DictNeighbor("смоьри", 0, 2, out fuzzyDist);
+            bool fuzzyPass = fuzzyNeighbor != null && fuzzyDist == 1;
+            if (!fuzzyPass) fails++;
+            sb.AppendLine(string.Format("{0}: fuzzy 'смоьри' ~= '{1}' dist{2} ({3})",
+                fuzzyPass ? "PASS" : "FAIL", fuzzyNeighbor ?? "-", fuzzyDist, "умный режим: сосед на дистанции 1"));
+            int transDist;
+            string transNeighbor = WordDict.DictNeighbor("првиет", 0, 2, out transDist);
+            bool transPass = transNeighbor != null && transDist == 2;
+            if (!transPass) fails++;
+            sb.AppendLine(string.Format("{0}: fuzzy 'првиет' ~= '{1}' dist{2} ({3})",
+                transPass ? "PASS" : "FAIL", transNeighbor ?? "-", transDist, "смежная транспозиция = 2 замены"));
+
             sb.AppendLine(fails == 0 ? "ALL TESTS PASSED" : fails + " TEST(S) FAILED");
             try
             {
