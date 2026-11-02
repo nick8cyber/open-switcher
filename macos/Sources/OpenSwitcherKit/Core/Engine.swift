@@ -1301,8 +1301,8 @@ public final class Engine {
                 // чужих символа — стало видно только по разнице окон): поле обязано
                 // кончаться ожидаемой заменой; не кончается — инжекция ушла не туда,
                 // громкий маркер для разбора (автовосстановление невозможно)
-                if !expectedAfter.isEmpty && after != "?" && !after.hasSuffix(expectedAfter) {
-                    self?.logLine("DAMAGE SUSPECTED: поле не кончается '\(expectedAfter)' — инжекция ушла не туда/переформатировала")
+                if !expectedAfter.isEmpty && after != "?" && !after.contains(expectedAfter) {
+                    self?.logLine("DAMAGE SUSPECTED: замена '\(expectedAfter)' не найдена в поле — инжекция ушла не туда/переформатировала")
                 }
             }
         }
@@ -1330,14 +1330,29 @@ public final class Engine {
     /// bs=13 при 12/13 съел 52 чужих символа, слово осталось на месте.
     /// Не совпало после ретрая 60 мс — честный отказ.
     private func verifyTailForInjection(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
-        let first = screenTailForInjectionTail(expectedTail)
-        if !first.available { return (false, false, first.actual) }
-        if first.matches { return (true, true, first.actual) }
-        usleep(60_000)
-        let second = screenTailForInjectionTail(expectedTail)
-        if second.available && second.matches { return (true, true, second.actual) }
-        let best = second.available ? second : first
-        return (true, false, best.actual)
+        // Electron под нагрузкой отдаёт ПРОТУХШИЙ AX (бой 17:48: поле уже с новым
+        // словом, AX показывал состояние на секунды старше; 17:45 — пустоту).
+        // Вердикт только по УСТАКАНИВШЕМУСЯ значению: читаем, пока меняется,
+        // максимум 400 мс; совпало — PASS. Стабильно НЕ совпало — отказ.
+        // Пустое значение — поле не отдаёт текст: вслепую по памяти (паритет C#,
+        // порядок cghid гарантирует исполнение после накопленных клавиш)
+        var last = screenTailForInjectionTail(expectedTail)
+        if last.matches { return (true, true, last.actual) }
+        var stableCount = 0
+        for _ in 0..<4 {
+            usleep(100_000)
+            let next = screenTailForInjectionTail(expectedTail)
+            if next.matches { return (true, true, next.actual) }
+            if !next.available || next.actual.isEmpty { return (false, false, next.actual) }
+            if next.actual == last.actual {
+                stableCount += 1
+                if stableCount >= 1 { return (true, false, next.actual) } // устаканилось и НЕ совпало
+            } else {
+                stableCount = 0
+            }
+            last = next
+        }
+        return (true, false, last.actual) // 400 мс менялось и не совпало — отказ
     }
 
     /// Хвост совпадает, если поле кончается им — с опциональным последним
