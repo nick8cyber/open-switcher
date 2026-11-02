@@ -92,6 +92,8 @@ public enum SelfTest {
             ("fuzzy: 'смоьри' dist1 сосед",      WordDict.dictNeighbor("смоьри", 0, maxSubs: 2)?.dist == 1, true),
             ("fuzzy: 'hellp' dist1 сосед",       WordDict.dictNeighbor("hellp", 1, maxSubs: 2)?.dist == 1, true),
             ("fuzzy: 'првиет' dist2 (транспоз)", WordDict.dictNeighbor("првиет", 0, maxSubs: 2)?.dist == 2, true),
+            ("fuzzy: пропуск буквы ('смотри' недожал 'и')", WordDict.dictNeighbor("смотр", 0, maxSubs: 2)?.dist == 1, true),
+            ("fuzzy: лишняя буква ('смоотри' дважды нажал 'о')", WordDict.dictNeighbor("смоотри", 0, maxSubs: 2)?.dist == 1, true),
             ("fuzzy: 'пкивед' dist2-сосед (6 букв)", WordDict.dictNeighbor("пкивед", 0, maxSubs: 2)?.dist == 2, true),
             ("fuzzy: dist2 не ищется <6 букв",   WordDict.dictNeighbor("пкиве", 0, maxSubs: 2)?.neighbor == WordDict.dictNeighbor("пкиве", 0, maxSubs: 1)?.neighbor, true),
             ("fuzzy: dist1-поиск не находит dist2-слово", WordDict.dictNeighbor("пкивед", 0, maxSubs: 1) == nil, true),

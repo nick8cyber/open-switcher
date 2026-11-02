@@ -50,9 +50,40 @@ public enum PasswordGuard {
               let el = focused else { return nil }
         let axEl = el as! AXUIElement
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString,
-                                            &value) == .success,
-              let s = value as? String else { return nil }
+        var text: String? = nil
+        if AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString,
+                                         &value) == .success, let v = value as? String {
+            text = v
+        }
+        // ФОЛБЭК для AX-немых полей (telegram/finder, ADR-001): у фокусного
+        // элемента нет value — пробуем выделенный текст и первый текстовый
+        // потомок (поле ввода часто вложено в контейнер фокуса)
+        if (text == nil || text!.isEmpty) {
+            var sel: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextAttribute as CFString,
+                                             &sel) == .success, let sv = sel as? String, !sv.isEmpty {
+                text = sv
+            }
+        }
+        if (text == nil || text!.isEmpty) {
+            var kids: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString,
+                                             &kids) == .success,
+               let arr = kids as? [AXUIElement] {
+                for child in arr.prefix(8) {
+                    var role: CFTypeRef?
+                    var cv: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+                       let rs = role as? String, rs == "AXTextArea" || rs == "AXTextField",
+                       AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &cv) == .success,
+                       let cs = cv as? String {
+                        text = cs
+                        break
+                    }
+                }
+            }
+        }
+        guard let s = text, !s.isEmpty else { return nil }
         var caret: Int? = nil
         var rangeRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString,

@@ -217,6 +217,18 @@ namespace OpenSwitcher
             if (!transPass) fails++;
             sb.AppendLine(string.Format("{0}: fuzzy 'првиет' ~= '{1}' dist{2} ({3})",
                 transPass ? "PASS" : "FAIL", transNeighbor ?? "-", transDist, "смежная транспозиция = 2 замены"));
+            int skipDist;
+            string skipNeighbor = WordDict.DictNeighbor("смотр", 0, 2, out skipDist);
+            bool skipPass = skipNeighbor != null && skipDist == 1;
+            if (!skipPass) fails++;
+            sb.AppendLine(string.Format("{0}: fuzzy 'смотр' ~= '{1}' dist{2} ({3})",
+                skipPass ? "PASS" : "FAIL", skipNeighbor ?? "-", skipDist, "пропуск буквы = вставка"));
+            int extraDist;
+            string extraNeighbor = WordDict.DictNeighbor("смоотри", 0, 2, out extraDist);
+            bool extraPass = extraNeighbor != null && extraDist == 1;
+            if (!extraPass) fails++;
+            sb.AppendLine(string.Format("{0}: fuzzy 'смоотри' ~= '{1}' dist{2} ({3})",
+                extraPass ? "PASS" : "FAIL", extraNeighbor ?? "-", extraDist, "лишняя буква = удаление"));
 
             sb.AppendLine(fails == 0 ? "ALL TESTS PASSED" : fails + " TEST(S) FAILED");
             try

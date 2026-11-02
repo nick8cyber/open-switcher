@@ -153,6 +153,7 @@ namespace OpenSwitcher.Core
             var chars = w.ToCharArray();
             if (maxSubs >= 1)
             {
+                // замена одной буквы
                 for (int i = 0; i < chars.Length; i++)
                 {
                     char orig = chars[i];
@@ -164,6 +165,21 @@ namespace OpenSwitcher.Core
                         if (Has(candidate, lang)) { chars[i] = orig; dist = 1; return candidate; }
                     }
                     chars[i] = orig;
+                }
+                // ПРОПУСК буквы (недожал): вставка одной буквы ('смотр' + 'и')
+                for (int i = 0; i <= chars.Length; i++)
+                {
+                    foreach (char ch in alphabet)
+                    {
+                        string candidate = w.Insert(i, ch.ToString());
+                        if (Has(candidate, lang)) { dist = 1; return candidate; }
+                    }
+                }
+                // ЛИШНЯЯ буква (дважды нажал): удаление одной
+                for (int i = 0; i < chars.Length; i++)
+                {
+                    string candidate = w.Remove(i, 1);
+                    if (Has(candidate, lang)) { dist = 1; return candidate; }
                 }
             }
             if (maxSubs >= 2 && chars.Length >= 6)

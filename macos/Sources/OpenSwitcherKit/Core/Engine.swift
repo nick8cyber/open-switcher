@@ -1294,7 +1294,7 @@ public final class Engine {
     /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
     /// Текст не изменился после инжекции = цель не съела замену («определил,
     /// но не заменил») — фиксируется явно.
-    private func screenProbe(expectedAfter: String = "") {
+    private func screenProbe(expectedAfter: String = "", removedTail: String = "") {
         DispatchQueue.main.async { [weak self] in
             let before = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
             self?.logLine("screen-before: '\(before)'")
@@ -1311,6 +1311,14 @@ public final class Engine {
                 // громкий маркер для разбора (автовосстановление невозможно)
                 if !expectedAfter.isEmpty && after != "?" && !after.contains(expectedAfter) {
                     self?.logLine("DAMAGE SUSPECTED: замена '\(expectedAfter)' не найдена в поле — инжекция ушла не туда/переформатировала")
+                }
+                // СКЛЕЙКА (бой 19:08:56 'bизучи'): последний символ СТЁРТОГО слова
+                // прилип к замене (Electron склеил быстрые BS — bs=5 дошёл как 4).
+                // Сигнатура: [последняя буква стёртого]+[замена] присутствует в поле
+                if removedTail.isEmpty == false, expectedAfter.isEmpty == false,
+                   let lastChar = removedTail.last, after.contains(String(lastChar) + expectedAfter) {
+                    self?.logLine("DAMAGE GLUE: '\(lastChar)\(expectedAfter.prefix(12))…' — потерян backspace, стёртое слово осталось частично")
+                    self?.fireInfo("Замена с прилипшей буквой — проверь хвост")
                 }
             }
         }
@@ -1707,7 +1715,7 @@ public final class Engine {
         lastWord = word
 
         suppress(0.6)
-        screenProbe(expectedAfter: bestText)
+        screenProbe(expectedAfter: bestText, removedTail: cur.text)
         TextConverter.sendBackspaces(word.count + retroPrefix.count)
         TextConverter.sendUnicode(retroText + bestText)
         // набранный знак рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
@@ -1862,7 +1870,7 @@ public final class Engine {
             logLine("undo verify: экран не читается — откат вслепую (паритет C#)")
         }
         suppress(0.6)
-        screenProbe(expectedAfter: restore)
+        screenProbe(expectedAfter: restore) // glue-проба недоступна: удалённый (конвертированный) текст строкой не хранится
         TextConverter.sendBackspaces(bs)
         TextConverter.sendUnicode(restore)
         prevSingle = nil
@@ -1999,7 +2007,7 @@ public final class Engine {
             logLine("force-flip verify: экран не читается — стираю вслепую (паритет C#)")
             fireInfo("Переворот вслепую: \(cur.text) → \(best.text)") // единственное место, где гейт не видит текст — юзер должен знать
         }
-        screenProbe(expectedAfter: best.text + (trailSent.isEmpty ? "" : String(trailSent.last!)))
+        screenProbe(expectedAfter: best.text + (trailSent.isEmpty ? "" : String(trailSent.last!)), removedTail: cur.text)
         TextConverter.sendBackspaces(word.count + trailLen)
         TextConverter.sendUnicode(best.text)
         if !trailSent.isEmpty {

@@ -133,6 +133,7 @@ public enum WordDict {
         let w = Array(word.lowercased())
         guard w.count >= 4, w.count <= 16, let alphabet = alphabets[lang] else { return nil }
         if maxSubs >= 1 {
+            // замена одной буквы
             for i in w.indices {
                 let orig = w[i]
                 for ch in alphabet where ch != orig {
@@ -141,6 +142,24 @@ public enum WordDict {
                     let s = String(c)
                     if has(s, lang) { return (s, 1) }
                 }
+            }
+            // ПРОПУСК буквы (юзер не дожал): вставка одной буквы даёт словарное
+            // слово ('смотри' с недожатой 'и' -> 'смотри'). Решение владельца
+            // 01.11: «пропуски букв давай тоже добавим»
+            for i in 0...w.count {
+                for ch in alphabet {
+                    var c = w
+                    c.insert(ch, at: i)
+                    let s = String(c)
+                    if has(s, lang) { return (s, 1) }
+                }
+            }
+            // ЛИШНЯЯ буква (двойное нажатие): удаление одной буквы даёт словарное
+            for i in w.indices {
+                var c = w
+                c.remove(at: i)
+                let s = String(c)
+                if has(s, lang) { return (String(c), 1) }
             }
         }
         if maxSubs >= 2, w.count >= 6 {
