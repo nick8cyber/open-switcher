@@ -1286,7 +1286,7 @@ public final class Engine {
     /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
     /// Текст не изменился после инжекции = цель не съела замену («определил,
     /// но не заменил») — фиксируется явно.
-    private func screenProbe() {
+    private func screenProbe(expectedAfter: String = "") {
         DispatchQueue.main.async { [weak self] in
             let before = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
             self?.logLine("screen-before: '\(before)'")
@@ -1296,6 +1296,13 @@ public final class Engine {
                 if before == after && after != "?" {
                     self?.logLine("INJECTION NOT APPLIED: текст не изменился — цель не съела замену")
                     self?.fireInfo("Замена не применилась этим приложением — переверни вручную") // 04:57: тап «молча не сработал» — юзер не знал почему
+                }
+                // ПОСТ-ПРОВЕРКА УРОНА (бой 17:40: bs=13 при допуске 12/13 съел 52
+                // чужих символа — стало видно только по разнице окон): поле обязано
+                // кончаться ожидаемой заменой; не кончается — инжекция ушла не туда,
+                // громкий маркер для разбора (автовосстановление невозможно)
+                if !expectedAfter.isEmpty && after != "?" && !after.hasSuffix(expectedAfter) {
+                    self?.logLine("DAMAGE SUSPECTED: поле не кончается '\(expectedAfter)' — инжекция ушла не туда/переформатировала")
                 }
             }
         }
@@ -1315,34 +1322,40 @@ public final class Engine {
         return box ?? nil
     }
 
-    /// Верификация хвоста для инжекции: однократное чтение AX может отставать
-    /// от поля (Electron/Chromium обновляют AX-дерево с лагом: бой 22:28 'lf
-    /// ltkfq' — гейт видел 'l'/'ltkf' и зря отказывал; 04:57 'cltkf'/'cltkfq').
-    /// Схема: прочитали → не совпало → пауза 60 мс и повтор → всё ещё не
-    /// совпало → допуск НЕДОСТАЮЩЕГО хвоста (не более 2 последних букв и не
-    /// более половины слова): недостающие буквы уже в очереди приложения,
-    /// posted-события доставляются ПОСЛЕ накопленных (FIFO) — к моменту
-    /// исполнения забоёв поле кончится полным словом. Доступность/совпадение
-    /// — та же форма, что у screenTailAtCaret (drop-in для всех гейтов).
+    /// Верификация хвоста для инжекции. Допуск — ТОЛЬКО опциональный хвостовой
+    /// сепаратор (редакторы тримят trailing space: AX его не показывает, хотя
+    /// поле его содержит). Скользящий допуск k/n (12/13 … 7/13) УДАЛЁН: на
+    /// лгущем под нагрузкой AX-каретке Electron он принимал частичное
+    /// совпадение и открывал инжекцию в ЧУЖОЕ место — бой 17:40 01.11:
+    /// bs=13 при 12/13 съел 52 чужих символа, слово осталось на месте.
+    /// Не совпало после ретрая 60 мс — честный отказ.
     private func verifyTailForInjection(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
-        let first = screenTailAtCaret(expectedTail)
+        let first = screenTailForInjectionTail(expectedTail)
         if !first.available { return (false, false, first.actual) }
         if first.matches { return (true, true, first.actual) }
         usleep(60_000)
-        let second = screenTailAtCaret(expectedTail)
+        let second = screenTailForInjectionTail(expectedTail)
         if second.available && second.matches { return (true, true, second.actual) }
         let best = second.available ? second : first
-        let n = expectedTail.count
-        var k = n - 1
-        let kMin = max(1, n - 2, (n + 1) / 2)
-        while k >= kMin {
-            if best.actual.hasSuffix(String(expectedTail.prefix(k))) {
-                logLine("verify: принят хвост с лагом AX (совпадение \(k)/\(n)) — недостающее в очереди приложения")
-                return (true, true, best.actual)
-            }
-            k -= 1
-        }
         return (true, false, best.actual)
+    }
+
+    /// Хвост совпадает, если поле кончается им — с опциональным последним
+    /// сепаратором (пробел): trailing-space трим редакторов не должен
+    /// ломать гейт, но ЛЮБЫЕ иные расхождения — отказ
+    private func screenTailForInjectionTail(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
+        let gate = screenTailAtCaret(expectedTail)
+        if gate.matches { return gate }
+        if expectedTail.hasSuffix(" ") {
+            let trimmed = String(expectedTail.dropLast())
+            let g2 = screenTailAtCaret(trimmed)
+            if g2.matches {
+                logLine("verify: хвост без триммого пробела — принят")
+                return (g2.available, true, g2.actual)
+            }
+            return (g2.available, false, g2.actual)
+        }
+        return gate
     }
 
     /// Хвост у каретки по экрану (AX): совпадает ли с тем, что собираемся стереть.
@@ -1661,7 +1674,7 @@ public final class Engine {
         lastWord = word
 
         suppress(0.6)
-        screenProbe()
+        screenProbe(expectedAfter: bestText)
         TextConverter.sendBackspaces(word.count + retroPrefix.count)
         TextConverter.sendUnicode(retroText + bestText)
         // набранный знак рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
@@ -1816,7 +1829,7 @@ public final class Engine {
             logLine("undo verify: экран не читается — откат вслепую (паритет C#)")
         }
         suppress(0.6)
-        screenProbe()
+        screenProbe(expectedAfter: restore)
         TextConverter.sendBackspaces(bs)
         TextConverter.sendUnicode(restore)
         prevSingle = nil
@@ -1953,7 +1966,7 @@ public final class Engine {
             logLine("force-flip verify: экран не читается — стираю вслепую (паритет C#)")
             fireInfo("Переворот вслепую: \(cur.text) → \(best.text)") // единственное место, где гейт не видит текст — юзер должен знать
         }
-        screenProbe()
+        screenProbe(expectedAfter: best.text + (trailSent.isEmpty ? "" : String(trailSent.last!)))
         TextConverter.sendBackspaces(word.count + trailLen)
         TextConverter.sendUnicode(best.text)
         if !trailSent.isEmpty {
