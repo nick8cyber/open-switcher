@@ -1915,44 +1915,97 @@ public final class Engine {
         beginFixSelection(fromFixWord: true)
     }
 
-    /// Паст-режим переворота: Cmd+Shift+Left (выделить слово слева) → сверка
-    /// выделения с AX (уcтаканивание до 400 мс) → Cmd+V с заменой → буфер
-    /// восстанавливается. Ни одного backspace — Electron-поля, калечащие текст
-    /// забой-бёрстами, получают атомарную замену выделения. false — режим не
-    /// вышел (AX не читается / выделение не совпало; поле не тронуто, стрелка
-    /// гасит выделение) — вызывающий уходит в забой-путь с гейтом
-    private func pasteFlipWord(_ from: String, _ to: String) -> Bool {
+
+    enum PasteFlipResult { case accepted, refuse, fallbackBs }
+
+    private var pasteFlipInFlight = false
+
+    /// План паст-флипа: решаем СИНХРОННО (буквы, AX-читаемость, повторный тап),
+    /// исполняем АСИНХРОННО. КРИТИЧНО: всё, что постится из тап-колбэка,
+    /// доставляется приложению только ПОСЛЕ возврата колбэка — забоям всё равно
+    /// (fire-and-forget), а флоу «выдели→проверь→вставь» обязан ждать эффект,
+    /// т.е. обязан работать вне колбэка (самотест 02:48/02:51: выделение
+    /// прочиталось пустым при живом комбо). Слово слева = Option+Shift+Left
+    /// (Cmd+Shift+Left — «до начала строки», самотест 02:45)
+    private func pasteFlipWordPlan(_ cur: LayoutCandidate, _ best: LayoutCandidate,
+                                   _ word: [KeyRec], _ layouts: [LayoutService.LayoutData],
+                                   _ skipLearn: Bool) -> PasteFlipResult {
+        let from = cur.text, to = best.text
         let core = LanguageTables.lettersOnly(from)
-        guard core.count >= 1, core == from else { return false } // знак в слове — выделение ненадёжно
+        guard core.count >= 1, core == from else { return .fallbackBs } // знак в слове — выделение ненадёжно
+        if pasteFlipInFlight {
+            logLine("paste-flip refuse: предыдущий ещё выполняется")
+            fireInfo("Предыдущий переворот ещё выполняется")
+            return .refuse
+        }
+        // ЧИТАЕМОСТЬ ДО отправки событий: слепое поле — безопасный откат в забой-путь
+        if selectedTextOnMain() == nil { return .fallbackBs }
+        pasteFlipInFlight = true
         suppress(0.6)
-        TextConverter.targetPid = fgApp
-        // выделяем слово слева одним атомарным комбо
-        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.CMD | HK.SHIFT)
-        // ждём выделение: сверка с AX до устаканивания
+        let from2 = from, to2 = to
+        let word2 = word, layouts2 = layouts
+        let cur2 = cur, best2 = best
+        let skipLearn2 = skipLearn
+        let fg = fgApp
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runPasteFlip(from: from2, to: to2, word: word2, layouts: layouts2,
+                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg)
+        }
+        logLine("paste-flip: исполнение отложено (вне тап-колбэка)")
+        return .accepted
+    }
+
+    /// Тело паст-флипа (фоновая очередь, тап-колбэк уже вернулся):
+    /// Option+Shift+Left → сверка выделения с AX → Cmd+V → буфер восстановлен.
+    /// Ни одного backspace. Отказ — стрелка гасит выделение, плашка
+    private func runPasteFlip(from: String, to: String, word: [KeyRec],
+                              layouts: [LayoutService.LayoutData], cur: LayoutCandidate,
+                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t) {
+        defer { pasteFlipInFlight = false }
+        usleep(60_000) // дать тап-колбэку вернуться (доставка постов — после него)
+        TextConverter.targetPid = fg
+        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
         var sel = selectedTextOnMain() ?? ""
         var tries = 0
-        while (sel.isEmpty || sel != from) && tries < 4 {
+        // выделение = слово, возможно с обрамляющими пробелами (TextEdit берёт
+        // 'спеки ' с хвостовым — самотест 02:57); вставка пробелы сохраняет
+        var pasteText = to
+        func matchSel(_ s: String) -> Bool {
+            guard s.contains(from) else { return false }
+            let pre = String(s[s.startIndex..<s.range(of: from)!.lowerBound])
+            let suf = String(s[s.range(of: from)!.upperBound..<s.endIndex])
+            guard pre.allSatisfy({ $0 == " " }) && suf.allSatisfy({ $0 == " " }) else { return false }
+            pasteText = pre + to + suf
+            return true
+        }
+        while !matchSel(sel) && tries < 4 {
             usleep(100_000)
             sel = selectedTextOnMain() ?? ""
-            if sel == from { break }
             tries += 1
         }
-        guard sel == from else {
-            logLine("paste-flip: выделение '\(sel.prefix(20))' != '\(from)' — откат к забой-пути")
-            TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: 0) // погасить выделение
-            return false
+        guard matchSel(sel) else {
+            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(from)' — гашу, тапни снова")
+            TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: 0)
+            fireInfo("Не выделилось слово — тапни Option ещё раз")
+            return
         }
         guard let saved = TextConverter.getClipboardTextOnce() else {
             TextConverter.sendCombo(keyCode: 0x7B, mods: 0)
-            logLine("paste-flip: буфер не читается — откат к забой-пути")
-            return false
+            logLine("paste-flip refuse: буфер не читается")
+            return
         }
-        TextConverter.setClipboardText(to)
+        TextConverter.setClipboardText(pasteText)
         TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
         scheduleClipboardRestore(saved)
         logLine("paste-flip OK: '\(from)' -> '\(to)' (selection, без забоев)")
         fireInfo("Перевёрнуто: \(from) → \(to)")
-        return true
+        // завершение — на потоке тапа (владеет undo/learning-состоянием)
+        performOnTapThread { [weak self] in
+            guard let self = self else { return }
+            self.switchLayoutAfterFlip(word: word, best: best, layouts: layouts)
+            self.armUndoAfterFlip(cur: cur, replacement: to, trailTyped: "", trailSent: "")
+            self.rememberFlipPair(cur: cur, best: best, skipLearn: skipLearn)
+        }
     }
 
     /// Раскладка после паст-флипа (как в забой-пути: слово >1 буквы — переключаем)
@@ -2078,11 +2131,16 @@ public final class Engine {
         // в том же поле не портило текст ни разу за всю историю). Пробуем ПЕРВЫМ
         // делом; не вышло (AX слеп / выделение не подтвердилось) — прежний путь
         // с гейтом и забоями. Разделитель уже в поле: выделяем только слово
-        if pasteFlipWord(cur.text, best.text) {
-            switchLayoutAfterFlip(word: word, best: best, layouts: layouts)
-            armUndoAfterFlip(cur: cur, replacement: best.text, trailTyped: "", trailSent: "")
-            rememberFlipPair(cur: cur, best: best, skipLearn: skipLearn)
-            return true
+        // ALL-OR-NOTHING (самотест 02:45: гасящая стрелка + протухший AX =
+        // вставка в начало документа): после ОТПРАВЛЕННЫХ событий выделения
+        // откат в забой-путь ЗАПРЕЩЁН — только честный отказ
+        switch pasteFlipWordPlan(cur, best, word, layouts, skipLearn) {
+        case .accepted:
+            return true // исполнение — асинхронно, после возврата тап-колбэка
+        case .refuse:
+            return false
+        case .fallbackBs:
+            break // AX не читался ДО каких-либо событий — безопасный забой-путь
         }
         let expectedTail = cur.text + trailTyped
         let gate = verifyTailForInjection(expectedTail)
