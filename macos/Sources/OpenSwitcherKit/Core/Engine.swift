@@ -1915,6 +1915,85 @@ public final class Engine {
         beginFixSelection(fromFixWord: true)
     }
 
+    /// Паст-режим переворота: Cmd+Shift+Left (выделить слово слева) → сверка
+    /// выделения с AX (уcтаканивание до 400 мс) → Cmd+V с заменой → буфер
+    /// восстанавливается. Ни одного backspace — Electron-поля, калечащие текст
+    /// забой-бёрстами, получают атомарную замену выделения. false — режим не
+    /// вышел (AX не читается / выделение не совпало; поле не тронуто, стрелка
+    /// гасит выделение) — вызывающий уходит в забой-путь с гейтом
+    private func pasteFlipWord(_ from: String, _ to: String) -> Bool {
+        let core = LanguageTables.lettersOnly(from)
+        guard core.count >= 1, core == from else { return false } // знак в слове — выделение ненадёжно
+        suppress(0.6)
+        TextConverter.targetPid = fgApp
+        // выделяем слово слева одним атомарным комбо
+        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.CMD | HK.SHIFT)
+        // ждём выделение: сверка с AX до устаканивания
+        var sel = selectedTextOnMain() ?? ""
+        var tries = 0
+        while (sel.isEmpty || sel != from) && tries < 4 {
+            usleep(100_000)
+            sel = selectedTextOnMain() ?? ""
+            if sel == from { break }
+            tries += 1
+        }
+        guard sel == from else {
+            logLine("paste-flip: выделение '\(sel.prefix(20))' != '\(from)' — откат к забой-пути")
+            TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: 0) // погасить выделение
+            return false
+        }
+        guard let saved = TextConverter.getClipboardTextOnce() else {
+            TextConverter.sendCombo(keyCode: 0x7B, mods: 0)
+            logLine("paste-flip: буфер не читается — откат к забой-пути")
+            return false
+        }
+        TextConverter.setClipboardText(to)
+        TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
+        scheduleClipboardRestore(saved)
+        logLine("paste-flip OK: '\(from)' -> '\(to)' (selection, без забоев)")
+        fireInfo("Перевёрнуто: \(from) → \(to)")
+        return true
+    }
+
+    /// Раскладка после паст-флипа (как в забой-пути: слово >1 буквы — переключаем)
+    private func switchLayoutAfterFlip(word: [KeyRec], best: LayoutCandidate, layouts: [LayoutService.LayoutData]) {
+        if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
+            switchLayoutOnMain(bl, source: "force-flip")
+            verifySwitch(target: bl)
+            expectLayout(bl)
+        }
+    }
+
+    /// Точка отката после паст-флипа: поле = [префикс][замена][сепаратор из поля]
+    private func armUndoAfterFlip(cur: LayoutCandidate, replacement: String, trailTyped: String, trailSent: String) {
+        undoPending = true
+        undoText = cur.text
+        undoLen = replacement.count
+        undoPrefix = ""; undoPrefixLen = 0
+        prevSingle = nil
+        undoSepText = ""
+        undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
+        undoApp = fgApp
+        undoAt = Engine.ms()
+        keysSinceUndoPoint = 0
+        undoTail.removeAll()
+        undoTailBroken = false
+        lastConvertInfo = "flip '\(cur.text)' -> '\(replacement)'"
+    }
+
+    /// Заучивание пары после флипа (как в забой-пути)
+    private func rememberFlipPair(cur: LayoutCandidate, best: LayoutCandidate, skipLearn: Bool) {
+        let wasRejected = isRejected(cur.text.lowercased())
+        if wasRejected && !skipLearn {
+            removeRejected(cur.text.lowercased())
+        }
+        if !skipLearn && cur.text.count >= 2 && cur.text == LanguageTables.lettersOnly(cur.text) &&
+            !WordDict.has(cur.text, cur.lang) {
+            rememberAccepted(cur.text.lowercased())
+            fireInfo("Заучено: \(cur.text) → \(best.text)")
+        }
+    }
+
     /// Break при нечего-отменять: принудительный переворот (порт ForceFlipLastWord, v3 §9).
     /// false — свежего слова у каретки нет (плашку отказа показывает вызывающий).
     @discardableResult
@@ -1992,6 +2071,18 @@ public final class Engine {
             logLine("force-flip REFUSED: свежая вставка (paste race) — поле ещё коммитит")
             fireInfo("Только что была вставка — переверни словом позже")
             return false
+        }
+        // ПАСТ-РЕЖИМ (бои 17:40 + 02:36×3: забой-бёрст в Electron-полях bb
+        // детерминированно уничтожал текст далеко за пределами bs — гейт хвост
+        // проходил, а поле после инжекции теряло 31-52 символа; выделение+вставка
+        // в том же поле не портило текст ни разу за всю историю). Пробуем ПЕРВЫМ
+        // делом; не вышло (AX слеп / выделение не подтвердилось) — прежний путь
+        // с гейтом и забоями. Разделитель уже в поле: выделяем только слово
+        if pasteFlipWord(cur.text, best.text) {
+            switchLayoutAfterFlip(word: word, best: best, layouts: layouts)
+            armUndoAfterFlip(cur: cur, replacement: best.text, trailTyped: "", trailSent: "")
+            rememberFlipPair(cur: cur, best: best, skipLearn: skipLearn)
+            return true
         }
         let expectedTail = cur.text + trailTyped
         let gate = verifyTailForInjection(expectedTail)
