@@ -65,10 +65,13 @@ public enum TextConverter {
     public static func sendBackspaces(_ n: Int) {
         guard n > 0 else { return }
         for i in 0..<n {
-            // микро-пауза между парами: непрерывный burst в очереди целевого
-            // процесса часть приложений интерпретирует как залипание (одно
-            // нажатие = удаление множества символов, «отрезало строку сзади»)
-            if i > 0 { usleep(2000) }
+            // пауза между парами: непрерывный burst часть приложений
+            // интерпретирует как залипание (одно нажатие = удаление множества
+            // символов); Electron/Chromium при 2 мс (порт C# Thread.Sleep(2),
+            // там SendInput — общая очередь и склейки нет) СКЛЕИВАЕТ быстрые
+            // repeated Backspace — из пачки bs=5 дошёл 4, поле получило
+            // 'bизучи' вместо 'изучи' (бой 19:08:56). 8 мс — вне окна склейки
+            if i > 0 { usleep(8000) }
             let d = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: true)
             let u = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: false)
             if let d = d { post(d) }
