@@ -1694,15 +1694,18 @@ public final class Engine {
             logLine("convert skip: свежая вставка (paste race) — поле ещё коммитит")
             return false
         }
+        // Гейт на авто-пути — СОВЕТНИК, не блокиратор (бой 04:25: 'ltkfq' прошёл
+        // все ворота, но AX bb отдал протухший снимок 'лаю?' — отказ на ровном
+        // месте; при том все клавиши слова видел тап, вставок не было, инжекция
+        // идёт в общей очереди после накопленных клавиш — модель C#, где экрана
+        // нет вовсе и стираний не бывало). Совпало — подтверждение в лог;
+        // протух/не совпал — идём по памяти движка, урон ловят DAMAGE-пробы
         let expectedTail = retroPrefix + cur.text
         let gate = verifyTailForInjection(expectedTail)
         if gate.available {
-            if gate.matches {
-                logLine("convert verify: хвост '\(expectedTail)' у каретки подтверждён")
-            } else {
-                logLine("convert REFUSED: у каретки '\(gate.actual)' вместо '\(expectedTail)' — стирание по памяти отменено")
-                return false
-            }
+            logLine(gate.matches
+                ? "convert verify: хвост '\(expectedTail)' у каретки подтверждён"
+                : "convert verify: AX протух ('\(gate.actual)') — иду по памяти (ключи отслежены)")
         } else {
             logLine("convert verify: экран не читается — инжектирую вслепую (паритет C#)")
         }
