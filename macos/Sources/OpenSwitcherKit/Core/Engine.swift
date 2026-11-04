@@ -1292,6 +1292,20 @@ public final class Engine {
         gapBuf.removeAll()
     }
 
+    /// Армировать gap-окно после ЛЮБОГО переключения раскладки движком
+    /// (конверт/force-flip/паст-флип): TISSelect асинхронен — буквы, набранные
+    /// в окне применения (~100-400 мс), отрисовываются СТАРОЙ раскладкой
+    /// (бой 02:07 'yaaнуrfr': конверт 'ye'->'ну' переключил на RU, юзер продолжил
+    /// печатать в EN-лаг — фарш из трёх состояний). Gap-буфер досылает их
+    /// уже новой раскладкой. Тап-переключения армируют gap давнее (§6.5)
+    private func armGapForEngineSwitch(_ target: LayoutService.LayoutData) {
+        gapActive = true
+        gapLayout = target
+        gapBuf.removeAll()
+        gapDeadline = Engine.ms() + 0.8
+        armGapFlushTimer()
+    }
+
     /// Досыл gap-буфера по дедлайну, не дожидаясь следующей клавиши (порт C# ArmGapFlushTimer):
     /// проглоченная в просвете буква иначе висела невидимой до следующего нажатия.
     private func armGapFlushTimer() {
@@ -2112,6 +2126,7 @@ public final class Engine {
             switchLayoutOnMain(bl, source: "force-flip")
             verifySwitch(target: bl)
             expectLayout(bl)
+            armGapForEngineSwitch(bl)
         }
     }
 
@@ -2267,6 +2282,7 @@ public final class Engine {
             switchLayoutOnMain(bl, source: "force-flip")
             verifySwitch(target: bl)
             expectLayout(bl)
+            armGapForEngineSwitch(bl)
         }
 
         undoPending = true
