@@ -148,6 +148,7 @@ public final class Engine {
     public init(_ settings: Settings) {
         s = settings
         rebuildExclusionList()
+        rebuildPasteConvertList()
         // прогрев словарей ДО создания тапа: ленивое построение корпусов
         // (35k+20k слов, биграммы) занимает ~0.4-1 с — на потоке тапа это был бы
         // системный фриз клавиатуры на первом слове (замерено в раунде 5)
@@ -191,6 +192,7 @@ public final class Engine {
     public func apply(_ settings: Settings) {
         s = settings
         rebuildExclusionList()
+        rebuildPasteConvertList()
         onSettingsApplied?()
     }
 
@@ -566,6 +568,14 @@ public final class Engine {
     }
 
     private var exclusionList: [String] = []
+    private var pasteConvertList: [String] = []
+
+    private func rebuildPasteConvertList() {
+        pasteConvertList = s.pasteConvertApps.lowercased()
+            .split(whereSeparator: { ",;".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
 
     private func rebuildExclusionList() {
         exclusionList = s.exclusions.lowercased()
@@ -1745,7 +1755,8 @@ public final class Engine {
         // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
         // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
         // выделяем слово, вставляем замену+сепаратор, BS не нужен вовсе
-        if replayHostile[fgApp] == true, let bl = layouts.first(where: { $0.id == best.layoutID }) {
+        if (replayHostile[fgApp] == true || pasteConvertList.contains(fgProc)),
+           let bl = layouts.first(where: { $0.id == best.layoutID }) {
             logLine("convert: replay-hostile поле — паст-режим ('\(cur.text)' -> '\(bestText)')")
             suppress(0.3)
             screenProbe(expectedAfter: bestText, removedTail: cur.text)

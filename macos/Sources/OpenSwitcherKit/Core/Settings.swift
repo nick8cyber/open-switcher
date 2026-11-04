@@ -49,6 +49,10 @@ public final class Settings {
     public var startWithSystem = false
     public var paused = false
     public var exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe" // популярные игры (вин/мак общий список, .exe на маке матчится как подстрока)
+    // Поля, где авто-конверт идёт через выделение+вставку (без забоев):
+    // веб-приложения в Chromium — их обработчик ввода переигрывает BS-инжекции
+    // (';ддфф', бой 23:39 02.11). mac-only (на вин SendInput упорядочен)
+    public var pasteConvertApps = ""
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
     public var defaultsV = 11
 }
@@ -137,6 +141,7 @@ public enum SettingsStore {
         case "HotPasteVk": s.hotPasteVk = Int(v) ?? s.hotPasteVk  // битое значение — дефолт, как в C#
         case "HotPasteMods": s.hotPasteMods = Int(v) ?? s.hotPasteMods  // битое значение — дефолт, как в C#
         case "LockAutoAfterManualSwitch": s.lockAutoAfterManualSwitch = v == "1"
+        case "PasteConvertApps": s.pasteConvertApps = v
         case "Exclusions": s.exclusions = v
         case "ThemeMode": s.themeMode = max(0, min(2, Int(v) ?? 0))
         case "DefaultsV": s.defaultsV = Int(v) ?? 0
