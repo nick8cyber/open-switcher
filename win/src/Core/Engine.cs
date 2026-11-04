@@ -350,6 +350,21 @@ namespace OpenSwitcher.Core
             _expectGraceUntil = Environment.TickCount + 1200;
         }
 
+        /// <summary>Процесс в списке PasteConvertApps (авто-конверт через
+        /// выделение+вставку, без BS) — веб-поля в Chromium, mac-паритет 02.11.</summary>
+        private bool PasteConvertListContains(string proc)
+        {
+            string list = S.PasteConvertApps;
+            if (string.IsNullOrEmpty(list) || string.IsNullOrEmpty(proc)) return false;
+            foreach (string part in list.ToLowerInvariant().Split(new[] { ',', ';' }))
+            {
+                string p = part.Trim();
+                if (p.Length == 0) continue;
+                if (proc == p) return true;
+            }
+            return false;
+        }
+
         private static string ProcessNameOf(uint pid)
         {
             if (pid == 0) return "";
@@ -1601,6 +1616,18 @@ namespace OpenSwitcher.Core
             _lastConvertTick = Environment.TickCount;
             _lastWord = word;
             _lastWordSepVk = 0;
+            // PasteConvertApps: веб-поля в Chromium (bb и пр.) переигрывают
+            // BS-инжекции своим обработчиком ввода — путь через выделение+вставку
+            // (механизм §8, ни одного BS; mac-паритет 02.11)
+            if (PasteConvertListContains(_fgProc))
+            {
+                Log("convert: paste-convert app ('" + cur.Text + "' -> '" + best.Text + "')");
+                _selResendVk = resendVk;          // разделитель проглочен — досылаем после вставки
+                _selResendShift = resendShift;
+                TextConverter.SendCombo(0x11, 0x10, 0x25, true, false); // Ctrl+Shift+Left — слово слева
+                BeginFixSelection(true);
+                return true;
+            }
             Suppress(600);
             TextConverter.SendBackspaces(word.Count + (retroFrom != null ? retroFrom.Length + 1 : 0));
             TextConverter.SendUnicode(retroText + best.Text);
@@ -1958,6 +1985,8 @@ namespace OpenSwitcher.Core
         private bool _selRetried;
         private int _selMethod;              // чем копировали: 0 = wm_copy, 1 = Ctrl+C инжекция
         private string _selBaseline;         // буфер до Ctrl+C
+        private int _selResendVk;            // разделитель, проглоченный ради паст-конверта (0 = нет)
+        private bool _selResendShift;        // ...и его Shift (досылается после вставки)
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
 
         public void BeginFixSelection()
@@ -2115,6 +2144,15 @@ namespace OpenSwitcher.Core
             Log("sel: pasted converted (" + lang + ", method=" + (_selMethod == 0 ? "wm" : "inj") + ")");
             _lastConvertInfo = "sel '" + text + "' -> '" + converted + "'";
             _lastConvertTick = Environment.TickCount;
+            // досыл разделителя, проглоченного ради паст-конверта (PasteConvertApps)
+            if (_selResendVk != 0)
+            {
+                TextConverter.InjectMode = S.InputMode;
+                TextConverter.FocusHwnd = _selFocusHwnd;
+                TextConverter.SendKey(_selResendVk, _selResendShift);
+                Log("sel: resent sep vk=0x" + _selResendVk.ToString("X"));
+                _selResendVk = 0;
+            }
 
             // самообучение (Ctrl+Space / Break-flip): одно слово из букв — выучиваем пару,
             // но только не коротыши и не словарные слова (см. комментарий в ForceConvertWord)

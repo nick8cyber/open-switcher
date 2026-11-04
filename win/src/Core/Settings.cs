@@ -47,6 +47,11 @@ namespace OpenSwitcher.Core
         public int TapMinMs = 0;              // тап короче N мс не переключает раскладку (случайный задев); 0 = выкл — жёсткий порог ел реальные тапы
         public bool StartWithWindows = false;
         public bool Paused = false;
+        /// <summary>Поля, где авто-конверт идёт через выделение+вставку (без забоев):
+        /// веб-приложения в Chromium — их обработчик ввода переигрывает BS-инжекции.
+        /// mac-паритет 02.11 (PasteConvertApps); на вин SendInput упорядочен, но
+        /// залипчивые поля существуют и тут.</summary>
+        public string PasteConvertApps = "";
         public string Exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe"; // популярные игры: инжекция/конвертация в них только мешает (чат всё равно руками)
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
         public int DefaultsV = 7; // версия дефолтов (7 = ввод сообщениями окна включён; 6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
@@ -182,6 +187,7 @@ namespace OpenSwitcher.Core
                 case "HotUndoMods": { int n; if (int.TryParse(v, out n)) s.HotUndoMods = n; break; }
                 case "LockAutoAfterManualSwitch": s.LockAutoAfterManualSwitch = v == "1"; break;
                 case "InputMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 1) s.InputMode = n; break; }
+                case "PasteConvertApps": s.PasteConvertApps = v; break;
                 case "Exclusions": s.Exclusions = v; break;
                 case "ThemeMode": { int n; if (int.TryParse(v, out n) && n >= 0 && n <= 2) s.ThemeMode = n; break; }
                 case "DefaultsV": { int n; if (int.TryParse(v, out n)) s.DefaultsV = n; break; }
@@ -220,6 +226,7 @@ namespace OpenSwitcher.Core
                 sb.AppendLine("HotUndoMods=" + s.HotUndoMods);
                 sb.AppendLine("LockAutoAfterManualSwitch=" + (s.LockAutoAfterManualSwitch ? "1" : "0"));
                 sb.AppendLine("InputMode=" + s.InputMode);
+                sb.AppendLine("PasteConvertApps=" + s.PasteConvertApps);
                 sb.AppendLine("Exclusions=" + s.Exclusions);
                 sb.AppendLine("ThemeMode=" + s.ThemeMode);
                 sb.AppendLine("DefaultsV=" + s.DefaultsV);
