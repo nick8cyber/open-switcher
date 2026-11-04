@@ -24,6 +24,14 @@ public final class Engine {
     // точный переворот по памяти (lastWord) вслепую стирал чужой текст
     // (бой 23.10.2026 23:20: юзер стёр 'ujdyj', тап стёр 'весь ui - там ui' — 4 слова)
     private var lastBsAt: TimeInterval = 0
+    // РЕПЛЕЙ-ДЕТЕКТ (бой 23:39 02.11: 'lf'->'да' в bb — поле САМО переиграло
+    // инжекцию: BS×3+L+F+space+space+BS×2+L+F за 60 мс; результат ';ддфф'):
+    // после convert OK на 300 мс армится окно; чужой backspace в нём = удар.
+    // 2 удара за сеанс — поле враждебно забоям, его авто-конверт переводится
+    // на паст-режим (выделение+вставка, ни одного BS)
+    private var replayArmUntil: TimeInterval = 0
+    private var replayStrikes: [pid_t: Int] = [:]
+    private var replayHostile: [pid_t: Bool] = [:]
     // свежая вставка (Cmd+V): paste в Electron коммитится асинхронно — инжекция
     // в этом окне гонится с недокоммиченным текстом (боя 02:54; паритет: C# страдал
     // тем же классом, но SendInput-порядок делал гонку невозможной)
@@ -842,7 +850,21 @@ public final class Engine {
 
         // любой реальный забой двигает каретку влево — снимает доверие к
         // «слово+разд стоят прямо у каретки» (гейт точного переворота)
-        if code == KeyCodeMap.backspace { lastBsAt = now }
+        if code == KeyCodeMap.backspace {
+            lastBsAt = now
+            // РЕПЛЕЙ-ДЕТЕКТ: BS сразу после нашей конвертации = поле переигрывает
+            // инжекцию своим обработчиком (бой 23:39 ';ддфф')
+            if now < replayArmUntil {
+                let strikes = (replayStrikes[fgApp] ?? 0) + 1
+                replayStrikes[fgApp] = strikes
+                logLine("REPLAY STRIKE #\(strikes): чужой BS через \(Int((now - (replayArmUntil - 0.3)) * 1000)) мс после конвертации в \(fgProc)")
+                if strikes >= 2 && replayHostile[fgApp] != true {
+                    replayHostile[fgApp] = true
+                    logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт переводится на паст-режим (выделение+вставка)")
+                    fireInfo("Это поле искажает автозамены — перевожу на вставку")
+                }
+            }
+        }
         // паритет C# (SessionPauseMs=3000): лок живёт только внутри сеанса
         // набора — пауза длиннее 3 с кончает сеанс, следующий ввод начинается
         // с чистым автодетектом (бой 18:24: пауза 35 с, лок всё ещё молчал)
@@ -1718,6 +1740,50 @@ public final class Engine {
         lastWord = word
 
         suppress(0.6)
+        replayArmUntil = Engine.ms() + 0.3 // реплей-детект: чужой BS в окне = удар
+        // ВРАЖДЕБНОЕ ПОЛЕ (2+ удара реплея): BS-инжекция запрещена, конверт через
+        // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
+        // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
+        // выделяем слово, вставляем замену+сепаратор, BS не нужен вовсе
+        if replayHostile[fgApp] == true, let bl = layouts.first(where: { $0.id == best.layoutID }) {
+            logLine("convert: replay-hostile поле — паст-режим ('\(cur.text)' -> '\(bestText)')")
+            suppress(0.3)
+            screenProbe(expectedAfter: bestText, removedTail: cur.text)
+            let from = cur.text, to = bestText
+            let curC = cur, bestC = best, w2 = word, ls2 = layouts
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                usleep(60_000) // тап-колбэк вернулся — посты начали доставляться
+                TextConverter.targetPid = fgApp
+                TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
+                var selNow = self.selectedTextOnMain() ?? ""
+                var tries = 0
+                while !selNow.contains(from) && tries < 4 {
+                    usleep(100_000)
+                    selNow = self.selectedTextOnMain() ?? ""
+                    tries += 1
+                }
+                guard selNow.contains(from) else {
+                    TextConverter.sendCombo(keyCode: 0x7B, mods: 0)
+                    self.logLine("convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(from)' — пропускаю")
+                    return
+                }
+                let saved = TextConverter.getClipboardTextOnce() ?? ""
+                TextConverter.setClipboardText(to)
+                TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
+                self.scheduleClipboardRestore(saved)
+                self.logLine("convert paste-fallback OK: '\(from)' -> '\(to)'")
+                self.performOnTapThread { [weak self] in
+                    guard let self = self else { return }
+                    if w2.count > 1 {
+                        self.switchLayoutOnMain(bl, source: "convert")
+                        self.verifySwitch(target: bl)
+                        self.expectLayout(bl)
+                    }
+                }
+            }
+            return true
+        }
         screenProbe(expectedAfter: bestText, removedTail: cur.text)
         TextConverter.sendBackspaces(word.count + retroPrefix.count)
         TextConverter.sendUnicode(retroText + bestText)
