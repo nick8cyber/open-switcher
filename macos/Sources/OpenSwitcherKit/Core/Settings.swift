@@ -184,6 +184,7 @@ public enum SettingsStore {
             "HotPasteVk=\(s.hotPasteVk)",
             "HotPasteMods=\(s.hotPasteMods)",
             "LockAutoAfterManualSwitch=\(s.lockAutoAfterManualSwitch ? 1 : 0)",
+            "PasteConvertApps=\(s.pasteConvertApps)",
             "Exclusions=\(s.exclusions)",
             "ThemeMode=\(s.themeMode)",
             "DefaultsV=\(s.defaultsV)",
