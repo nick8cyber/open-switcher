@@ -43,6 +43,7 @@ public final class Engine {
     private var prevSingleApp: pid_t = 0
     private var boundaryClean = true          // перед кареткой чистая граница слова (пробел/Enter/начало ввода)
     private var wordStartClean = false        // слово в буфере началось после чистой границы ('b2b' — нет)
+    private var wordStartLayoutID: String? = nil // раскладка ПЕРВОЙ буквы слова: сменилась посреди — рендер буфера врёт (бой 00:19 'момогу')
     private var noFlipUntil: TimeInterval = 0  // кулдаун 5 с после ручной правки (спека v3 §6.2)
     private var markCount = 0
     private var wdTicks = 0
@@ -937,7 +938,7 @@ public final class Engine {
                     buf.clear(); lastWordSepKey = 0
                     prevSingle = nil; boundaryClean = false
                 } else {
-                    if buf.count == 0 { wordStartClean = boundaryClean }
+                    if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id }
                     buf.push(KeyRec(code, shift, caps))
                     if undoPending && !undoTailBroken {
                         if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
@@ -1102,7 +1103,7 @@ public final class Engine {
                 return true
             }
             let rec = KeyRec(code, shift, caps)
-            if buf.count == 0 { wordStartClean = boundaryClean } // что стоит перед словом (ретро-флип)
+            if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id } // что стоит перед словом (ретро-флип)
             buf.push(rec)
             if undoPending && !undoTailBroken && !m.ctrl && !m.alt && !m.cmd {
                 if undoTail.count < 16 { undoTail.append(rec) }
@@ -1281,7 +1282,7 @@ public final class Engine {
         // досланные буквы — часть текущего слова и хвоста отката (порт C#): без этого
         // следующая конвертация/откат стирали на столько символов меньше
         for rec in gapBuf {
-            if buf.count == 0 { wordStartClean = boundaryClean }
+            if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id }
             buf.push(rec)
             if undoPending && !undoTailBroken {
                 if undoTail.count < 16 { undoTail.append(rec) } else { undoTailBroken = true }
@@ -1536,6 +1537,15 @@ public final class Engine {
             logLine("convert skip: cur unknown"); return false
         }
         if cur.lang < 0 { logLine("convert skip: cur unknown lang"); return false }
+
+        // РАСКЛАДКА СМЕНИЛАСЬ ПОСРЕДИ СЛОВА (бой 00:19 05.11 'момогу': «могу»
+        // набрано в РУ, раскладка перевернулась — движок пересчитал буфер в EN,
+        // конверт продублировал готовое слово). Смешанное слово конвертить нельзя:
+        // рендер буфера одной раскладкой врёт. Ручной путь — мимо (юзер настаивает)
+        if !manual, let startID = wordStartLayoutID, startID != cur.layoutID {
+            logLine("convert skip: раскладка сменилась посреди слова (старт '\(startID.prefix(8))' -> текущая '\(cur.layoutID.prefix(8))')")
+            return false
+        }
 
         let typedLow = cur.text.lowercased()
         learnedLock.lock()

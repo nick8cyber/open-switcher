@@ -116,6 +116,7 @@ namespace OpenSwitcher.Core
         private IntPtr _fgHkl;
         private IntPtr _fgFocus;
         private string _fgProc = "";
+        private IntPtr _bufStartHkl;         // раскладка ПЕРВОЙ буквы слова: сменилась посреди — рендер буфера врёт (мac-паритет 'момогу')
         private readonly Dictionary<uint, string> _procCache = new Dictionary<uint, string>();
 
         // дескрипторы собственного UI (настройки): исключаем автоисправление вне "песочницы"
@@ -596,7 +597,7 @@ namespace OpenSwitcher.Core
                         bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
                         bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
                         var recS = new KeyRec((int)(k.vkCode & 0xFF), sh, cp);
-                        if (_buf.Count == 0) _wordStartClean = _boundaryClean;
+                        if (_buf.Count == 0) { _wordStartClean = _boundaryClean; _bufStartHkl = _fgHkl; }
                         _buf.Push(recS);
                         if (_undoPending && !_undoTailBroken)
                         {
@@ -683,7 +684,7 @@ namespace OpenSwitcher.Core
             // конвертация/откат стирали на столько символов меньше
             foreach (KeyRec rec in _gapBuf)
             {
-                if (_buf.Count == 0) _wordStartClean = _boundaryClean;
+                if (_buf.Count == 0) { _wordStartClean = _boundaryClean; _bufStartHkl = _fgHkl; }
                 _buf.Push(rec);
                 if (_undoPending && !_undoTailBroken)
                 {
@@ -960,7 +961,7 @@ namespace OpenSwitcher.Core
                     return true;
                 }
                 KeyRec rec = new KeyRec(vk, shift, caps);
-                if (_buf.Count == 0) _wordStartClean = _boundaryClean; // что стоит перед словом (ретро-флип)
+                if (_buf.Count == 0) { _wordStartClean = _boundaryClean; _bufStartHkl = _fgHkl; } // что стоит перед словом (ретро-флип)
                 _buf.Push(rec);
 
 
@@ -1378,6 +1379,14 @@ namespace OpenSwitcher.Core
             LayoutCandidate cur = null;
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) { Log("convert skip: cur unknown"); return false; }
+
+            // РАСКЛАДКА СМЕНИЛАСЬ ПОСРЕДИ СЛОВА (мac-паритет 'момогу', бой 00:19 05.11:
+            // смешанное слово конвертить нельзя — рендер буфера одной раскладкой врёт)
+            if (!manual && _bufStartHkl != IntPtr.Zero && _bufStartHkl != _fgHkl)
+            {
+                Log("convert skip: layout changed mid-word");
+                return false;
+            }
 
             string typedLow = cur.Text.ToLowerInvariant();
 
