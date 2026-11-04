@@ -1734,6 +1734,14 @@ public final class Engine {
         // протух/не совпал — идём по памяти движка, урон ловят DAMAGE-пробы
         let expectedTail = retroPrefix + cur.text
         let gate = verifyTailForInjection(expectedTail)
+        // Слово УЖЕ на экране в целевом виде (бой 00:19 05.11 'момогу': юзер печатал
+        // «могу» в РУ, раскладка сменилась посреди слова — движок пересчитал буфер
+        // в EN и продублировал готовое слово BS-инжекцией). Устаканившийся экран
+        // показывает best.text = инжекция не нужна, честный отказ
+        if gate.available && !gate.matches && gate.actual == bestText {
+            logLine("convert skip: экран уже показывает '\(bestText)' — слово не в той раскладке только в памяти движка")
+            return false
+        }
         if gate.available {
             logLine(gate.matches
                 ? "convert verify: хвост '\(expectedTail)' у каретки подтверждён"
