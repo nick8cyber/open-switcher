@@ -955,6 +955,12 @@ public final class Engine {
                     if gapBuf.isEmpty { return true }
                     gapBuf.removeLast()
                     return false
+                } else {
+                    // пробел/Enter/знак: как в главной gap-ветке — СНАЧАЛА досылаем
+                    // накопленное, потом клавиша идёт дальше (иначе буквы, набранные
+                    // до пробела, переезжают ЗА него — перестановка текста)
+                    flushGap()
+                    gapActive = false
                 }
             }
             // suppress-окно: конвертация запрещена, но буфер синхронизируем
