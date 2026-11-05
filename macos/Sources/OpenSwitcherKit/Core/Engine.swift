@@ -31,6 +31,8 @@ public final class Engine {
     // на паст-режим (выделение+вставка, ни одного BS)
     private var replayArmUntil: TimeInterval = 0
     private var replayStrikes: [pid_t: Int] = [:]
+    private var replayLastStrikeAt: TimeInterval = 0
+    private var replayHostileUntil: [pid_t: TimeInterval] = [:] // TTL 10 мин: ложный хостил не вечен
     private var replayHostile: [pid_t: Bool] = [:]
     // паттерн реплея: одиночный BS — НЕ реплей (бой 17:10 05.11: юзер сам правил
     // ввод BS×2 через 44 мс после конверта — telegram ЛОЖНО помечен враждебным);
@@ -876,13 +878,20 @@ public final class Engine {
         if replayBsSeen && now < replayArmUntil && KeyCodeMap.isLetterKey(code)
             && replayWordCodes.contains(code) {
             replayBsSeen = false
+            // затухание: страйки старше 60 с не копятся (бой 17:10 — юзер правил
+            // ввод BS+ретайп того же слова: паттерн совпал, но это не реплей)
+            if now - replayLastStrikeAt > 60 { replayStrikes[fgApp] = 0 }
             let strikes = (replayStrikes[fgApp] ?? 0) + 1
             replayStrikes[fgApp] = strikes
+            replayLastStrikeAt = now
             logLine("REPLAY STRIKE #\(strikes): BS+клавиша слова после конвертации в \(fgProc)")
-            if strikes >= 2 && replayHostile[fgApp] != true {
-                replayHostile[fgApp] = true
-                logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт переводится на паст-режим (выделение+вставка)")
-                fireInfo("Это поле искажает автозамены — перевожу на вставку")
+            if strikes >= 2 {
+                replayHostileUntil[fgApp] = now + 600 // TTL 10 мин: ложный хостил не вечен
+                if replayHostile[fgApp] != true {
+                    replayHostile[fgApp] = true
+                    logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт на паст-режиме 10 мин (выделение+вставка)")
+                    fireInfo("Это поле искажает автозамены — перевожу на вставку")
+                }
             }
         }
         // паритет C# (SessionPauseMs=3000): лок живёт только внутри сеанса
@@ -952,7 +961,12 @@ public final class Engine {
                     gapBuf.append(KeyRec(code, shift, caps))
                     return false
                 } else if code == KeyCodeMap.backspace {
-                    if gapBuf.isEmpty { return true }
+                    if gapBuf.isEmpty {
+                        // пустой gapBuf: BS идёт в поле — буфер синхронно схлопывается
+                        // (дефект аудита №3, twin главной gap-ветки)
+                        if buf.count > 0 { buf.pop() } else { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
+                        return true
+                    }
                     gapBuf.removeLast()
                     return false
                 } else {
@@ -1100,9 +1114,10 @@ public final class Engine {
                 gapActive = false
             } else {
                 if KeyCodeMap.isLetterKey(code) {
-                    // Cmd/Ctrl+буква в лаге смены раскладки — команда: в отложенные
-                    // буквы не пишем (та же фантомная «ф»), отдаём как есть
-                    if m.cmd || m.ctrl {
+                    // Cmd/Ctrl/Option+буква в лаге смены раскладки — команда или
+                    // спецзнак: в отложенные буквы не пишем, отдаём как есть
+                    // (Option раньше попадал в gapBuf и доезжал буквой — дефект аудита №4)
+                    if m.cmd || m.ctrl || m.alt {
                         flushGap()
                         gapActive = false
                         return true
@@ -1111,7 +1126,13 @@ public final class Engine {
                     return false // доставим после применения раскладки
                 }
                 if code == KeyCodeMap.backspace {
-                    if gapBuf.isEmpty { return true }
+                    if gapBuf.isEmpty {
+                        // пустой gapBuf: BS идёт в поле — буфер обязан синхронно
+                        // схлопнуться, иначе следующая конвертация стёрла бы лишнее
+                        // (дефект аудита №3)
+                        if buf.count > 0 { buf.pop() } else { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
+                        return true
+                    }
                     gapBuf.removeLast()
                     return false
                 }
@@ -1434,8 +1455,10 @@ public final class Engine {
         var last = screenTailForInjectionTail(expectedTail)
         if last.matches { return (true, true, last.actual) }
         var stableCount = 0
-        for _ in 0..<4 {
-            usleep(100_000)
+        // бюджет ~0.3 с: ретраи на тап-потоке — длиннее окно = лаг печати юзера
+        // и риск tapDisabled (дефект аудита №7: худший случай 1.4 с)
+        for _ in 0..<2 {
+            usleep(60_000)
             let next = screenTailForInjectionTail(expectedTail)
             if next.matches { return (true, true, next.actual) }
             if !next.available || next.actual.isEmpty { return (false, false, next.actual) }
@@ -1821,12 +1844,15 @@ public final class Engine {
         // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
         // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
         // выделяем слово, вставляем замену+сепаратор, BS не нужен вовсе
-        if (replayHostile[fgApp] == true || pasteConvertList.contains(fgProc)),
+        let hostileNow = replayHostile[fgApp] == true && Engine.ms() < (replayHostileUntil[fgApp] ?? 0)
+        if (hostileNow || pasteConvertList.contains(fgProc)),
            let bl = layouts.first(where: { $0.id == best.layoutID }) {
             logLine("convert: replay-hostile поле — паст-режим ('\(cur.text)' -> '\(bestText)')")
             suppress(0.3)
-            screenProbe(expectedAfter: bestText, removedTail: cur.text)
             let from = cur.text, to = bestText
+            // сепаратор проглатывается ради паст-конверта — досылается после вставки
+            let sepChar = resendKey == KeyCodeMap.enter ? "\n"
+                : (resendKey != 0 ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : "")
             let curC = cur, bestC = best, w2 = word, ls2 = layouts
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
@@ -1848,7 +1874,9 @@ public final class Engine {
                 let saved = TextConverter.getClipboardTextOnce() ?? ""
                 TextConverter.setClipboardText(to)
                 TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
+                if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) }
                 self.scheduleClipboardRestore(saved)
+                self.screenProbe(expectedAfter: to, removedTail: from)
                 self.logLine("convert paste-fallback OK: '\(from)' -> '\(to)'")
                 self.performOnTapThread { [weak self] in
                     guard let self = self else { return }
@@ -1856,7 +1884,20 @@ public final class Engine {
                         self.switchLayoutOnMain(bl, source: "convert")
                         self.verifySwitch(target: bl)
                         self.expectLayout(bl)
+                        self.armGapForEngineSwitch(bl)
                     }
+                    // точка отката: стёрто [слово], вставлено [замена(+сеп)]
+                    self.undoPending = true
+                    self.undoText = from
+                    self.undoLen = to.count
+                    self.undoPrefix = ""; self.undoPrefixLen = 0
+                    self.undoSepText = sepChar
+                    self.undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
+                    self.undoApp = self.fgApp
+                    self.undoAt = Engine.ms()
+                    self.keysSinceUndoPoint = 0
+                    self.undoTail.removeAll()
+                    self.undoTailBroken = false
                 }
             }
             return true
@@ -1889,6 +1930,7 @@ public final class Engine {
             switchLayoutOnMain(bl, source: "convert")
             verifySwitch(target: bl)
             expectLayout(bl)
+            armGapForEngineSwitch(bl)
         }
 
         // паритет C# injOk (Engine.cs:1295): без «Универсального доступа» инжекция
