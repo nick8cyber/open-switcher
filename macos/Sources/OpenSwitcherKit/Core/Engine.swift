@@ -32,6 +32,11 @@ public final class Engine {
     private var replayArmUntil: TimeInterval = 0
     private var replayStrikes: [pid_t: Int] = [:]
     private var replayHostile: [pid_t: Bool] = [:]
+    // паттерн реплея: одиночный BS — НЕ реплей (бой 17:10 05.11: юзер сам правил
+    // ввод BS×2 через 44 мс после конверта — telegram ЛОЖНО помечен враждебным);
+    // реплей всегда ДОПЕЧАТЫВАЕТ клавиши слова (';ддфф': BS×3 затем L,F — клавиши 'lf')
+    private var replayWordCodes: [Int] = []
+    private var replayBsSeen = false
     // свежая вставка (Cmd+V): paste в Electron коммитится асинхронно — инжекция
     // в этом окне гонится с недокоммиченным текстом (боя 02:54; паритет: C# страдал
     // тем же классом, но SendInput-порядок делал гонку невозможной)
@@ -863,17 +868,21 @@ public final class Engine {
         // «слово+разд стоят прямо у каретки» (гейт точного переворота)
         if code == KeyCodeMap.backspace {
             lastBsAt = now
-            // РЕПЛЕЙ-ДЕТЕКТ: BS сразу после нашей конвертации = поле переигрывает
-            // инжекцию своим обработчиком (бой 23:39 ';ддфф')
-            if now < replayArmUntil {
-                let strikes = (replayStrikes[fgApp] ?? 0) + 1
-                replayStrikes[fgApp] = strikes
-                logLine("REPLAY STRIKE #\(strikes): чужой BS через \(Int((now - (replayArmUntil - 0.3)) * 1000)) мс после конвертации в \(fgProc)")
-                if strikes >= 2 && replayHostile[fgApp] != true {
-                    replayHostile[fgApp] = true
-                    logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт переводится на паст-режим (выделение+вставка)")
-                    fireInfo("Это поле искажает автозамены — перевожу на вставку")
-                }
+            // РЕПЛЕЙ-ДЕТЕКТ, фаза 1: BS в окне после конверта — только ЗАПИСЬ
+            // (одиночный BS = правка юзера, не реплей — бой 17:10)
+            if now < replayArmUntil { replayBsSeen = true }
+        }
+        // фаза 2: после BS в окне прилетела БУКВА СЛОВА — вот это реплей
+        if replayBsSeen && now < replayArmUntil && KeyCodeMap.isLetterKey(code)
+            && replayWordCodes.contains(code) {
+            replayBsSeen = false
+            let strikes = (replayStrikes[fgApp] ?? 0) + 1
+            replayStrikes[fgApp] = strikes
+            logLine("REPLAY STRIKE #\(strikes): BS+клавиша слова после конвертации в \(fgProc)")
+            if strikes >= 2 && replayHostile[fgApp] != true {
+                replayHostile[fgApp] = true
+                logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт переводится на паст-режим (выделение+вставка)")
+                fireInfo("Это поле искажает автозамены — перевожу на вставку")
             }
         }
         // паритет C# (SessionPauseMs=3000): лок живёт только внутри сеанса
@@ -931,6 +940,23 @@ public final class Engine {
         if !KeyCodeMap.isModifier(code) { lastInputAt = now } // (пауза-экспирация лока — выше, до этого)
 
         if now < suppressUntil {
+            // GAP В SUPPRESS (бой 17:10 'naa'): конверт переключил раскладку и
+            // вызвал suppress; буквы в suppress-окне идут мимо gap-ветки (она
+            // ниже) и рендерятся СТАРОЙ раскладкой в момент TISSelect-лага.
+            // gap активен и глотает буквы/BS — доставим новой раскладкой
+            if gapActive, let gl = gapLayout {
+                if LayoutService.currentLayout()?.id == gl.id || now >= gapDeadline {
+                    flushGap()
+                    gapActive = false
+                } else if KeyCodeMap.isLetterKey(code) && !m.cmd && !m.ctrl && !m.alt {
+                    gapBuf.append(KeyRec(code, shift, caps))
+                    return false
+                } else if code == KeyCodeMap.backspace {
+                    if gapBuf.isEmpty { return true }
+                    gapBuf.removeLast()
+                    return false
+                }
+            }
             // suppress-окно: конвертация запрещена, но буфер синхронизируем
             if KeyCodeMap.isLetterKey(code) {
                 // Cmd/Ctrl/Alt+буква — команда/спецзнак, не текст: буфер под ноль (как в основной ветке)
@@ -1782,7 +1808,9 @@ public final class Engine {
         lastWord = word
 
         suppress(0.6)
-        replayArmUntil = Engine.ms() + 0.3 // реплей-детект: чужой BS в окне = удар
+        replayArmUntil = Engine.ms() + 0.3 // реплей-детект (фаза 1: BS)
+        replayWordCodes = word.map { $0.code }
+        replayBsSeen = false
         // ВРАЖДЕБНОЕ ПОЛЕ (2+ удара реплея): BS-инжекция запрещена, конверт через
         // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
         // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
