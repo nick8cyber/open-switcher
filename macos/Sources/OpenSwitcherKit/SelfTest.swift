@@ -109,6 +109,10 @@ public enum SelfTest {
             ("huge: 'callback' в словаре",       WordDict.has("callback", 1), true),
             ("huge: 'перкуссия' НЕ в старом топе", !WordDict.ruBig.contains("перкуссия"), true),
             ("huge: возможное не сломано ('кшмрре')", LanguageTables.possibleWord("кшмрре", 0), false),
+            // паст-пути, бой 02:08/03:02 06.11: каретка и десинк-детект
+            ("paste: 'да ' = уже целевое (десинк)", Engine.pasteSelectionAlreadyTarget("да ", target: "да"), true),
+            ("paste: 'lf ' ≠ целевое",            Engine.pasteSelectionAlreadyTarget("lf ", target: "да"), false),
+            ("paste: 'да' без пробелов = целевое", Engine.pasteSelectionAlreadyTarget("да", target: "да"), true),
         ]
         for (name, got, want) in v3checks {
             let pass = got == want

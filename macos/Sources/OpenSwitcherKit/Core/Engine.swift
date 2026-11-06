@@ -427,6 +427,12 @@ public final class Engine {
         if event.getIntegerValueField(TextConverter.userField) == TextConverter.selfMagic {
             return Unmanaged.passUnretained(event)
         }
+        if type == .keyDown || type == .leftMouseDown || type == .rightMouseDown {
+            // только НАЖАТИЯ: keyUp/flagsChanged триггера (пробел, чей keyDown породил
+            // конверт) приходят в первые ~30-100 мс и ложно рвали seq-гвард, убивая
+            // паст-путь на каждом конверте (аудит 06.11, дефект 2)
+            inputSeq &+= 1 // живый ввод: паст-пути по нему детектят гонку с печатью юзера
+        }
         if consumeSessionReset() { resetSession() }
 
         // ДИАГНОСТИКА (временно): полное эхо входящих клавиатурных событий
@@ -577,6 +583,10 @@ public final class Engine {
 
     private var exclusionList: [String] = []
     private var pasteConvertList: [String] = []
+    // счётчик живого ввода (растёт на каждом НЕ-своем событии в тапе): паст-пути
+    // сверяют его до/во время выделения — удар юзера в окне выделения замещает
+    // его и СТИРАЕТ слово (бой 02:08 06.11: '' nj' стёрлось ударом 'x')
+    private var inputSeq: UInt64 = 0
 
     private func rebuildPasteConvertList() {
         pasteConvertList = s.pasteConvertApps.lowercased()
@@ -1390,6 +1400,52 @@ public final class Engine {
         }
     }
 
+    /// Синхронный заход на поток тапа за живым состоянием (владелец inputSeq/fgApp —
+    /// он). nil — тап не ответил за 0.2 с; вызывающий трактует как «безопасный отказ».
+    private func syncOnTap<T>(_ body: @escaping () -> T) -> T? {
+        if CFRunLoopGetCurrent() === tapRunLoop { return body() }
+        guard let rl = tapRunLoop else { return nil }
+        var out: T? = nil
+        let sem = DispatchSemaphore(value: 0)
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) {
+            out = body()
+            sem.signal()
+        }
+        CFRunLoopWakeUp(rl)
+        _ = sem.wait(timeout: .now() + 0.3)
+        return out
+    }
+
+    /// Печатает ли юзер СЕЙЧАС (или увёл фокус): выделение, открытое поверх живой
+    /// печати, замещается следующим ударом и слово стирается (бой 02:08 06.11).
+    /// Снимок берётся на потоке тапа — без гонок. Расхождение/нет ответа = отмена
+    /// (безопасная сторона; «нет ответа» отдельно помечается в лог — тап бывает
+    /// занят settle-ретреем, это не печать).
+    private func pasteTypingAbort(seq0: UInt64, fg0: pid_t) -> Bool {
+        guard let snap = syncOnTap({ () -> (UInt64, pid_t) in (self.inputSeq, self.fgApp) }) else {
+            logLine("paste-check: тап не ответил за таймаут — отмена по безопасности (не печать)")
+            return true
+        }
+        return snap.0 != seq0 || snap.1 != fg0
+    }
+
+    /// Гашение выделения БЕЗ сдвига каретки. Бои 02:08/03:02 06.11: отказ гасил
+    /// выделение голой стрелкой ВЛЕВО — каретка прыгала в начало слова, печать
+    /// юзера втыкалась в чужое место, «задевает, стирает лишнее». Option+Shift+Left
+    /// выделяет СЛЕВА от каретки, значит стрелка ВПРАВО схлопывает выделение в его
+    /// конец = исходная позиция каретки. Пустое чтение AX — выделения нет, не шлём
+    /// ничего; nil (AX молчит) — выделение скорее живо, гасим вправо.
+    private func deselectSelectionCaretSafe(_ selRead: String?) {
+        if let s = selRead, s.isEmpty { return } // выделения нет — каретка и так на месте
+        TextConverter.sendCombo(keyCode: 0x7C /* Right */, mods: 0)
+    }
+
+    /// Слово уже в целевой раскладке на экране (бой 03:02: десинк памяти движка и
+    /// системы — поле уже содержало «да», выделение дало «да ») — переворот не нужен.
+    static func pasteSelectionAlreadyTarget(_ sel: String, target: String) -> Bool {
+        sel.trimmingCharacters(in: .whitespacesAndNewlines) == target
+    }
+
     /// Замер экрана вокруг инжекции: текст фокусного поля до и через 0.4 с после —
     /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
     /// Текст не изменился после инжекции = цель не съела замену («определил,
@@ -1853,22 +1909,53 @@ public final class Engine {
             // сепаратор проглатывается ради паст-конверта — досылается после вставки
             let sepChar = resendKey == KeyCodeMap.enter ? "\n"
                 : (resendKey != 0 ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : "")
-            let curC = cur, bestC = best, w2 = word, ls2 = layouts
+            let w2 = word
+            let seq0 = inputSeq, fg0 = fgApp // мы на потоке тапа — снимок без гонки
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
-                usleep(60_000) // тап-колбэк вернулся — посты начали доставляться
-                TextConverter.targetPid = fgApp
+                usleep(30_000) // тап-колбэк давно вернулся; >60 мс окно ловит печать юзера
+                // юзер печатает/правит/фокус ушёл — НЕ выделяем: удар по живому
+                // выделению замещает его и стирает слово (бой 02:08 06.11)
+                if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
+                    // сепаратор не досылаем: ввод юзера в полёте, досыл даст двойной
+                    // пробел/вставку в чужое место; слова МОГУТ склеиться — осознанный
+                    // трейдофф (аудит 06.11, дефект 4)
+                    self.logLine("convert paste-abort: юзер печатает/фокус ушёл — выделение не делаю, слово как набрано (сепаратор не досылён: возможна склейка слов)")
+                    return
+                }
+                TextConverter.targetPid = fg0
                 TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
-                var selNow = self.selectedTextOnMain() ?? ""
+                // выделение живёт минимальное время: ретраи ТОЛЬКО по пустоте
+                // (протухший AX), несовпадение при живом чтении решаем сразу
+                var selOpt = self.selectedTextOnMain()
+                var selNow = selOpt ?? ""
                 var tries = 0
-                while !selNow.contains(from) && tries < 4 {
-                    usleep(100_000)
-                    selNow = self.selectedTextOnMain() ?? ""
+                var userTyping = false
+                while (selOpt == nil || selNow.isEmpty) && tries < 2 {
+                    usleep(50_000)
+                    if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
+                        // юзер начал печатать по живому выделению — его удар уже
+                        // заменил выделение; НИ ОДНОЙ клавиши не шлём (Right сдвинул
+                        // бы его каретку, sep встал бы в чужое место — аудит 06.11, дефект 1)
+                        userTyping = true
+                        break
+                    }
+                    selOpt = self.selectedTextOnMain()
+                    selNow = selOpt ?? ""
                     tries += 1
                 }
-                guard selNow.contains(from) else {
-                    TextConverter.sendCombo(keyCode: 0x7B, mods: 0)
-                    self.logLine("convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(from)' — пропускаю")
+                if userTyping {
+                    self.logLine("convert paste-abort: юзер печатает по выделению — не мешаю (клавиш не шлю)")
+                    return
+                }
+                guard selOpt != nil, selNow.contains(from) else {
+                    // юзер не печатал (seq цел) — выделение наше, гасим БЕЗ сдвига каретки
+                    let already = Engine.pasteSelectionAlreadyTarget(selNow, target: to)
+                    self.deselectSelectionCaretSafe(selOpt)
+                    if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) } // проглоченный сепаратор возвращаем — слова не склеиваются
+                    self.logLine(already
+                        ? "convert paste-fallback: на экране уже '\(to)' (десинк памяти и раскладки) — не переворачиваю, сепаратор дослан"
+                        : "convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(from)' — сепаратор дослан, каретка на месте")
                     return
                 }
                 let saved = TextConverter.getClipboardTextOnce() ?? ""
@@ -2135,9 +2222,10 @@ public final class Engine {
         let cur2 = cur, best2 = best
         let skipLearn2 = skipLearn
         let fg = fgApp
+        let seq0 = inputSeq // снимок на потоке тапа: гонка «выделение vs печать»
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.runPasteFlip(from: from2, to: to2, word: word2, layouts: layouts2,
-                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg)
+                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg, seq0: seq0)
         }
         logLine("paste-flip: исполнение отложено (вне тап-колбэка)")
         return .accepted
@@ -2145,15 +2233,22 @@ public final class Engine {
 
     /// Тело паст-флипа (фоновая очередь, тап-колбэк уже вернулся):
     /// Option+Shift+Left → сверка выделения с AX → Cmd+V → буфер восстановлен.
-    /// Ни одного backspace. Отказ — стрелка гасит выделение, плашка
+    /// Ни одного backspace. Отказ — гашение выделения стрелкой ВПРАВО (в конец =
+    /// исходная каретка), плашка
     private func runPasteFlip(from: String, to: String, word: [KeyRec],
                               layouts: [LayoutService.LayoutData], cur: LayoutCandidate,
-                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t) {
+                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t, seq0: UInt64) {
         defer { pasteFlipInFlight = false }
         usleep(60_000) // дать тап-колбэку вернуться (доставка постов — после него)
+        // юзер печатает/фокус ушёл — не выделяем (удар замещает выделение = слово стёрто)
+        if pasteTypingAbort(seq0: seq0, fg0: fg) {
+            logLine("paste-flip abort: юзер печатает/фокус ушёл — не мешаю")
+            return
+        }
         TextConverter.targetPid = fg
         TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
-        var sel = selectedTextOnMain() ?? ""
+        var selOpt = selectedTextOnMain()
+        var sel = selOpt ?? ""
         var tries = 0
         // выделение = слово, возможно с обрамляющими пробелами (TextEdit берёт
         // 'спеки ' с хвостовым — самотест 02:57); вставка пробелы сохраняет
@@ -2166,19 +2261,26 @@ public final class Engine {
             pasteText = pre + to + suf
             return true
         }
-        while !matchSel(sel) && tries < 4 {
-            usleep(100_000)
-            sel = selectedTextOnMain() ?? ""
+        while !matchSel(sel) && tries < 3 {
+            usleep(80_000)
+            if pasteTypingAbort(seq0: seq0, fg0: fg) {
+                // юзер начал печатать по живому выделению — его удар уже заменил
+                // выделение; никаких клавиш не шлём (стрелка сдвинула бы его каретку)
+                logLine("paste-flip abort: юзер печатает по выделению — не мешаю")
+                return
+            }
+            selOpt = selectedTextOnMain()
+            sel = selOpt ?? ""
             tries += 1
         }
         guard matchSel(sel) else {
-            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(from)' — гашу, тапни снова")
-            TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: 0)
+            deselectSelectionCaretSafe(selOpt) // стрелка ВПРАВО: каретка в конец выделения = где была
+            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(from)' — гашу вправо, тапни снова")
             fireInfo("Не выделилось слово — тапни Option ещё раз")
             return
         }
         guard let saved = TextConverter.getClipboardTextOnce() else {
-            TextConverter.sendCombo(keyCode: 0x7B, mods: 0)
+            deselectSelectionCaretSafe(selOpt)
             logLine("paste-flip refuse: буфер не читается")
             return
         }
@@ -2525,6 +2627,9 @@ public final class Engine {
                 return
             }
             logLine("sel: no new clipboard (text \(text.isEmpty ? "empty" : "present")\(seqChanged ? "" : ", seq unchanged"))")
+            // выделение создавал движок (fix-word) — оставшееся живым, оно съест
+            // следующий удар юзера; гасим вправо (каретка в конец = где была)
+            if selFromFixWord { deselectSelectionCaretSafe(PasswordGuard.selectedText()) }
             fireInfo("Не удалось скопировать выделение в этом приложении")
             return
         }
@@ -2533,6 +2638,7 @@ public final class Engine {
         let lang = LanguageTables.langOf(LanguageTables.lettersOnly(text))
         if lang < 0 {
             logLine("sel: lang unknown")
+            if selFromFixWord { deselectSelectionCaretSafe(PasswordGuard.selectedText()) }
             fireInfo("Не удалось определить язык")
             return
         }
@@ -2541,6 +2647,8 @@ public final class Engine {
         // иначе Cmd+V затрёт чужой текст (выделение съехало/схлопнулось)
         if let sel = PasswordGuard.selectedText(), sel != text {
             logLine("sel REFUSED: выделение '\(sel)' != скопированному '\(text)' — вставка отменена")
+            // выделение движка (fix-word) гасим, своё — юзера не трогаем
+            if selFromFixWord { deselectSelectionCaretSafe(sel) }
             fireInfo("Выделение изменилось — конвертация отменена")
             return
         }

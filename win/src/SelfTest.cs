@@ -230,6 +230,24 @@ namespace OpenSwitcher
             sb.AppendLine(string.Format("{0}: fuzzy 'смоотри' ~= '{1}' dist{2} ({3})",
                 extraPass ? "PASS" : "FAIL", extraNeighbor ?? "-", extraDist, "лишняя буква = удаление"));
 
+            // сверка скопированного с ожидаемым словом паст-конверта (бой 02:08/03:02 06.11:
+            // гонка печати/реплея подсовывает чужой текст — вставлять нельзя)
+            var selExpectChecks = new[]
+            {
+                new object[] { "lf ",  "lf", true,  "своё слово с хвостовым пробелом" },
+                new object[] { "да ",  "lf", false, "чужой текст (десинк раскладки) — отказ" },
+                new object[] { null,   "lf", false, "пустое чтение — отказ" },
+                new object[] { "lf",   null, true,  "ручной sel-флоу без ожидания — сверять не с чем" }
+            };
+            foreach (object[] r in selExpectChecks)
+            {
+                bool got = Engine.SelMatchesExpect((string)r[0], (string)r[1]);
+                bool pass = got == (bool)r[2];
+                if (!pass) fails++;
+                sb.AppendLine(string.Format("{0}: sel-expect '{1}' vs '{2}' [{3}] {4} ({5})",
+                    pass ? "PASS" : "FAIL", r[0] ?? "-", r[1] ?? "-", got ? "ok" : "reject", pass ? "" : "!!", r[3]));
+            }
+
             sb.AppendLine(fails == 0 ? "ALL TESTS PASSED" : fails + " TEST(S) FAILED");
             try
             {

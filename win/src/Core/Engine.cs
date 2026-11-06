@@ -1631,10 +1631,13 @@ namespace OpenSwitcher.Core
             if (PasteConvertListContains(_fgProc))
             {
                 Log("convert: paste-convert app ('" + cur.Text + "' -> '" + best.Text + "')");
-                _selResendVk = resendVk;          // разделитель проглочен — досылаем после вставки
-                _selResendShift = resendShift;
                 TextConverter.SendCombo(0x11, 0x10, 0x25, true, false); // Ctrl+Shift+Left — слово слева
                 BeginFixSelection(true);
+                // разделитель проглочен — досылаем после вставки; строго ПОСЛЕ
+                // BeginFixSelection: он сбрасывает stale-сепаратор (аудит 06.11)
+                _selResendVk = resendVk;
+                _selResendShift = resendShift;
+                _selExpect = cur.Text; // сверка: вставлять только своё слово (мусор от гонки/реплея — отказ)
                 return true;
             }
             Suppress(600);
@@ -1996,6 +1999,7 @@ namespace OpenSwitcher.Core
         private string _selBaseline;         // буфер до Ctrl+C
         private int _selResendVk;            // разделитель, проглоченный ради паст-конверта (0 = нет)
         private bool _selResendShift;        // ...и его Shift (досылается после вставки)
+        private string _selExpect;           // ожидаемое слово паст-конверта (null = sel-флоу без сверки: ручное выделение)
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
 
         public void BeginFixSelection()
@@ -2010,6 +2014,9 @@ namespace OpenSwitcher.Core
             _selFocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
             _selFromFixWord = fromFixWord;
             _selRetried = false;
+            _selExpect = null;
+            _selResendVk = 0;      // stale-сепаратор прошлого флоу не должен утекать
+            _selResendShift = false; // (аудит 06.11, дефект 3: прерванный paste-флоу оставлял vk жить)
             _selBaseline = TextConverter.GetClipboardTextOnce();
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
@@ -2050,6 +2057,44 @@ namespace OpenSwitcher.Core
         {
             var sb = new System.Text.StringBuilder(64);
             return Native.GetClassName(hwnd, sb, sb.Capacity) > 0 ? sb.ToString() : "";
+        }
+
+        /// <summary>Гашение выделения, созданного ДВИЖКОМ (fix-word/paste-конверт).
+        /// Ctrl+Shift+Left выделяет слева от каретки: VK_RIGHT схлопывает выделение
+        /// в его конец = исходная позиция каретки (голый LEFT/отсутствие гашения
+        /// смещали каретку/оставляли выделение съедать следующий удар юзера —
+        /// мак-бой 02:08/03:02 06.11, вин-паритет). Выделение юзера не трогаем.</summary>
+        private void SelDeselectOurs()
+        {
+            if (!_selFromFixWord && _selExpect == null) return; // выделение юзера — его собственность
+            TextConverter.ReleaseModifiers();
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _selFocusHwnd;
+            TextConverter.SendCombo(0, 0, 0x27, true, false); // VK_RIGHT (extended)
+        }
+
+        /// <summary>Досыл разделителя, проглоченного ради паст-конверта: на отказе
+        /// слова обязаны НЕ склеиваться. Чистит состояние (stale-пробел в следующий
+        /// sel-флоу — баг: sep жил в поле и после отказа).</summary>
+        private void SelResendSeparator()
+        {
+            if (_selResendVk == 0) return;
+            TextConverter.InjectMode = S.InputMode;
+            TextConverter.FocusHwnd = _selFocusHwnd;
+            // БЫЛО SendKey(vk, _selResendShift): Shift уходил в параметр extended —
+            // '?' (Shift+/) пересылался как '/' без шифта
+            TextConverter.SendKey(_selResendVk, false, _selResendShift);
+            Log("sel: resent sep vk=0x" + _selResendVk.ToString("X") + " (refusal path)");
+            _selResendVk = 0;
+        }
+
+        /// <summary>Сверка скопированного с ожидаемым словом паст-конверта.
+        /// null-ожидание = ручное выделение (сверять не с чем). Чистая функция для SelfTest.</summary>
+        public static bool SelMatchesExpect(string text, string expect)
+        {
+            if (expect == null) return true;
+            if (text == null) return false;
+            return text.Contains(expect);
         }
 
         private void SelPollTick(object sender, EventArgs e)
@@ -2124,15 +2169,33 @@ namespace OpenSwitcher.Core
                 }
                 // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
                 Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
+                SelDeselectOurs();     // висящее выделение движка съест следующий удар юзера
+                SelResendSeparator();  // проглоченный сепаратор возвращаем — слова не склеиваются
                 FireInfo("Не удалось скопировать выделение в этом приложении");
                 return;
             }
             Log("sel: got " + text.Length + " chars (method=" + (_selMethod == 0 ? "wm_copy" : "ctrl+c") + ")");
 
+            // сверка с ожидаемым словом (паст-конверт): гонка печати/реплей поля даёт
+            // чужой текст в выделении — конвертить и вставлять его НЕЛЬЗЯ
+            if (!SelMatchesExpect(text, _selExpect))
+            {
+                Log("sel REFUSED: выделение '" + (text.Length > 16 ? text.Substring(0, 16) : text)
+                    + "' != ожидаемому '" + _selExpect + "' — отмена, каретка на месте");
+                SelDeselectOurs();
+                SelResendSeparator();
+                FireInfo("Слово не удержалось в выделении — повтори");
+                _selExpect = null;
+                return;
+            }
+            _selExpect = null; // сверено (или ручной sel-флоу без ожидания)
+
             int lang = LanguageTables.LangOf(LanguageTables.LettersOnly(text));
             if (lang < 0)
             {
                 Log("sel: lang unknown");
+                SelDeselectOurs();
+                SelResendSeparator();
                 FireInfo("Не удалось определить язык");
                 return;
             }
@@ -2158,7 +2221,8 @@ namespace OpenSwitcher.Core
             {
                 TextConverter.InjectMode = S.InputMode;
                 TextConverter.FocusHwnd = _selFocusHwnd;
-                TextConverter.SendKey(_selResendVk, _selResendShift);
+                // Shift — третьим аргументом (2-арг overload принимает extended, не шифт)
+                TextConverter.SendKey(_selResendVk, false, _selResendShift);
                 Log("sel: resent sep vk=0x" + _selResendVk.ToString("X"));
                 _selResendVk = 0;
             }
