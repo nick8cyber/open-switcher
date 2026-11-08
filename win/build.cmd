@@ -36,11 +36,16 @@ echo BUILD OK: OpenSwitcher.exe
 
 rem --- self-test детектора раскладки (вывод в stdout) ---
 rem ПРОВАЛ САМОТЕСТА РОНИТ СБОРКУ: раньше код возврата игнорировался (exit /b 0
-rem безусловно), и FAIL-чеки доезжали до релиза молча
-OpenSwitcher.exe --selftest "%~dp0selftest_result.txt"
+rem безусловно), и FAIL-чеки доезжали до релиза молча. winexe без консоли не
+rem пишет в лог CI — stdout ловим в файл и печатаем; при провале печатаем и
+rem crash-логи (исключение в чеке пишет os_selftest_crash.log, exit 2)
+OpenSwitcher.exe --selftest "%~dp0selftest_result.txt" > "%~dp0selftest_stdout.txt" 2>&1
+type "%~dp0selftest_stdout.txt" 2>nul
 if errorlevel 1 (
     echo SELFTEST FAILED
-    type "%~dp0selftest_result.txt" 2>nul
+    if exist "%~dp0selftest_result.txt" type "%~dp0selftest_result.txt"
+    if exist "%~dp0os_selftest_crash.log" type "%~dp0os_selftest_crash.log"
+    if exist "%~dp0os_crash.log" type "%~dp0os_crash.log"
     exit /b 1
 )
 exit /b 0

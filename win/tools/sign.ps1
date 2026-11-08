@@ -3,7 +3,10 @@
 # подписываются ИМ, поэтому репутация/доверие в COMODO не сбрасывается на каждом ребилде.
 $ErrorActionPreference = "Continue"
 
-$exe = "D:\Developing\tools\open-switcher\OpenSwitcher.exe"
+# exe рядом с репо (win\OpenSwitcher.exe); жёсткий путь старой локальной
+# раскладки — только фолбэк (на CI он не существует и валил подпись шумом)
+$exe = Join-Path $PSScriptRoot "..\OpenSwitcher.exe"
+if (-not (Test-Path $exe)) { $exe = "D:\Developing\tools\open-switcher\OpenSwitcher.exe" }
 $subject = "CN=OpenSwitcher Local"
 
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |

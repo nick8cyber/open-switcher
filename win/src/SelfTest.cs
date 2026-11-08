@@ -254,7 +254,10 @@ namespace OpenSwitcher
                 File.WriteAllText(outPath, sb.ToString());
             }
             catch (Exception) { }
-            Console.Write(sb.ToString());
+            // winexe без консоли (CI/старт из explorer): первый Write бросает
+            // IOException «handle is invalid» и валил самотест ДО записи файла —
+            // гейт build.cmd видел exit 2 без единой строки диагностики
+            try { Console.Write(sb.ToString()); } catch (Exception) { }
             return fails == 0 ? 0 : 1;
         }
 
