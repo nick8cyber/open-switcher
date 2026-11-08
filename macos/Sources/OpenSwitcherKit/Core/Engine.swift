@@ -1949,7 +1949,13 @@ public final class Engine {
                     return
                 }
                 guard selOpt != nil, selNow.contains(from) else {
-                    // юзер не печатал (seq цел) — выделение наше, гасим БЕЗ сдвига каретки
+                    // остаточное окно гонки (вход-чек был на +30 мс, чтение могло
+                    // опоздать): удар юзера уже заменил выделение — НИ ОДНОЙ клавиши
+                    // (Right сдвинул бы его каретку, sep воткнулся в живой ввод)
+                    if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
+                        self.logLine("convert paste-refuse: юзер печатает — гашение и сепаратор не шлю, каретка его")
+                        return
+                    }
                     let already = Engine.pasteSelectionAlreadyTarget(selNow, target: to)
                     self.deselectSelectionCaretSafe(selOpt)
                     if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) } // проглоченный сепаратор возвращаем — слова не склеиваются
@@ -2274,12 +2280,20 @@ public final class Engine {
             tries += 1
         }
         guard matchSel(sel) else {
+            if pasteTypingAbort(seq0: seq0, fg0: fg) { // удар юзера уже заменил выделение — клавиш не шлю
+                logLine("paste-flip refuse: юзер печатает — гашение не шлю, каретка его")
+                return
+            }
             deselectSelectionCaretSafe(selOpt) // стрелка ВПРАВО: каретка в конец выделения = где была
             logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(from)' — гашу вправо, тапни снова")
             fireInfo("Не выделилось слово — тапни Option ещё раз")
             return
         }
         guard let saved = TextConverter.getClipboardTextOnce() else {
+            if pasteTypingAbort(seq0: seq0, fg0: fg) {
+                logLine("paste-flip refuse: юзер печатает — гашение не шлю, каретка его")
+                return
+            }
             deselectSelectionCaretSafe(selOpt)
             logLine("paste-flip refuse: буфер не читается")
             return

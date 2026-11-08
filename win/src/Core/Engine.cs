@@ -531,6 +531,10 @@ namespace OpenSwitcher.Core
                 // (treatAsReal=false) — тик ставят сами места, где пробел уходит в текст
                 if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode))
                 {
+                    // тик последнего РЕАЛЬНОГО нажатия: sel-флоу по нему детектит
+                    // «юзер печатает во время конверта» (мак-паритет seq-гварда;
+                    // ТОЛЬКО keyDown — keyUp триггера прибывает позже и ложно рвал бы)
+                    _lastRealKeyDownTick = Environment.TickCount;
                     int dv = (int)(k.vkCode & 0xFF);
                     if (dv == 0x20 && !HeldCmdMods(k) && !S.Paused && S.SpaceDedupMs > 0 && _buf.Count == 0 &&
                         _spaceAtCaretTick != 0 &&
@@ -2001,6 +2005,12 @@ namespace OpenSwitcher.Core
         private bool _selResendShift;        // ...и его Shift (досылается после вставки)
         private string _selExpect;           // ожидаемое слово паст-конверта (null = sel-флоу без сверки: ручное выделение)
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
+        private int _lastRealKeyDownTick;    // тик последнего РЕАЛЬНОГО keyDown (хук, без модификаторов)
+        private int _selStartRealKeyTick;    // тик триггера sel-флоу: расхождение = юзер печатает
+        private bool SelTypingDetected()
+        {
+            return _lastRealKeyDownTick != _selStartRealKeyTick;
+        }
 
         public void BeginFixSelection()
         {
@@ -2017,6 +2027,7 @@ namespace OpenSwitcher.Core
             _selExpect = null;
             _selResendVk = 0;      // stale-сепаратор прошлого флоу не должен утекать
             _selResendShift = false; // (аудит 06.11, дефект 3: прерванный paste-флоу оставлял vk жить)
+            _selStartRealKeyTick = _lastRealKeyDownTick; // триггер уже учтён хуком (keyDown до OnKeyDown)
             _selBaseline = TextConverter.GetClipboardTextOnce();
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
@@ -2169,12 +2180,32 @@ namespace OpenSwitcher.Core
                 }
                 // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
                 Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
-                SelDeselectOurs();     // висящее выделение движка съест следующий удар юзера
-                SelResendSeparator();  // проглоченный сепаратор возвращаем — слова не склеиваются
+                if (!SelTypingDetected())
+                {
+                    SelDeselectOurs();     // висящее выделение движка съест следующий удар юзера
+                    SelResendSeparator();  // проглоченный сепаратор возвращаем — слова не склеиваются
+                }
+                else
+                {
+                    // юзер печатает: его удар уже заменил выделение — Right сдвинул бы
+                    // его каретку, сепаратор воткнулся бы в живой ввод (мак-бой 02:08)
+                    Log("sel: refuse cleanup skipped — юзер печатает, клавиш не шлю");
+                }
                 FireInfo("Не удалось скопировать выделение в этом приложении");
                 return;
             }
             Log("sel: got " + text.Length + " chars (method=" + (_selMethod == 0 ? "wm_copy" : "ctrl+c") + ")");
+
+            // ЮЗЕР ПЕЧАТАЕТ ВО ВРЕМЯ ФЛОУ: его удар заменил выделение (слово уже
+            // съедено этим ударом) — вставлять НЕЛЬЗЯ (воткнётся в чужое место),
+            // гасить/досылять НЕЛЬЗЯ (каретка уже его). Мак-паритет seq-гварда.
+            if (SelTypingDetected())
+            {
+                Log("sel REFUSED: юзер печатает во время конверта — вставку и клавиши отменяю");
+                FireInfo("Печатаешь — конвертация отменена");
+                _selExpect = null;
+                return;
+            }
 
             // сверка с ожидаемым словом (паст-конверт): гонка печати/реплей поля даёт
             // чужой текст в выделении — конвертить и вставлять его НЕЛЬЗЯ
@@ -2194,8 +2225,11 @@ namespace OpenSwitcher.Core
             if (lang < 0)
             {
                 Log("sel: lang unknown");
-                SelDeselectOurs();
-                SelResendSeparator();
+                if (!SelTypingDetected())
+                {
+                    SelDeselectOurs();
+                    SelResendSeparator();
+                }
                 FireInfo("Не удалось определить язык");
                 return;
             }
