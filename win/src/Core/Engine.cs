@@ -2007,9 +2007,17 @@ namespace OpenSwitcher.Core
         private uint _selBaseSeq;            // sequence number буфера до Ctrl+C
         private int _lastRealKeyDownTick;    // тик последнего РЕАЛЬНОГО keyDown (хук, без модификаторов)
         private int _selStartRealKeyTick;    // тик триггера sel-флоу: расхождение = юзер печатает
-        private bool SelTypingDetected()
+        /// <summary>Юзер ввёл что-то во время sel-флоу: нажал клавишу (тик
+        /// разошёлся) ИЛИ кликнул мышью (клик замещает выделение так же, как
+        /// удар клавиши — мак-гвард считает мышь в inputSeq, тут паритет через
+        /// GetAsyncKeyState LSB «нажата после прошлого вызова»; flush в
+        /// BeginFixSelection отсекает клики ДО флоу). Клик в окне флоу сдвинул
+        /// бы каретку/заменил выделение — вставка и cleanup отменяются.</summary>
+        private bool SelUserInputDetected()
         {
-            return _lastRealKeyDownTick != _selStartRealKeyTick;
+            if (_lastRealKeyDownTick != _selStartRealKeyTick) return true;
+            return (Native.GetAsyncKeyState(0x01) & 0x8001) != 0 ||   // VK_LBUTTON
+                   (Native.GetAsyncKeyState(0x02) & 0x8001) != 0;     // VK_RBUTTON
         }
 
         public void BeginFixSelection()
@@ -2028,6 +2036,8 @@ namespace OpenSwitcher.Core
             _selResendVk = 0;      // stale-сепаратор прошлого флоу не должен утекать
             _selResendShift = false; // (аудит 06.11, дефект 3: прерванный paste-флоу оставлял vk жить)
             _selStartRealKeyTick = _lastRealKeyDownTick; // триггер уже учтён хуком (keyDown до OnKeyDown)
+            Native.GetAsyncKeyState(0x01); // flush «была нажата после прошлого вызова» для кнопок мыши:
+            Native.GetAsyncKeyState(0x02); // дальше LSB ловит только клики ВНУТРИ флоу (SelUserInputDetected)
             _selBaseline = TextConverter.GetClipboardTextOnce();
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
@@ -2180,7 +2190,7 @@ namespace OpenSwitcher.Core
                 }
                 // буфер не обновился — выделение не скопировалось; вставлять старьё нельзя
                 Log("sel: no new clipboard (seqChanged=" + seqChanged + ")");
-                if (!SelTypingDetected())
+                if (!SelUserInputDetected())
                 {
                     SelDeselectOurs();     // висящее выделение движка съест следующий удар юзера
                     SelResendSeparator();  // проглоченный сепаратор возвращаем — слова не склеиваются
@@ -2199,7 +2209,7 @@ namespace OpenSwitcher.Core
             // ЮЗЕР ПЕЧАТАЕТ ВО ВРЕМЯ ФЛОУ: его удар заменил выделение (слово уже
             // съедено этим ударом) — вставлять НЕЛЬЗЯ (воткнётся в чужое место),
             // гасить/досылять НЕЛЬЗЯ (каретка уже его). Мак-паритет seq-гварда.
-            if (SelTypingDetected())
+            if (SelUserInputDetected())
             {
                 Log("sel REFUSED: юзер печатает во время конверта — вставку и клавиши отменяю");
                 FireInfo("Печатаешь — конвертация отменена");
@@ -2225,7 +2235,7 @@ namespace OpenSwitcher.Core
             if (lang < 0)
             {
                 Log("sel: lang unknown");
-                if (!SelTypingDetected())
+                if (!SelUserInputDetected())
                 {
                     SelDeselectOurs();
                     SelResendSeparator();
