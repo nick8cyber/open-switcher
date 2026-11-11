@@ -595,6 +595,16 @@ public final class Engine {
             .filter { !$0.isEmpty }
     }
 
+    /// Поле, где забой-инжекция разрушает текст (Electron склеивает/теряет быстрые
+    /// CGEvent-бёрсты — бои 01.11 17:40, 02:54; метка 11.11 20:00: bs=9 съел 28
+    /// символов перед словом): перечислено в PasteConvertApps или помечено
+    /// реплей-враждебным. Единый критерий для ВСЕХ веток стирания: в таком поле
+    /// BS-путь запрещён вообще — только выделение+вставка или честный отказ
+    private func fieldBsUnsafe() -> Bool {
+        let hostile = replayHostile[fgApp] == true && Engine.ms() < (replayHostileUntil[fgApp] ?? 0)
+        return hostile || pasteConvertList.contains(fgProc)
+    }
+
     private func rebuildExclusionList() {
         exclusionList = s.exclusions.lowercased()
             .split(whereSeparator: { ",;".contains($0) })
@@ -1468,6 +1478,25 @@ public final class Engine {
                 if !expectedAfter.isEmpty && after != "?" && !after.contains(expectedAfter) {
                     self?.logLine("DAMAGE SUSPECTED: замена '\(expectedAfter)' не найдена в поле — инжекция ушла не туда/переформатировала")
                 }
+                // УРОН ПРЕФИКСА (метка 11.11 20:00: bs=9 в bb уничтожил 28 символов
+                // ПЕРЕД словом — замена нашлась, проверка выше молчала): голова
+                // поля до стёртого хвоста обязана пережить инжекцию; исчезла —
+                // урон фиксируется сразу, а не по жалобе
+                if !removedTail.isEmpty && before != "?" && after != "?" {
+                    var head: String? = nil
+                    if before.hasSuffix(removedTail) {
+                        head = String(before.dropLast(removedTail.count))
+                    } else if before.dropLast().hasSuffix(removedTail) {
+                        head = String(before.dropLast(removedTail.count + 1)) // сепаратор между хвостом и кареткой
+                    }
+                    if let head, !head.isEmpty {
+                        let keep = String(head.suffix(40))
+                        if keep.count >= 8 && !after.contains(keep) {
+                            self?.logLine("DAMAGE PREFIX: '...\(keep.suffix(24))' исчез из поля — инжекция съела текст перед словом")
+                            self?.fireInfo("Замена задела текст перед словом — проверь поле")
+                        }
+                    }
+                }
                 // СКЛЕЙКА (бой 19:08:56 'bизучи'): последний символ СТЁРТОГО слова
                 // прилип к замене (Electron склеил быстрые BS — bs=5 дошёл как 4).
                 // Сигнатура: [последняя буква стёртого]+[замена] присутствует в поле
@@ -1900,16 +1929,25 @@ public final class Engine {
         // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
         // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
         // выделяем слово, вставляем замену+сепаратор, BS не нужен вовсе
-        let hostileNow = replayHostile[fgApp] == true && Engine.ms() < (replayHostileUntil[fgApp] ?? 0)
-        if (hostileNow || pasteConvertList.contains(fgProc)),
+        if fieldBsUnsafe(),
            let bl = layouts.first(where: { $0.id == best.layoutID }) {
             logLine("convert: replay-hostile поле — паст-режим ('\(cur.text)' -> '\(bestText)')")
             suppress(0.3)
             let from = cur.text, to = bestText
-            // сепаратор проглатывается ради паст-конверта — досылается после вставки
+            // сепаратор проглатывается ради паст-конверта — досылается после вставки.
+            // sepChar — знак как набран (восстановление при отказе); pasteSep — в
+            // раскладке цели (порт sentSep забой-пути: 'проверь'+Shift+7 хотел '?')
             let sepChar = resendKey == KeyCodeMap.enter ? "\n"
                 : (resendKey != 0 ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : "")
+            let pasteSep = resendKey == KeyCodeMap.enter ? "\n"
+                : Engine.sepInLayout(resendKey, resendShift, bl, sepChar)
             let w2 = word
+            // выделяется [ретро-префикс+слово] и заменяется ОДНОЙ вставкой
+            // [ретро+цель+сеп]: иначе ретро-буква терялась ('f ns' -> 'f ты'),
+            // а sep отдельным sendUnicode обгонял асинхронный paste-коммит Electron
+            // и вставал ПЕРЕД словом ('jr ' -> ' ок', 'gjxtve' -> ' почему' — метки)
+            let wantSel = retroPrefix + from
+            let pasteText = retroText + to + pasteSep
             let seq0 = inputSeq, fg0 = fgApp // мы на потоке тапа — снимок без гонки
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
@@ -1924,14 +1962,17 @@ public final class Engine {
                     return
                 }
                 TextConverter.targetPid = fg0
-                TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
-                // выделение живёт минимальное время: ретраи ТОЛЬКО по пустоте
-                // (протухший AX), несовпадение при живом чтении решаем сразу
+                // посимвольное выделение: Opt+Shift+Left гранулируется редактором —
+                // Electron склеивает '85in' одним токеном, а 'contains'-проверка
+                // пускала расширенное выделение под вставку (съедала '85');
+                // Shift+Left×n выделяет ровно ожидаемый хвост, сверка — строгая
+                for _ in 0..<wantSel.count { TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.SHIFT) }
+                usleep(30_000) // дать серии дойти до поля до первого чтения
                 var selOpt = self.selectedTextOnMain()
                 var selNow = selOpt ?? ""
                 var tries = 0
                 var userTyping = false
-                while (selOpt == nil || selNow.isEmpty) && tries < 2 {
+                while selNow != wantSel && tries < 2 {
                     usleep(50_000)
                     if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
                         // юзер начал печатать по живому выделению — его удар уже
@@ -1948,7 +1989,8 @@ public final class Engine {
                     self.logLine("convert paste-abort: юзер печатает по выделению — не мешаю (клавиш не шлю)")
                     return
                 }
-                guard selOpt != nil, selNow.contains(from) else {
+                let already = Engine.pasteSelectionAlreadyTarget(selNow, target: to)
+                guard selOpt != nil, selNow == wantSel || already else {
                     // остаточное окно гонки (вход-чек был на +30 мс, чтение могло
                     // опоздать): удар юзера уже заменил выделение — НИ ОДНОЙ клавиши
                     // (Right сдвинул бы его каретку, sep воткнулся в живой ввод)
@@ -1956,18 +1998,20 @@ public final class Engine {
                         self.logLine("convert paste-refuse: юзер печатает — гашение и сепаратор не шлю, каретка его")
                         return
                     }
-                    let already = Engine.pasteSelectionAlreadyTarget(selNow, target: to)
                     self.deselectSelectionCaretSafe(selOpt)
                     if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) } // проглоченный сепаратор возвращаем — слова не склеиваются
-                    self.logLine(already
-                        ? "convert paste-fallback: на экране уже '\(to)' (десинк памяти и раскладки) — не переворачиваю, сепаратор дослан"
-                        : "convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(from)' — сепаратор дослан, каретка на месте")
+                    self.logLine("convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(wantSel)' — сепаратор дослан, каретка на месте")
+                    return
+                }
+                if already {
+                    self.deselectSelectionCaretSafe(selOpt)
+                    if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) }
+                    self.logLine("convert paste-fallback: на экране уже '\(to)' (десинк памяти и раскладки) — не переворачиваю, сепаратор дослан")
                     return
                 }
                 let saved = TextConverter.getClipboardTextOnce() ?? ""
-                TextConverter.setClipboardText(to)
+                TextConverter.setClipboardText(pasteText)
                 TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
-                if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) }
                 self.scheduleClipboardRestore(saved)
                 self.screenProbe(expectedAfter: to, removedTail: from)
                 self.logLine("convert paste-fallback OK: '\(from)' -> '\(to)'")
@@ -1979,11 +2023,12 @@ public final class Engine {
                         self.expectLayout(bl)
                         self.armGapForEngineSwitch(bl)
                     }
-                    // точка отката: стёрто [слово], вставлено [замена(+сеп)]
+                    // точка отката: стёрто [ретро+слово], вставлено [ретро+замена+сеп]
+                    // (undoLen — часть ПОСЛЕ префикса: префикс считает undoPrefixLen)
                     self.undoPending = true
                     self.undoText = from
-                    self.undoLen = to.count
-                    self.undoPrefix = ""; self.undoPrefixLen = 0
+                    self.undoLen = to.count + pasteSep.count
+                    self.undoPrefix = retroPrefix; self.undoPrefixLen = retroText.count
                     self.undoSepText = sepChar
                     self.undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
                     self.undoApp = self.fgApp
@@ -2210,19 +2255,33 @@ public final class Engine {
     /// (Cmd+Shift+Left — «до начала строки», самотест 02:45)
     private func pasteFlipWordPlan(_ cur: LayoutCandidate, _ best: LayoutCandidate,
                                    _ word: [KeyRec], _ layouts: [LayoutService.LayoutData],
-                                   _ skipLearn: Bool) -> PasteFlipResult {
+                                   _ skipLearn: Bool, trailSepKey: Int, trailSepShift: Bool) -> PasteFlipResult {
         let from = cur.text, to = best.text
-        let core = LanguageTables.lettersOnly(from)
-        guard core.count >= 1, core == from else { return .fallbackBs } // знак в слове — выделение ненадёжно
         if pasteFlipInFlight {
             logLine("paste-flip refuse: предыдущий ещё выполняется")
             fireInfo("Предыдущий переворот ещё выполняется")
             return .refuse
         }
-        // ЧИТАЕМОСТЬ ДО отправки событий: слепое поле — безопасный откат в забой-путь
-        if selectedTextOnMain() == nil { return .fallbackBs }
+        // ЧИТАЕМОСТЬ ДО отправки событий: слепое поле — безопасный откат в забой-путь,
+        // но ТОЛЬКО в BS-безопасном: во враждебном поле забой — шреддер (метка
+        // 11.11 20:00: ';' в слове вернул флип в забой, bs=9 съел 28 символов)
+        if selectedTextOnMain() == nil {
+            if fieldBsUnsafe() {
+                logLine("paste-flip refuse: поле враждебно к забоям и AX слеп — забой запрещён")
+                fireInfo("Поле не читается и ломается от забоев — переворот отменён")
+                return .refuse
+            }
+            return .fallbackBs
+        }
         pasteFlipInFlight = true
         suppress(0.6)
+        // выделяется [слово+хвост-сеп] посимвольно и заменяется ОДНОЙ вставкой
+        // [цель+сеп цели]: посимвольность снимает гранулярность Opt+Shift+Left
+        // (знаки/цифры в слове, '85in'-токены), sep внутри вставки — без гонки
+        let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
+        let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
+        let wantSel = from + trailTyped
+        let pasteText = to + trailSent
         let from2 = from, to2 = to
         let word2 = word, layouts2 = layouts
         let cur2 = cur, best2 = best
@@ -2231,19 +2290,23 @@ public final class Engine {
         let seq0 = inputSeq // снимок на потоке тапа: гонка «выделение vs печать»
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.runPasteFlip(from: from2, to: to2, word: word2, layouts: layouts2,
-                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg, seq0: seq0)
+                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg, seq0: seq0,
+                               wantSel: wantSel, pasteText: pasteText,
+                               trailTyped: trailTyped, trailSent: trailSent)
         }
         logLine("paste-flip: исполнение отложено (вне тап-колбэка)")
         return .accepted
     }
 
     /// Тело паст-флипа (фоновая очередь, тап-колбэк уже вернулся):
-    /// Option+Shift+Left → сверка выделения с AX → Cmd+V → буфер восстановлен.
+    /// Shift+Left×n → строгая сверка выделения с AX → Cmd+V → буфер восстановлен.
     /// Ни одного backspace. Отказ — гашение выделения стрелкой ВПРАВО (в конец =
     /// исходная каретка), плашка
     private func runPasteFlip(from: String, to: String, word: [KeyRec],
                               layouts: [LayoutService.LayoutData], cur: LayoutCandidate,
-                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t, seq0: UInt64) {
+                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t, seq0: UInt64,
+                              wantSel: String, pasteText: String,
+                              trailTyped: String, trailSent: String) {
         defer { pasteFlipInFlight = false }
         usleep(60_000) // дать тап-колбэку вернуться (доставка постов — после него)
         // юзер печатает/фокус ушёл — не выделяем (удар замещает выделение = слово стёрто)
@@ -2252,22 +2315,17 @@ public final class Engine {
             return
         }
         TextConverter.targetPid = fg
-        TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
+        for _ in 0..<wantSel.count { TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.SHIFT) }
+        usleep(30_000) // дать серии дойти до поля до первого чтения
         var selOpt = selectedTextOnMain()
         var sel = selOpt ?? ""
         var tries = 0
-        // выделение = слово, возможно с обрамляющими пробелами (TextEdit берёт
-        // 'спеки ' с хвостовым — самотест 02:57); вставка пробелы сохраняет
-        var pasteText = to
-        func matchSel(_ s: String) -> Bool {
-            guard s.contains(from) else { return false }
-            let pre = String(s[s.startIndex..<s.range(of: from)!.lowerBound])
-            let suf = String(s[s.range(of: from)!.upperBound..<s.endIndex])
-            guard pre.allSatisfy({ $0 == " " }) && suf.allSatisfy({ $0 == " " }) else { return false }
-            pasteText = pre + to + suf
-            return true
+        // хвостовой сепаратор в выделении AX может тримить — диапазон тот же,
+        // вставка его переписывает знаком раскладки цели
+        func selMatches(_ s: String) -> Bool {
+            s == wantSel || (wantSel.hasSuffix(" ") && s == wantSel.dropLast())
         }
-        while !matchSel(sel) && tries < 3 {
+        while !selMatches(sel) && tries < 3 {
             usleep(80_000)
             if pasteTypingAbort(seq0: seq0, fg0: fg) {
                 // юзер начал печатать по живому выделению — его удар уже заменил
@@ -2279,13 +2337,13 @@ public final class Engine {
             sel = selOpt ?? ""
             tries += 1
         }
-        guard matchSel(sel) else {
+        guard selMatches(sel) else {
             if pasteTypingAbort(seq0: seq0, fg0: fg) { // удар юзера уже заменил выделение — клавиш не шлю
                 logLine("paste-flip refuse: юзер печатает — гашение не шлю, каретка его")
                 return
             }
             deselectSelectionCaretSafe(selOpt) // стрелка ВПРАВО: каретка в конец выделения = где была
-            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(from)' — гашу вправо, тапни снова")
+            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(wantSel)' — гашу вправо, тапни снова")
             fireInfo("Не выделилось слово — тапни Option ещё раз")
             return
         }
@@ -2307,7 +2365,7 @@ public final class Engine {
         performOnTapThread { [weak self] in
             guard let self = self else { return }
             self.switchLayoutAfterFlip(word: word, best: best, layouts: layouts)
-            self.armUndoAfterFlip(cur: cur, replacement: to, trailTyped: "", trailSent: "")
+            self.armUndoAfterFlip(cur: cur, replacement: to, trailTyped: trailTyped, trailSent: trailSent)
             self.rememberFlipPair(cur: cur, best: best, skipLearn: skipLearn)
         }
     }
@@ -2322,14 +2380,15 @@ public final class Engine {
         }
     }
 
-    /// Точка отката после паст-флипа: поле = [префикс][замена][сепаратор из поля]
+    /// Точка отката после паст-флипа: поле = [префикс][замена+сеп цели];
+    /// возвращает [слово+знак как набран] целиком (паритет забой-пути)
     private func armUndoAfterFlip(cur: LayoutCandidate, replacement: String, trailTyped: String, trailSent: String) {
         undoPending = true
         undoText = cur.text
-        undoLen = replacement.count
+        undoLen = replacement.count + trailSent.count
         undoPrefix = ""; undoPrefixLen = 0
         prevSingle = nil
-        undoSepText = ""
+        undoSepText = trailTyped
         undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
         undoApp = fgApp
         undoAt = Engine.ms()
@@ -2439,7 +2498,8 @@ public final class Engine {
         // ALL-OR-NOTHING (самотест 02:45: гасящая стрелка + протухший AX =
         // вставка в начало документа): после ОТПРАВЛЕННЫХ событий выделения
         // откат в забой-путь ЗАПРЕЩЁН — только честный отказ
-        switch pasteFlipWordPlan(cur, best, word, layouts, skipLearn) {
+        switch pasteFlipWordPlan(cur, best, word, layouts, skipLearn,
+                                 trailSepKey: trailSepKey, trailSepShift: trailSepShift) {
         case .accepted:
             return true // исполнение — асинхронно, после возврата тап-колбэка
         case .refuse:
