@@ -923,6 +923,11 @@ func applySettingsFromModel(engine: Engine, model: SettingsUiModel) -> Bool {
     // ini-only поля нет в UI-модели: иначе каждый Save затирал бы их дефолтами
     snapshot.minWordLen = engine.s.minWordLen
     snapshot.spaceDedupMs = engine.s.spaceDedupMs
+    snapshot.tapMinMs = engine.s.tapMinMs
+    // бои 21:31/21:44/22:42 16.11: сейв настроек в 02:00 вытер PasteConvertApps=bb
+    // дефолтом — bb потерял паст-маршрут, авто-конверт пошёл забоем, поле
+    // переиграло инжекцию ('lf'->'laaда'). ini-only поле обязано копироваться
+    snapshot.pasteConvertApps = engine.s.pasteConvertApps
     snapshot.defaultsV = engine.s.defaultsV
     model.write(snapshot)
     guard SettingsStore.save(snapshot) else { return false }
