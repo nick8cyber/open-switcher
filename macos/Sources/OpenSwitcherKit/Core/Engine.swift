@@ -431,7 +431,17 @@ public final class Engine {
             // только НАЖАТИЯ: keyUp/flagsChanged триггера (пробел, чей keyDown породил
             // конверт) приходят в первые ~30-100 мс и ложно рвали seq-гвард, убивая
             // паст-путь на каждом конверте (аудит 06.11, дефект 2)
-            inputSeq &+= 1 // живый ввод: паст-пути по нему детектят гонку с печатью юзера
+            // ЭХО-РЕПЛЕЙ поля НЕ живой ввод юзера (метки 20:14 17.11: bb переиздало
+            // BS×3+клавиши слова за 33 мс после конверта — seq-гвард убивал паст и
+            // слово не переворачивалось): BS/клавиша слова в arm-окне реплей-детекта
+            // не бампят счётчик. Страховка остаётся: строгая сверка selNow==wantSel
+            // отказывает при ЛЮБОМ реальном изменении содержимого
+            let replayEcho = type == .keyDown && Engine.ms() < replayArmUntil && {
+                let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
+                return kc == KeyCodeMap.backspace
+                    || (KeyCodeMap.isLetterKey(kc) && replayWordCodes.contains(kc))
+            }()
+            if !replayEcho { inputSeq &+= 1 } // живой ввод: паст-пути по нему детектят гонку с печатью юзера
         }
         if consumeSessionReset() { resetSession() }
 
