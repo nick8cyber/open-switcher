@@ -18,9 +18,10 @@ jobs:
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path win/OpenSwitcher.exe, win/README.md -DestinationPath OpenSwitcher-win.zip
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: OpenSwitcher-win.zip
+          name: win-release
+          path: OpenSwitcher-win.zip
 
   macos:
     runs-on: macos-15
@@ -90,6 +91,21 @@ jobs:
           cd macos/build
           zip -qry "../../$NAME.app.zip" OpenSwitcher.app
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-${{ matrix.arch }}
+          path: OpenSwitcher-macOS-*.zip
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: OpenSwitcher-macOS-*.zip
+          files: |
+            artifacts/OpenSwitcher-win.zip
+            artifacts/OpenSwitcher-macOS-*.zip

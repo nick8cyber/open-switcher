@@ -70,7 +70,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>OpenSwitcher</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.2.0</string>
+    <key>CFBundleShortVersionString</key><string>1.3.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
@@ -85,6 +85,9 @@ EOF
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
     codesign --force --deep --options runtime --timestamp \
         --sign "Developer ID Application" "$APP" 2>/dev/null || \
+    codesign --force --deep -s - "$APP"
+elif [ -z "$CI" ]; then
+    echo "ВНИМАНИЕ: сертификат Developer ID Application не найден — подписываю ad-hoc (TCC-права могут сбрасываться при пересборке)"
     codesign --force --deep -s - "$APP"
 fi
 

@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Reflection;
 using System.Threading;
 using System.Windows.Forms;
@@ -13,12 +14,25 @@ namespace OpenSwitcher
         public static Engine Engine;
         public static TrayService Tray;
 
+        private static void WriteCrashLog(string content)
+        {
+            try
+            {
+                Directory.CreateDirectory(SettingsStore.Dir);
+                File.WriteAllText(Path.Combine(SettingsStore.Dir, "os_crash.log"), content);
+            }
+            catch (Exception)
+            {
+                try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "openswitcher_crash.log"), content); } catch (Exception) { }
+            }
+        }
+
         [STAThread]
         private static void Main(string[] args)
         {
             AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
             {
-                try { System.IO.File.WriteAllText("os_crash.log", e.ExceptionObject.ToString()); } catch (Exception) { }
+                WriteCrashLog(e.ExceptionObject != null ? e.ExceptionObject.ToString() : "unknown");
             };
             try
             {
@@ -26,7 +40,7 @@ namespace OpenSwitcher
             }
             catch (Exception ex)
             {
-                try { System.IO.File.WriteAllText("os_crash.log", ex.ToString()); } catch (Exception) { }
+                WriteCrashLog(ex.ToString());
                 Environment.Exit(3);
             }
         }
@@ -94,8 +108,19 @@ namespace OpenSwitcher
             showTimer.Start();
 
             if (showSettings) Tray.ShowSettings();
-            Application.Run(new ApplicationContext());
-            GC.KeepAlive(mux);
+            try
+            {
+                Application.Run(new ApplicationContext());
+            }
+            finally
+            {
+                showTimer.Stop();
+                showTimer.Dispose();
+                if (Tray != null) Tray.Dispose();
+                if (Engine != null) Engine.Dispose();
+                showEvent.Close();
+                mux.Close();
+            }
         }
 
         private static void OnThemeChanged()

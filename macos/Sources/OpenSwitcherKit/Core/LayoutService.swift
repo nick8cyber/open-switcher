@@ -33,34 +33,37 @@ public enum LayoutService {
     static var cacheAt: TimeInterval = 0
     static let cacheLock = NSLock()
     static let cacheTTL: TimeInterval = 30
-    /// Текущая раскладка — снапшот последнего refreshOnMain() (TIS на main).
-    /// Читается с любого потока (в т.ч. с потока тапа) только под cacheLock.
+    /// Фактическая текущая раскладка системы по последнему опросу `TISCopyCurrentKeyboardInputSource()` на main.
+    /// НЕ перезаписывается искусственно в `switchTo` — благодаря этому `Engine` точно видит окно лага
+    /// применения раскладки и переводит нажатые в просвете клавиши без потери букв.
     static var cachedCurrent: LayoutData?
 
-    /// ЕДИНСТВЕННАЯ точка TIS-вызовов чтения состояния (macOS 15 ассертит
-    /// main-очередь: EXC_BAD_INSTRUCTION dispatch_assert_queue_fail в
-    /// TSMGetInputSourceProperty при вызове с потока event-tap). Вызывается
-    /// с main: таймер Engine 0.25 с, наблюдатель AppleSelectedInputSourceChanged,
-    /// прогрев Engine.init. Перестраивает список раскладок по TTL и обновляет
-    /// cachedCurrent. Вызовы НЕ с main запрещены (dispatchPrecondition).
+    /// Единственная точка TIS-вызовов чтения состояния (macOS 15 требует main-очередь).
     public static func refreshOnMain() {
         dispatchPrecondition(condition: .onQueue(.main))
-        if cache.isEmpty || Date().timeIntervalSinceReferenceDate - cacheAt >= cacheTTL {
+        cacheLock.lock()
+        let empty = cache.isEmpty
+        let stale = Date().timeIntervalSinceReferenceDate - cacheAt >= cacheTTL
+        cacheLock.unlock()
+        if empty || stale {
             _ = rebuildLayoutsOnMain()
         }
         guard let cur = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
               let idPtr = TISGetInputSourceProperty(cur, kTISPropertyInputSourceID) else { return }
         let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as String
         cacheLock.lock()
-        cachedCurrent = cache.first(where: { $0.id == id })
+        var match = cache.first(where: { $0.id == id })
+        cacheLock.unlock()
+        if match == nil {
+            let rebuilt = rebuildLayoutsOnMain()
+            match = rebuilt.first(where: { $0.id == id })
+        }
+        cacheLock.lock()
+        cachedCurrent = match
         cacheLock.unlock()
     }
 
     /// Все включённые раскладки с юникод-данными (кэш 30 с).
-    /// TISCreateInputSourceList допустим только на main: живой кэш возвращается
-    /// с любого потока; протухший/пустой на main перестраивается инлайн, с чужого
-    /// потока (тап) возвращается последний известный список, а main асинхронно
-    /// просится обновить кэш (refreshOnMain).
     public static func getLayouts() -> [LayoutData] {
         cacheLock.lock()
         let now = Date().timeIntervalSinceReferenceDate
@@ -79,27 +82,53 @@ public enum LayoutService {
         return rebuildLayoutsOnMain()
     }
 
-    /// Перечисление TISCreateInputSourceList — только с main.
+    /// Перечисление TISCreateInputSourceList — только с main (фильтрует CJK IME / InputMode).
     private static func rebuildLayoutsOnMain() -> [LayoutData] {
         dispatchPrecondition(condition: .onQueue(.main))
         var list: [LayoutData] = []
         let filter = [kTISPropertyInputSourceIsEnableCapable as String: true] as CFDictionary
         if let sources = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource] {
             for src in sources {
+                // P2-4: игнорируем IME-режимы ввода (kTISTypeKeyboardInputMode — японский/китайский/корейский),
+                // оставляем только клавиатурные раскладки (kTISTypeKeyboardLayout).
+                if let typePtr = TISGetInputSourceProperty(src, kTISPropertyInputSourceType) {
+                    let stype = Unmanaged<CFString>.fromOpaque(typePtr).takeUnretainedValue() as String
+                    if stype == (kTISTypeKeyboardInputMode as String) { continue }
+                }
                 guard let ptr = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData) else { continue }
                 let data = Unmanaged<CFData>.fromOpaque(ptr).takeUnretainedValue()
                 guard let idPtr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { continue }
                 let id = Unmanaged<CFString>.fromOpaque(idPtr).takeUnretainedValue() as String
-                if list.contains(where: { $0.id == id }) { continue } // дедуп как в оригинале
+                if list.contains(where: { $0.id == id }) { continue }
                 list.append(LayoutData(source: src, id: id, layoutData: data))
             }
         }
         cacheLock.lock()
+        let prevID = cachedCurrent?.id
         cache = list
         cacheAt = Date().timeIntervalSinceReferenceDate
-        cachedCurrent = nil // набор раскладок изменился — кэш текущей недостоверен
+        cachedCurrent = prevID.flatMap { id in list.first(where: { $0.id == id }) }
         cacheLock.unlock()
         return list
+    }
+
+    /// Находится ли буква 'ё' на клавише 0x2A ('\') в стандартной русской раскладке Apple (P1-2).
+    public static func usesBackslashForYo(_ data: LayoutData? = nil) -> Bool {
+        let list: [LayoutData]
+        if let d = data {
+            list = [d]
+        } else {
+            cacheLock.lock()
+            list = cache
+            cacheLock.unlock()
+        }
+        for l in list {
+            if l.id == "com.apple.keylayout.Russian" { return true }
+            if let ch = renderKey(l, KeyRec(KeyCodeMap.backslash, false, false))?.lowercased(), ch == "ё" {
+                return true
+            }
+        }
+        return false
     }
 
     /// Текст, который дала бы эта раскладка при тех же нажатиях.
@@ -109,14 +138,11 @@ public enum LayoutService {
         return out
     }
 
-    /// Символ одной клавиши; nil — раскладка его не дала. Отдельно от render: там сбой
-    /// заменяется '?', и настоящий знак '?' (Shift+/ в EN) было не отличить от сбоя.
+    /// Символ одной клавиши; nil — раскладка его не дала.
     public static func renderKey(_ data: LayoutData, _ rec: KeyRec) -> String? {
         var deadState: UInt32 = 0
         var chars = [UniChar](repeating: 0, count: 8)
         var count = 0
-        // UCKeyTranslate ждёт EventRecord.modifiers, сдвинутые >>8:
-        // shiftKey (0x0200) -> 0x02, alphaLock (0x0400) -> 0x04
         var mods: UInt32 = 0
         if rec.shift { mods |= 1 << 1 }
         if rec.caps { mods |= 1 << 2 }
@@ -125,7 +151,25 @@ public enum LayoutService {
                                 mods, UInt32(LMGetKbdType()),
                                 OptionBits(1 << kUCKeyTranslateNoDeadKeysBit),
                                 &deadState, 8, &count, &chars)
-        return kr == noErr && count > 0 ? String(utf16CodeUnits: chars, count: Int(count)) : nil
+        guard kr == noErr && count > 0 else { return nil }
+        var s = String(utf16CodeUnits: chars, count: Int(count))
+        // P1-2: RussianWin на Shift+0x32 возвращает латинскую Ë (U+00CB) вместо кириллической Ё (U+0401)
+        if data.id.lowercased().contains("russian") {
+            if s == "\u{00CB}" { s = "Ё" }
+            else if s == "\u{00EB}" { s = "ё" }
+        }
+        return s
+    }
+
+    private static let nonRussianCyrillic = CharacterSet(charactersIn: "іїєґўІЇЄҐЎ")
+
+    private static func isOtherCyrillicLayout(_ id: String, rendered: String) -> Bool {
+        let lid = id.lowercased()
+        if lid.contains("ukrainian") || lid.contains("belarus") || lid.contains("belorussian") ||
+            lid.contains("kazakh") || lid.contains("serbian") || lid.contains("bulgarian") {
+            return true
+        }
+        return rendered.unicodeScalars.contains { nonRussianCyrillic.contains($0) }
     }
 
     public static func layoutName(_ text: String) -> String {
@@ -135,46 +179,68 @@ public enum LayoutService {
         return "???"
     }
 
-    /// Прочитать буфер во всех раскладках и оценить каждую.
+    /// Прочитать буфер во всех раскладок и оценить каждую.
     public static func renderAll(_ keys: [KeyRec], _ layouts: [LayoutData]) -> [LayoutCandidate] {
         layouts.map { data in
             let text = render(data, keys)
             let letters = LanguageTables.lettersOnly(text)
-            let lang = !letters.isEmpty ? LanguageTables.langOf(letters) : -1
+            var lang = !letters.isEmpty ? LanguageTables.langOf(letters) : -1
+            if lang == 0 && isOtherCyrillicLayout(data.id, rendered: text) {
+                lang = -1 // не путаем RU с UA/BY раскладками (P2-4)
+            }
             let score = lang >= 0 ? LanguageTables.score(letters, lang) : -99
             return LayoutCandidate(layoutID: data.id, source: data.source, text: text, lang: lang,
                                    score: score, name: layoutName(letters))
         }
     }
 
-    /// Текущая системная раскладка. БЕЗ TIS-вызовов: только чтение cachedCurrent
-    /// под локом — безопасно с потока тапа на каждое нажатие. Свежесть держат
-    /// main-обновления: таймер Engine 0.25 с + наблюдатель смены раскладки
-    /// (грейс expectLayout 1.2 с и gap-дедлайн 0.8 с перекрывают лаг 0.25 с).
+    /// Фактическая системная раскладка (чтение под локом, безопасно с потока тапа).
     public static func currentLayout() -> LayoutData? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return cachedCurrent
     }
 
-    /// Найти раскладку, в которой клавиша 'a' даёт кириллицу (0) или латиницу (1).
+    /// Найти раскладку языка (0 = РУС с приоритетом чисто русской; 1 = ENG с приоритетом QWERTY).
     public static func findLayoutByLang(_ lang: Int) -> LayoutData? {
-        let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
-        return getLayouts().first { LanguageTables.langOf(render($0, probe)) == lang }
+        let probeA = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
+        let layouts = getLayouts()
+        if lang == 0 {
+            let probeRu = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "s"), false, false),
+                           KeyRec(KeyCodeMap.ansiCode(ofLatin: "]"), false, false)]
+            if let exact = layouts.first(where: { l in
+                !isOtherCyrillicLayout(l.id, rendered: "") &&
+                render(l, probeRu).lowercased() == "ыъ"
+            }) {
+                return exact
+            }
+            return layouts.first { !isOtherCyrillicLayout($0.id, rendered: "") && LanguageTables.langOf(render($0, probeA)) == 0 }
+        }
+        if lang == 1 {
+            if let us = layouts.first(where: { $0.id == "com.apple.keylayout.ABC" || $0.id == "com.apple.keylayout.US" }) {
+                return us
+            }
+            let probeYz = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "y"), false, false),
+                           KeyRec(KeyCodeMap.ansiCode(ofLatin: "z"), false, false)]
+            if let qwerty = layouts.first(where: { render($0, probeYz).lowercased() == "yz" }) {
+                return qwerty
+            }
+        }
+        return layouts.first { LanguageTables.langOf(render($0, probeA)) == lang }
     }
 
-    /// Переключить раскладку (на macOS — глобально, TISSelectInputSource).
-    /// ТОЛЬКО main (macOS 15 ассертит очередь): вызывающие с потока тапа
-    /// обязаны заводить вызов через DispatchQueue.main.async.
+    /// Переключить раскладку глобально (только на main).
+    /// Планирует серию быстрых проверок `refreshOnMain`, чтобы поймать фактическое
+    /// применение раскладки системой за ~30–180 мс без искусственного обмана кэша.
     @discardableResult
     public static func switchTo(_ data: LayoutData) -> Bool {
-        // наша собственная смена — кэш текущей раскладки обновляем МГНОВЕННО:
-        // иначе тап-поток до 250 мс «не видит» переключения и gap-буфер
-        // глотает первые буквы после тапа (жалоба юзера «переключается редко»)
-        cacheLock.lock()
-        cachedCurrent = data
-        cacheLock.unlock()
         dispatchPrecondition(condition: .onQueue(.main))
-        return TISSelectInputSource(data.source) == noErr
+        let ok = TISSelectInputSource(data.source) == noErr
+        for delay in [0.035, 0.09, 0.18] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                refreshOnMain()
+            }
+        }
+        return ok
     }
 }

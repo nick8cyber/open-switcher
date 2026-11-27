@@ -1,153 +1,202 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import Carbon.HIToolbox
 
-/// Детект «в фокусе поле пароля» (AXSecureTextField). Конвертация в пароле
-/// ломает ввод: буквы невидимы, флип раскладки посреди набора фатален —
-/// поэтому в secure-поле авто-конвертация не ходит вовсе (лок/гейты ни при чём).
+/// Детект «в фокусе поле пароля» (SecureEventInput + AXSecureTextField) и
+/// безопасное чтение текста/каретки через Accessibility API.
 ///
-/// AX-запрос дорогой и допустим только с main (тред-безопасность AX как у TIS):
-/// main-таймер 0.25 с обновляет кэш, поток тапа читает готовый флаг
-/// (та же схема, что LayoutService.cache).
+/// Системный `IsSecureEventInputEnabled()` потокобезопасен и мгновенен (ноль лага
+/// таймера при фокусе парольного поля), а AX-опрос на main каждые 0.25 с дополняет
+/// его для веб-форм в браузерах/Electron, где SecureEventInput может не включаться.
 public enum PasswordGuard {
     private static let lock = NSLock()
     private static var checkedAt: TimeInterval = 0
+    private static var lastActivityAt: TimeInterval = 0
     private static var secure = false
-    private static let ttl: TimeInterval = 0.25
+    private static let ttl: TimeInterval = 0.60
 
-    /// Дёшево: из потока тапа — вернёт кэш последней main-проверки (свежесть ≤0.25 с;
-    /// конвертация стреляет на конце слова — к этому моменту кэш успевает обновиться).
+    public static func notifyActivity() {
+        let now = Engine.ms()
+        lock.lock()
+        lastActivityAt = now
+        lock.unlock()
+    }
+
+    /// Мгновенная проверка с любого потока: системный Secure Input ИЛИ AX-кэш.
     public static var isSecureFocused: Bool {
-        lock.lock(); defer { lock.unlock() }
+        if IsSecureEventInputEnabled() { return true }
+        lock.lock()
+        defer { lock.unlock() }
         return secure
     }
 
-    /// ПРАВДИВЫЙ прибор: текст сфокусированного элемента с экрана (не самоотчёт
-    /// движка). Зывать только с main. nil — поле не отдало значение (не AX-текст).
+    /// Текст сфокусированного элемента (вызывать только с main).
     public static func focusedText() -> String? {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
-                                            &focused) == .success,
-              let el = focused else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el as! AXUIElement, kAXValueAttribute as CFString,
-                                            &value) == .success,
-              let s = value as? String else { return nil }
-        return s
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let el = focusedElementOnMain() else { return nil }
+        return readTextElementAndValue(el)?.text
     }
 
-    /// Текст фокусного элемента + позиция каретки (в UTF-16-единицах значения).
-    /// nil — поле не отдало значение (не AX-текст). Каретка nil — диапазон выделения
-    /// не читается (вызывающий считает каретку в конце поля). Зывать только с main.
-    public static func focusedTextAndCaret() -> (text: String, caret: Int?)? {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
-                                            &focused) == .success,
-              let el = focused else { return nil }
-        let axEl = el as! AXUIElement
-        var value: CFTypeRef?
-        var text: String? = nil
-        if AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString,
-                                         &value) == .success, let v = value as? String {
-            text = v
-        }
-        // ФОЛБЭК для AX-немых полей (telegram/finder, ADR-001): у фокусного
-        // элемента нет value — пробуем выделенный текст и первый текстовый
-        // потомок (поле ввода часто вложено в контейнер фокуса)
-        if (text == nil || text!.isEmpty) {
-            var sel: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextAttribute as CFString,
-                                             &sel) == .success, let sv = sel as? String, !sv.isEmpty {
-                text = sv
-            }
-        }
-        if (text == nil || text!.isEmpty) {
-            var kids: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString,
-                                             &kids) == .success,
-               let arr = kids as? [AXUIElement] {
-                for child in arr.prefix(8) {
-                    var role: CFTypeRef?
-                    var cv: CFTypeRef?
-                    if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
-                       let rs = role as? String, rs == "AXTextArea" || rs == "AXTextField",
-                       AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &cv) == .success,
-                       let cs = cv as? String {
-                        text = cs
-                        break
-                    }
-                }
-            }
-        }
-        guard let s = text, !s.isEmpty else { return nil }
+    /// Текст фокусного элемента + точная позиция каретки (в UTF-16-единицах).
+    /// Вызывать только с main.
+    /// Возвращает `hasSelection = true`, если выделен непустой диапазон (тогда
+    /// забой-стирание по памяти недопустимо). Если каретка не читается — `caret = nil`.
+    public static func focusedTextAndCaret() -> (text: String, caret: Int?, hasSelection: Bool)? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let axEl = focusedElementOnMain(),
+              let (targetEl, text) = readTextElementAndValue(axEl),
+              !text.isEmpty else { return nil }
+
         var caret: Int? = nil
+        var hasSel = false
         var rangeRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString,
+        if AXUIElementCopyAttributeValue(targetEl, kAXSelectedTextRangeAttribute as CFString,
                                          &rangeRef) == .success,
            let ref = rangeRef, CFGetTypeID(ref) == AXValueGetTypeID() {
             var r = CFRange()
-            if AXValueGetValue(ref as! AXValue, .cfRange, &r) {
-                caret = r.location + r.length // каретка = конец выделения; выделение ≠ 0 — стирать нельзя
+            if AXValueGetValue(ref as! AXValue, .cfRange, &r), r.location >= 0 {
+                hasSel = r.length > 0
+                caret = r.location + r.length
             }
         }
-        return (s, caret)
+        return (text, caret, hasSel)
     }
 
-    /// Выделенный текст фокусного элемента (AXSelectedText). nil — не читается.
-    /// Зывать только с main.
+    /// Выделенный текст фокусного элемента (AXSelectedText). nil — атрибут недоступен.
+    /// Вызывать только с main.
     public static func selectedText() -> String? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let axEl = focusedElementOnMain() else { return nil }
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextAttribute as CFString,
+                                         &value) == .success,
+           let s = value as? String {
+            return s
+        }
+        if let (childEl, _) = readTextElementAndValue(axEl), childEl !== axEl {
+            var cval: CFTypeRef?
+            if AXUIElementCopyAttributeValue(childEl, kAXSelectedTextAttribute as CFString,
+                                             &cval) == .success,
+               let cs = cval as? String {
+                return cs
+            }
+        }
+        return nil
+    }
+
+    private static func focusedElementOnMain() -> AXUIElement? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.05) // не вешать main на занятом Electron
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
                                             &focused) == .success,
               let el = focused else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el as! AXUIElement, kAXSelectedTextAttribute as CFString,
-                                            &value) == .success,
-              let s = value as? String else { return nil }
-        return s
+        let axEl = el as! AXUIElement
+        AXUIElementSetMessagingTimeout(axEl, 0.05)
+        return axEl
     }
 
-    /// Единственная точка AX-опроса. Зывать только с main.
+    /// Находит реальный текстовый AXUIElement и его строковое значение (с фолбэком
+    /// на первый текстовый потомок, чтобы и текст, и SelectedTextRange читались
+    /// у ОДНОГО и того же элемента).
+    private static func readTextElementAndValue(_ axEl: AXUIElement) -> (element: AXUIElement, text: String)? {
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXValueAttribute as CFString,
+                                         &value) == .success,
+           let v = value as? String {
+            return (axEl, v)
+        }
+        var kids: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString,
+                                         &kids) == .success,
+           let arr = kids as? [AXUIElement] {
+            for child in arr.prefix(8) {
+                AXUIElementSetMessagingTimeout(child, 0.04)
+                var role: CFTypeRef?
+                var cv: CFTypeRef?
+                if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+                   let rs = role as? String, rs == "AXTextArea" || rs == "AXTextField",
+                   AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &cv) == .success,
+                   let cs = cv as? String {
+                    return (child, cs)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Периодическое обновление AX-флага поля пароля (вызывать только с main).
+    /// В простое (нет ввода > 3 с) не тратит ~90 AX IPC вызовов/сек (P1-9).
     public static func refreshOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let now = Engine.ms()
         lock.lock()
-        if Engine.ms() - checkedAt < ttl { lock.unlock(); return }
-        checkedAt = Engine.ms()
+        let active = (now - lastActivityAt) < 3.0
+        if !active || now - checkedAt < ttl { lock.unlock(); return }
+        checkedAt = now
         lock.unlock()
 
         let result = checkSecureAx()
-        lock.lock(); secure = result; lock.unlock()
+        lock.lock()
+        secure = result
+        lock.unlock()
     }
 
-    /// Поле пароля? Проверено на живом NSSecureTextField: роль у него обычная
-    /// (AXTextField), маркеры два — RoleDescription содержит "secure" и/или
-    /// AXNumberOfCharacters не читается (у обычного поля читается всегда).
-    /// Ложное «да» глушит конвертацию зря, поэтому сигнал составной.
+    /// Принудительный немедленный пересчёт на main (при смене фокуса/приложения).
+    public static func forceRefreshOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let now = Engine.ms()
+        let result = checkSecureAx()
+        lock.lock()
+        checkedAt = now
+        lastActivityAt = now
+        secure = result
+        lock.unlock()
+    }
+
+    /// Проверка поля пароля, независимая от языка интерфейса macOS и движка браузера:
+    /// 1) системный `IsSecureEventInputEnabled()`
+    /// 2) стандартный `AXSubrole == "AXSecureTextField"` (AppKit, Safari, Chromium, Electron, Firefox)
+    /// 3) `AXRoleDescription` ("secure" / "защищ")
+    /// 4) нативный `AXTextField` со скрытым `AXNumberOfCharacters`.
     private static func checkSecureAx() -> Bool {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString,
-                                            &focused) == .success,
-              let el = focused else { return false }
-        let axEl = el as! AXUIElement
+        if IsSecureEventInputEnabled() { return true }
+        guard let axEl = focusedElementOnMain() else { return false }
+        if isElementSecure(axEl) { return true }
+
+        var kids: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString,
+                                         &kids) == .success,
+           let arr = kids as? [AXUIElement] {
+            for child in arr.prefix(4) {
+                AXUIElementSetMessagingTimeout(child, 0.03)
+                if isElementSecure(child) { return true }
+            }
+        }
+        return false
+    }
+
+    private static func isElementSecure(_ axEl: AXUIElement) -> Bool {
+        var subrole: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axEl, kAXSubroleAttribute as CFString,
+                                         &subrole) == .success,
+           let sr = subrole as? String,
+           sr == (kAXSecureTextFieldSubrole as String) || sr.lowercased().contains("secure") {
+            return true
+        }
         var roleDesc: CFTypeRef?
         if AXUIElementCopyAttributeValue(axEl, kAXRoleDescriptionAttribute as CFString,
                                          &roleDesc) == .success,
-           let rd = roleDesc as? String, rd.lowercased().contains("secure") {
+           let rd = (roleDesc as? String)?.lowercased(),
+           rd.contains("secure") || rd.contains("защищ") || rd.contains("парол") {
             return true
         }
         var role: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axEl, kAXRoleAttribute as CFString,
                                             &role) == .success,
-              (role as? String) == "AXTextField" else { return false }
-        var nchars: CFTypeRef?
-        return AXUIElementCopyAttributeValue(axEl, kAXNumberOfCharactersAttribute as CFString,
-                                             &nchars) != .success
+              let r = role as? String else { return false }
+        return r == "AXSecureTextField"
     }
 }

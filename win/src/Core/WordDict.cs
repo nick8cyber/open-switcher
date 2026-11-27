@@ -84,10 +84,11 @@ namespace OpenSwitcher.Core
             "horrible beautiful interesting important available document documents " +
             "project projects issue issues ticket commit branch merge release update " +
             "updates error errors better well done " +
-            // клавиатурные сокращения: юзер пишет их в чатах, но автоправка не трогала
-            // (цель должна быть словарной); русско-раскладочные прочтения («скед»,
-            // «фде», «ышафе»...) не слова — ложных срабатываний нет
-            "ctrl alt shift esc del tab caps";
+            // клавиатурные сокращения и частые IT-токены: юзер пишет их в чатах/коде,
+            // чтобы обратный переворот срабатывал, а набранные в EN не считались несловарными
+            "ctrl alt shift esc del tab caps " +
+            "api sdk cli gui url ssh ssl sql css html json yaml http https git npm pip " +
+            "app dev pro max min log cfg env var tmp msg btn img";
 
         private static readonly HashSet<string> Ru = Make(RuSrc);
         private static readonly HashSet<string> En = Make(EnSrc);
@@ -105,18 +106,43 @@ namespace OpenSwitcher.Core
         private static HashSet<string> Make(string src)
         {
             var set = new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
-            foreach (string w in src.Split(' '))
+            char[] trimChars = new[] { ' ', '\t', '\r', '\n', '[', ']', '\'', '"', ',' };
+            foreach (string w in src.Split(new[] { ' ', '\t', '\r', '\n', ',' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                string t = w.Trim();
+                string t = w.Trim(trimChars);
                 if (t.Length >= 2) set.Add(t.ToLowerInvariant());
             }
             return set;
         }
 
-        /// <summary>Есть ли слово (в нижнем регистре) в словаре языка: 0 = ru, 1 = en.</summary>
-        /// <summary>Решения v3 — исключены навсегда (расширения словаря их не возвращают):
-        /// 'iban' — RU-прочтение с тех же клавиш = «шифт» (96f7c2b).</summary>
-        private static readonly HashSet<string> V3Removed = new HashSet<string> { "iban" };
+        /// <summary>Решения v3/v4 — исключены навсегда (расширения словаря их не возвращают):
+        /// 'iban' — RU-прочтение с тех же клавиш = «шифт» (96f7c2b);
+        /// 'gemin' — шум из субтитров, блокировавший опечатку в 'gemini'.</summary>
+        private static readonly HashSet<string> V3Removed = new HashSet<string> { "iban", "gemin" };
+
+        /// <summary>Закрытый белый список частых русских 2-буквенных слов, разрешённых к авто-конвертации
+        /// из EN->RU при MinWordLen = 3 (только если их EN-прочтение не является английским словом/сокращением).</summary>
+        private static readonly HashSet<string> RuTwoLetterAuto = Make(
+            "не на да но ты мы вы он же бы то ли ну ни до из за от по со во об ко ее ей им их уж ой ай эй ух ах ох"
+        );
+
+        /// <summary>Двухбуквенные EN-слова и частые IT-сокращения, которые НИКОГДА не авто-конвертируем в RU.</summary>
+        private static readonly HashSet<string> EnTwoLetterProtected = Make(
+            "am an as at be by do go he hi id if in io ip is it js me my no of oh ok on or os pc pr qa re so to tv ui uk up us vm vs we ux ai hr ts py sh db ci cd ml dl cv cc"
+        );
+
+        /// <summary>Разрешён ли авто-переворот 2-буквенного слова (только однозначные EN->RU пары, не в ALL_CAPS).</summary>
+        public static bool IsAllowedTwoLetterAuto(string curText, string bestCore, int curLang, int bestLang)
+        {
+            if (curLang != 1 || bestLang != 0) return false;
+            if (string.IsNullOrEmpty(curText) || string.IsNullOrEmpty(bestCore)) return false;
+            string cLow = curText.ToLowerInvariant();
+            string bLow = bestCore.ToLowerInvariant();
+            if (cLow.Length != 2 || bLow.Length != 2) return false;
+            if (curText == curText.ToUpperInvariant() && curText != cLow) return false;
+            if (EnTwoLetterProtected.Contains(cLow)) return false;
+            return RuTwoLetterAuto.Contains(bLow);
+        }
 
         public static bool Has(string word, int lang)
         {
@@ -129,19 +155,34 @@ namespace OpenSwitcher.Core
             return false;
         }
 
+        /// <summary>Строгое ядро словаря (ручное ядро + чистый частотник 35k RU / 20k EN, БЕЗ Huge).
+        /// Используется для dict-over-score, DictNeighbor и разблокировки autoLocked,
+        /// чтобы шум из 350k субтитров не пробивал биграммный скоринг.</summary>
+        public static bool HasCore(string word, int lang)
+        {
+            if (string.IsNullOrEmpty(word)) return false;
+            string w = word.Trim().ToLowerInvariant();
+            return HasCoreNormalized(w, lang);
+        }
+
+        private static bool HasCoreNormalized(string w, int lang)
+        {
+            if (w.Length < 2 || V3Removed.Contains(w)) return false;
+            if (lang == 0) return Ru.Contains(w) || RuBig.Contains(w);
+            if (lang == 1) return En.Contains(w) || EnBig.Contains(w);
+            return false;
+        }
+
         private static readonly Dictionary<int, char[]> Alphabets = new Dictionary<int, char[]>
         {
             { 0, "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".ToCharArray() },
             { 1, "abcdefghijklmnopqrstuvwxyz".ToCharArray() },
         };
 
-        /// <summary>Словарное слово на дистанции ≤ maxSubs (ТОЛЬКО замены букв): 'смоьри' →
-        /// 'смотри' (1), 'првиет' → 'привет' (2 — смежная транспозиция = 2 замены).
-        /// Умный режим (решение владельца 01.11, порт mac 469df98). Пороги против
-        /// «погрешности»: 1 замена — от 4 букв, 2 замены — от 6; маржа скора —
-        /// 1x для dist1, 2x для dist2 (решение о марже — в ворота Engine).
-        /// ВНИМАНИЕ: сборка — легаси csc .NET 4.0 (C# 5): без туплов, out var,
-        /// ?. и интерполяции (build.cmd, release.yml).</summary>
+        /// <summary>Быстрый поиск словарного соседа для умного режима (O(L), без лагов хука):
+        /// - dist 1 (от 4 букв): 1 замена, 1 пропуск буквы или 1 лишняя буква (от 5 букв);
+        /// - dist 2 (от 5 букв): смежная транспозиция соседних букв ('првиет' -> 'привет').
+        /// ВНИМАНИЕ: сборка — легаси csc .NET 4.0 (C# 5): без туплов, out var, ?. и интерполяции.</summary>
         public static string DictNeighbor(string word, int lang, int maxSubs, out int dist)
         {
             dist = 0;
@@ -150,63 +191,59 @@ namespace OpenSwitcher.Core
             if (w.Length < 4 || w.Length > 16) return null;
             char[] alphabet;
             if (!Alphabets.TryGetValue(lang, out alphabet)) return null;
-            var chars = w.ToCharArray();
+            char[] chars = w.ToCharArray();
             if (maxSubs >= 1)
             {
-                // замена одной буквы
+                // 1) замена одной буквы
                 for (int i = 0; i < chars.Length; i++)
                 {
                     char orig = chars[i];
-                    foreach (char ch in alphabet)
+                    for (int a = 0; a < alphabet.Length; a++)
                     {
+                        char ch = alphabet[a];
                         if (ch == orig) continue;
                         chars[i] = ch;
                         string candidate = new string(chars);
-                        if (Has(candidate, lang)) { chars[i] = orig; dist = 1; return candidate; }
+                        if (HasCoreNormalized(candidate, lang)) { chars[i] = orig; dist = 1; return candidate; }
                     }
                     chars[i] = orig;
                 }
-                // ПРОПУСК буквы (недожал): вставка одной буквы ('смотр' + 'и')
+                // 2) пропуск буквы (недожал): вставка одной буквы ('смотр' + 'и')
+                char[] ins = new char[chars.Length + 1];
                 for (int i = 0; i <= chars.Length; i++)
                 {
-                    foreach (char ch in alphabet)
+                    if (i > 0) Array.Copy(chars, 0, ins, 0, i);
+                    if (i < chars.Length) Array.Copy(chars, i, ins, i + 1, chars.Length - i);
+                    for (int a = 0; a < alphabet.Length; a++)
                     {
-                        string candidate = w.Insert(i, ch.ToString());
-                        if (Has(candidate, lang)) { dist = 1; return candidate; }
+                        ins[i] = alphabet[a];
+                        string candidate = new string(ins);
+                        if (HasCoreNormalized(candidate, lang)) { dist = 1; return candidate; }
                     }
                 }
-                // ЛИШНЯЯ буква (дважды нажал): удаление одной
-                for (int i = 0; i < chars.Length; i++)
+                // 3) лишняя буква (дважды нажал, от 5 букв): удаление одной
+                if (chars.Length >= 5)
                 {
-                    string candidate = w.Remove(i, 1);
-                    if (Has(candidate, lang)) { dist = 1; return candidate; }
+                    for (int i = 0; i < chars.Length; i++)
+                    {
+                        string candidate = w.Remove(i, 1);
+                        if (HasCoreNormalized(candidate, lang)) { dist = 1; return candidate; }
+                    }
                 }
             }
-            if (maxSubs >= 2 && chars.Length >= 6)
+            // 4) смежная транспозиция соседних букв ('првиет' -> 'привет', O(L))
+            if (maxSubs >= 2 && chars.Length >= 5)
             {
-                for (int i = 0; i < chars.Length; i++)
+                for (int i = 0; i + 1 < chars.Length; i++)
                 {
-                    char oi = chars[i];
-                    for (int j = i + 1; j < chars.Length; j++)
-                    {
-                        char oj = chars[j];
-                        foreach (char ch1 in alphabet)
-                        {
-                            foreach (char ch2 in alphabet)
-                            {
-                                if (ch1 == oi && ch2 == oj) continue; // обе на месте — dist 0
-                                chars[i] = ch1;
-                                chars[j] = ch2;
-                                string candidate = new string(chars);
-                                if (Has(candidate, lang))
-                                {
-                                    chars[i] = oi; chars[j] = oj;
-                                    dist = 2; return candidate;
-                                }
-                            }
-                        }
-                        chars[i] = oi; chars[j] = oj;
-                    }
+                    if (chars[i] == chars[i + 1]) continue;
+                    char tmp = chars[i];
+                    chars[i] = chars[i + 1];
+                    chars[i + 1] = tmp;
+                    string candidate = new string(chars);
+                    chars[i + 1] = chars[i];
+                    chars[i] = tmp;
+                    if (HasCoreNormalized(candidate, lang)) { dist = 2; return candidate; }
                 }
             }
             return null;

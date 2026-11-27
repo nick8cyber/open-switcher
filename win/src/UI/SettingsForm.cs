@@ -29,6 +29,9 @@ namespace OpenSwitcher.UI
         private HotkeyBox _hkWord, _hkSel, _hkRu, _hkEn, _hkAuto, _hkUndo;
         private ChoiceSeg _segSens, _segTheme;
         private TextBox _tbExcl, _tbSandbox;
+        private float _dpiScale = 1f;
+
+        private int Sc(int px) { return (int)Math.Round(px * _dpiScale); }
 
         public IntPtr SandboxHandle
         {
@@ -108,8 +111,8 @@ namespace OpenSwitcher.UI
             PageCard c1 = MkCard(pMain, y);
             _tAuto = new ToggleSwitch();
             _tAuto.Checked = _engine.S.AutoConvertOnWordEnd;
-            c1.AddRow("Живое автоисправление",
-                "Слово переворачивается прямо при наборе, не дожидаясь пробела", _tAuto, 56);
+            c1.AddRow("Автоисправление по границе слова",
+                "Проверять слово при нажатии пробела или знака препинания", _tAuto, 56);
             _tEnter = new ToggleSwitch();            _tEnter.Checked = _engine.S.FixOnEnter;
             c1.AddRow("Исправлять слово перед Enter",
                 "Enter перехватывается, слово правится до отправки", _tEnter, 56);
@@ -199,7 +202,7 @@ namespace OpenSwitcher.UI
             _tInputMode = new ToggleSwitch();
             _tInputMode.Checked = _engine.S.InputMode == 1;
             c5.AddRow("Ввод сообщениями окна (обход HIPS)",
-                "Буквы и Backspace шлются напрямую в окно ввода (WM_CHAR), минуя SendInput. Включено по умолчанию: антивирусы с защитой от эмуляции ввода (COMODO HIPS и т.п.) глушат SendInput — тогда замена «проходит», но текст не меняется. Выключите, если исправленный текст появляется не в том месте или не появляется вовсе в вашем редакторе",
+                "Буквы и Backspace шлются напрямую в окно ввода (WM_CHAR), минуя SendInput. По умолчанию выключено: включите только если антивирус с защитой от эмуляции ввода (COMODO HIPS и т.п.) глушит SendInput — тогда замена «проходит», но текст не меняется. Может не работать в Chromium и современных играх",
                 _tInputMode, 56);
             _tClip = new ToggleSwitch();
             _tClip.Checked = _engine.S.RestoreClipboard;
@@ -423,7 +426,13 @@ namespace OpenSwitcher.UI
 
         private void Save()
         {
+            var cur = _engine.S;
             var s = new Settings();
+            s.MinWordLen = cur.MinWordLen;
+            s.SpaceDedupMs = cur.SpaceDedupMs;
+            s.TapMinMs = cur.TapMinMs;
+            s.PasteConvertApps = cur.PasteConvertApps;
+            s.DefaultsV = cur.DefaultsV;
             s.AutoConvertOnWordEnd = _tAuto.Checked;
             s.FixOnEnter = _tEnter.Checked;
             s.LockAutoAfterManualSwitch = _tLock.Checked;
@@ -447,8 +456,15 @@ namespace OpenSwitcher.UI
             s.InputMode = _tInputMode.Checked ? 1 : 0;
             s.RestoreClipboard = _tClip.Checked;
             s.StartWithWindows = _tRun.Checked;
-            s.Exclusions = _tbExcl.Text.Trim();
-            s.Paused = _engine.S.Paused;
+            string[] rawParts = _tbExcl.Text.Split(new char[] { ',', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            var cleanParts = new System.Collections.Generic.List<string>();
+            foreach (string rp in rawParts)
+            {
+                string tr = rp.Trim();
+                if (tr.Length > 0) cleanParts.Add(tr);
+            }
+            s.Exclusions = string.Join(", ", cleanParts.ToArray());
+            s.Paused = cur.Paused;
             SettingsStore.Save(s);
             Program.SetAutostart(s.StartWithWindows);
             _engine.Apply(s);
@@ -460,9 +476,8 @@ namespace OpenSwitcher.UI
         {
             base.OnLoad(e);
             // ручное DPI-масштабирование: раскладка собрана в логических 96dpi-пикселях
-            uint dpi = Native.GetDpiForWindow(Handle);
-            if (dpi == 0) dpi = (uint)DeviceDpi;
-            float k = dpi / 96f;
+            float k = UiTheme.GetDpiScale(this);
+            _dpiScale = k > 1.01f ? k : 1f;
             if (k > 1.01f)
             {
                 Scale(new SizeF(k, k));
@@ -502,7 +517,7 @@ namespace OpenSwitcher.UI
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
-            if (e.Button == MouseButtons.Left && e.Y < TitleH)
+            if (e.Button == MouseButtons.Left && e.Y < Sc(TitleH))
             {
                 Native.ReleaseCapture();
                 Native.SendMessage(Handle, Native.WM_NCLBUTTONDOWN, (IntPtr)Native.HTCAPTION, IntPtr.Zero);
@@ -512,36 +527,41 @@ namespace OpenSwitcher.UI
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            // иконка приложения
-            var iconR = new Rectangle(12, 13, 22, 22);
+            // иконка приложения (масштабируется вместе с формой под DPI)
+            int titleH = Sc(TitleH);
+            int sideW = Sc(SidebarW);
+            int footH = Sc(FooterH);
+            int iconSz = Sc(22);
+            var iconR = new Rectangle(Sc(12), Sc(13), iconSz, iconSz);
             Rectangle gr = new Rectangle(0, 0, Width, Height);
-            using (var path = UiTheme.RoundRect(iconR, 7))
+            using (var path = UiTheme.RoundRect(iconR, Sc(7)))
             using (var brush = new LinearGradientBrush(gr, UiTheme.Accent, Color.FromArgb(0x7C, 0x5C, 0xFF), 40f))
                 e.Graphics.FillPath(brush, path);
-            using (var pen = new Pen(Color.White, 1.8f))
+            using (var pen = new Pen(Color.White, 1.8f * _dpiScale))
             {
                 pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
-                int x = iconR.X, y = iconR.Y, s = 22;
-                e.Graphics.DrawLine(pen, x + 4, y + 8, x + s - 4, y + 8);
-                e.Graphics.DrawLine(pen, x + s - 4, y + 8, x + s - 7, y + 5);
-                e.Graphics.DrawLine(pen, x + s - 4, y + 8, x + s - 7, y + 11);
-                e.Graphics.DrawLine(pen, x + s - 4, y + 14, x + 4, y + 14);
-                e.Graphics.DrawLine(pen, x + 4, y + 14, x + 7, y + 11);
-                e.Graphics.DrawLine(pen, x + 4, y + 14, x + 7, y + 17);
+                int x = iconR.X, y = iconR.Y, s = iconSz;
+                int dx4 = Sc(4), dx7 = Sc(7), dy5 = Sc(5), dy8 = Sc(8), dy11 = Sc(11), dy14 = Sc(14), dy17 = Sc(17);
+                e.Graphics.DrawLine(pen, x + dx4, y + dy8, x + s - dx4, y + dy8);
+                e.Graphics.DrawLine(pen, x + s - dx4, y + dy8, x + s - dx7, y + dy5);
+                e.Graphics.DrawLine(pen, x + s - dx4, y + dy8, x + s - dx7, y + dy11);
+                e.Graphics.DrawLine(pen, x + s - dx4, y + dy14, x + dx4, y + dy14);
+                e.Graphics.DrawLine(pen, x + dx4, y + dy14, x + dx7, y + dy11);
+                e.Graphics.DrawLine(pen, x + dx4, y + dy14, x + dx7, y + dy17);
             }
 
             TextRenderer.DrawText(e.Graphics, "OpenSwitcher", UiTheme.Font(13f, true),
-                new Point(42, 13), UiTheme.Text);
+                new Point(Sc(42), Sc(13)), UiTheme.Text);
 
             using (var pen = new Pen(UiTheme.CardBorder))
-                e.Graphics.DrawLine(pen, 0, TitleH, Width, TitleH);
+                e.Graphics.DrawLine(pen, 0, titleH, Width, titleH);
             using (var pen = new Pen(UiTheme.CardBorder))
-                e.Graphics.DrawLine(pen, SidebarW, TitleH, SidebarW, Height - FooterH);
+                e.Graphics.DrawLine(pen, sideW, titleH, sideW, Height - footH);
             using (var pen = new Pen(UiTheme.CardBorder))
-                e.Graphics.DrawLine(pen, 0, Height - FooterH, Width, Height - FooterH);
+                e.Graphics.DrawLine(pen, 0, Height - footH, Width, Height - footH);
 
-            var verR = new Rectangle(16, Height - FooterH, 300, FooterH);
-            TextRenderer.DrawText(e.Graphics, "OpenSwitcher 1.1 · Ru ⇄ En", UiTheme.Font(8.5f, false),
+            var verR = new Rectangle(Sc(16), Height - footH, Sc(300), footH);
+            TextRenderer.DrawText(e.Graphics, "OpenSwitcher 1.3.0 · Ru ⇄ En", UiTheme.Font(8.5f, false),
                 verR, UiTheme.Dim, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             base.OnPaint(e);

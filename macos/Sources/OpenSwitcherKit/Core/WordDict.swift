@@ -65,56 +65,100 @@ public enum WordDict {
         horrible beautiful interesting important available document documents \
         project projects issue issues ticket commit branch merge release update \
         updates error errors better well done \
-        ctrl alt shift esc del tab caps
+        ctrl alt shift esc del tab caps api sdk cli gui url ssh ssl sql css html json yaml \
+        http https git npm pip app dev pro max min log cfg env var tmp msg btn img
         """
 
     static let ru: Set<String> = Make(ruSrc)
     static let en: Set<String> = Make(enSrc)
 
     /// Частотники OpenSubtitles (RU 35k / EN 20k) — WordData, покрывают живую лексику.
-    /// Этот же корпус — источник биграмм possibleWord (НЕ расширять без нужды:
-    /// «глубокий мусор» умного режима обязан быть биграммно невозможным)
     static let ruBig: Set<String> = Make(WordData.ruAll)
     static let enBig: Set<String> = Make(WordData.enAll)
 
-    /// Расширенное МЕМБЕРСТВО (WordDataHuge: топ 200k RU / 150k EN OpenSubtitles,
-    /// ADR-003): редкие/книжные/профессиональные слова. На possibleWord не влияет
+    /// Расширенное членство (WordDataHuge: топ 200k RU / 150k EN OpenSubtitles, ADR-003).
+    /// Используется для подтверждения редких слов (при пройденном скоринге) и защиты
+    /// cur-in-dict, но НЕ имеет права в одиночку пробивать скоринг через dict-over-score.
     static let ruHuge: Set<String> = Make(WordDataHuge.ruHugeAll)
     static let enHuge: Set<String> = Make(WordDataHuge.enHugeAll)
 
-    /// Решения v3 — исключены из словаря НАВСЕГДА, любые расширения их не
-    /// возвращают: 'iban' — его RU-прочтение с тех же клавиш = «шифт», слово
-    /// переворачивалось в 'iban' при каждом наборе (96f7c2b)
-    static let v3Removed: Set<String> = ["iban"]
+    /// Deny-list мусорных токенов из субтитровых корпусов ('iban' = клавиши «шифт»;
+    /// 'gemin' = обрубок 'gemini', ломавший недописанное «пуьшт»).
+    static let v3Removed: Set<String> = ["iban", "gemin"]
 
-    /// Однобуквенные слова языка (предлоги/союзы) — «неприкасаемые» Caramba
+    /// Закрытый белый список частых 2-буквенных русских слов для безопасного авто-переворота
+    /// при MinWordLen >= 3 (исключает случайные срабатывания вроде TV -> ЕМ, CV -> СМ).
+    static let ruTwoLetterAuto: Set<String> = [
+        "да", "не", "но", "он", "ты", "вы", "то", "за", "на", "по",
+        "от", "из", "же", "бы", "ну", "ок", "ли", "ни", "до", "со",
+        "во", "ко", "об", "уж", "ее", "ей", "им", "их", "ой",
+    ]
+
+    /// Защищённые 2-буквенные английские слова и IT-сокращения (никогда не конвертируются автоматически).
+    static let enTwoLetterProtected: Set<String> = [
+        "in", "on", "to", "no", "so", "it", "is", "at", "by", "or", "of",
+        "as", "an", "am", "we", "he", "me", "my", "us", "if", "up", "do",
+        "go", "be", "hi", "ok", "oh", "ah", "eh", "yo", "vs", "id", "ip",
+        "os", "ui", "ux", "qa", "ai", "pr", "hr", "js", "ts", "py", "sh",
+        "db", "ci", "cd", "vm", "ml", "dl", "cv", "tv", "pc", "io", "re", "cc",
+    ]
+
+    /// Однобуквенные слова языка (предлоги/союзы) — «неприкасаемые» Caramba.
     static let ruSingles = "аивкосуя"
     static let enSingles = "ai"
 
-    /// Однобуквенное слово языка: «а», «и», «в»… / "a", "i".
-    /// Главный сигнал одиночных букв: 'f' — не слово, «а» — слово.
     public static func hasSingleLetterWord(_ ch: String, _ lang: Int) -> Bool {
         guard ch.count == 1, let c = ch.lowercased().first else { return false }
         return lang == 0 ? ruSingles.contains(c) : enSingles.contains(c)
     }
 
+    /// Разрешён ли авто-переворот 2-буквенного слова (только однозначные EN->RU пары, не в ALL_CAPS).
+    public static func isAllowedTwoLetterAuto(curText: String, bestCore: String, curLang: Int, bestLang: Int) -> Bool {
+        guard curLang == 1, bestLang == 0 else { return false }
+        let cLow = curText.lowercased()
+        let bLow = bestCore.lowercased()
+        guard cLow.count == 2, bLow.count == 2 else { return false }
+        // Запрещаем 2-буквенный автофлип для ALL_CAPS (даже при включённом CapsLock: 'LF', 'TV', 'UI'),
+        // но разрешаем заглавную первую букву в начале предложения ('Lf' -> 'Да').
+        if curText == curText.uppercased() && curText != cLow { return false }
+        if enTwoLetterProtected.contains(cLow) { return false }
+        return ruTwoLetterAuto.contains(bLow)
+    }
+
     static func Make(_ src: String) -> Set<String> {
         var set = Set<String>()
-        for w in src.split(separator: " ") {
-            let t = w.trimmingCharacters(in: .whitespaces).lowercased()
+        let trimChars = CharacterSet(charactersIn: " \t\r\n[]'\",")
+        for w in src.split(whereSeparator: { $0.isWhitespace || $0 == "," }) {
+            let t = String(w).trimmingCharacters(in: trimChars).lowercased()
             if t.count >= 2 { set.insert(t) }
         }
         return set
     }
 
-    /// Есть ли слово в словаре языка: 0 = ru, 1 = en.
+    /// Полное членство в словаре (ядро + 35k/20k + 200k/150k Huge).
     public static func has(_ word: String, _ lang: Int) -> Bool {
         if word.isEmpty { return false }
         let w = word.trimmingCharacters(in: .whitespaces).lowercased()
-        if w.count < 2 { return false }
-        if v3Removed.contains(w) { return false }
+        if w.count < 2 || v3Removed.contains(w) { return false }
         if lang == 0 { return ru.contains(w) || ruBig.contains(w) || ruHuge.contains(w) }
         if lang == 1 { return en.contains(w) || enBig.contains(w) || enHuge.contains(w) }
+        return false
+    }
+
+    /// Строгое ядро словаря (ручное ядро + чистый частотник 35k RU / 20k EN, БЕЗ Huge).
+    /// Используется для `dict-over-score`, `dictNeighbor` и разблокировки `autoLocked`,
+    /// чтобы шум из 350k субтитров не пробивал биграммный скоринг.
+    public static func hasCore(_ word: String, _ lang: Int) -> Bool {
+        if word.isEmpty { return false }
+        let w = word.trimmingCharacters(in: .whitespaces).lowercased()
+        return hasCoreNormalized(w, lang)
+    }
+
+    @inline(__always)
+    private static func hasCoreNormalized(_ w: String, _ lang: Int) -> Bool {
+        if w.count < 2 || v3Removed.contains(w) { return false }
+        if lang == 0 { return ru.contains(w) || ruBig.contains(w) }
+        if lang == 1 { return en.contains(w) || enBig.contains(w) }
         return false
     }
 
@@ -123,61 +167,52 @@ public enum WordDict {
         1: Array("abcdefghijklmnopqrstuvwxyz"),
     ]
 
-    /// Словарное слово на дистанции ≤ maxSubs (ТОЛЬКО замены букв): 'смоьри' →
-    /// 'смотри' (1), 'првиет' → 'привет' (2 — смежная транспозиция = 2 замены).
-    /// Умный режим (решение владельца 01.11; дистанция 2 — там же вечером).
-    /// Пороги против «погрешности»: 1 замена — от 4 букв, 2 замены — от 6
-    /// (для коротких две замены — полслова, сходство теряет смысл); возврат —
-    /// сосед и дистанция (1 → маржа скора 1x, 2 → маржа 2x).
+    /// Быстрый поиск словарного соседа для умного режима (< 0.1 мс, без аллокаций trim/lower):
+    /// - dist 1 (от 4 букв): 1 замена, 1 пропуск буквы или 1 лишняя буква (от 5 букв)
+    /// - dist 2 (от 5 букв): смежная транспозиция соседних букв ('првиет' -> 'привет', O(L)).
+    /// Квадратичный перебор всех пар букв удалён (вешал поток тапа до 570 мс и давал ложные совпадения).
     public static func dictNeighbor(_ word: String, _ lang: Int, maxSubs: Int) -> (neighbor: String, dist: Int)? {
         let w = Array(word.lowercased())
         guard w.count >= 4, w.count <= 16, let alphabet = alphabets[lang] else { return nil }
         if maxSubs >= 1 {
-            // замена одной буквы
-            for i in w.indices {
-                let orig = w[i]
+            // 1) замена одной буквы
+            var c = w
+            for i in c.indices {
+                let orig = c[i]
                 for ch in alphabet where ch != orig {
-                    var c = w
                     c[i] = ch
                     let s = String(c)
-                    if has(s, lang) { return (s, 1) }
+                    if hasCoreNormalized(s, lang) { return (s, 1) }
                 }
+                c[i] = orig
             }
-            // ПРОПУСК буквы (юзер не дожал): вставка одной буквы даёт словарное
-            // слово ('смотри' с недожатой 'и' -> 'смотри'). Решение владельца
-            // 01.11: «пропуски букв давай тоже добавим»
+            // 2) пропуск одной буквы (вставка)
             for i in 0...w.count {
                 for ch in alphabet {
-                    var c = w
-                    c.insert(ch, at: i)
-                    let s = String(c)
-                    if has(s, lang) { return (s, 1) }
+                    var ins = w
+                    ins.insert(ch, at: i)
+                    let s = String(ins)
+                    if hasCoreNormalized(s, lang) { return (s, 1) }
                 }
             }
-            // ЛИШНЯЯ буква (двойное нажатие): удаление одной буквы даёт словарное
-            for i in w.indices {
-                var c = w
-                c.remove(at: i)
-                let s = String(c)
-                if has(s, lang) { return (String(c), 1) }
+            // 3) лишняя буква (двойное нажатие, от 5 букв, чтобы 4-буквенный мусор не падал в 3-буквенные корни)
+            if w.count >= 5 {
+                for i in w.indices {
+                    var del = w
+                    del.remove(at: i)
+                    let s = String(del)
+                    if hasCoreNormalized(s, lang) { return (s, 1) }
+                }
             }
         }
-        if maxSubs >= 2, w.count >= 6 {
-            for i in w.indices {
-                let oi = w[i]
-                for j in w.indices where j > i {
-                    let oj = w[j]
-                    for ch1 in alphabet {
-                        for ch2 in alphabet {
-                            if ch1 == oi && ch2 == oj { continue } // обе на месте — это dist 0
-                            var c = w
-                            c[i] = ch1
-                            c[j] = ch2
-                            let s = String(c)
-                            if has(s, lang) { return (s, 2) }
-                        }
-                    }
-                }
+        if maxSubs >= 2, w.count >= 5 {
+            // смежная транспозиция двух соседних букв ('првиет' -> 'привет') — O(L)
+            var tr = w
+            for i in 0..<(tr.count - 1) where tr[i] != tr[i + 1] {
+                tr.swapAt(i, i + 1)
+                let s = String(tr)
+                if hasCoreNormalized(s, lang) { return (s, 2) }
+                tr.swapAt(i, i + 1)
             }
         }
         return nil

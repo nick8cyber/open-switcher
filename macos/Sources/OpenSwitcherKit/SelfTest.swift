@@ -47,13 +47,13 @@ public enum SelfTest {
             let curScore = LanguageTables.score(LanguageTables.lettersOnly(curText), curLang)
             let altScore = LanguageTables.score(LanguageTables.lettersOnly(altText), altLang)
             var convert: Bool
-            if c.live && !WordDict.has(altText, altLang) {
+            if c.live && !WordDict.hasCore(altText, altLang) {
                 convert = false
             } else {
                 convert = LanguageTables.shouldConvert(curText: curText, curLang: curLang, curScore: curScore,
                                                        bestText: altText, bestLang: altLang, bestScore: altScore,
                                                        sensitivity: 1.0)
-                let targetInDict = WordDict.has(altText, altLang)
+                let targetInDict = WordDict.hasCore(altText, altLang)
                 let curInDict = WordDict.has(curText, curLang)
                 if convert && curInDict && !targetInDict { convert = false }
                 if !convert && targetInDict && !curInDict { convert = true }
@@ -94,9 +94,24 @@ public enum SelfTest {
             ("fuzzy: 'првиет' dist2 (транспоз)", WordDict.dictNeighbor("првиет", 0, maxSubs: 2)?.dist == 2, true),
             ("fuzzy: пропуск буквы ('смотри' недожал 'и')", WordDict.dictNeighbor("смотр", 0, maxSubs: 2)?.dist == 1, true),
             ("fuzzy: лишняя буква ('смоотри' дважды нажал 'о')", WordDict.dictNeighbor("смоотри", 0, maxSubs: 2)?.dist == 1, true),
-            ("fuzzy: 'пкивед' dist2-сосед (6 букв)", WordDict.dictNeighbor("пкивед", 0, maxSubs: 2)?.dist == 2, true),
-            ("fuzzy: dist2 не ищется <6 букв",   WordDict.dictNeighbor("пкиве", 0, maxSubs: 2)?.neighbor == WordDict.dictNeighbor("пкиве", 0, maxSubs: 1)?.neighbor, true),
+            ("fuzzy: 'пкивед' (2 произв. замены) отклонён O(L)", WordDict.dictNeighbor("пкивед", 0, maxSubs: 2) == nil, true),
+            ("fuzzy: dist2 не ищется при maxSubs=1", WordDict.dictNeighbor("првиет", 0, maxSubs: 1) == nil, true),
             ("fuzzy: dist1-поиск не находит dist2-слово", WordDict.dictNeighbor("пкивед", 0, maxSubs: 1) == nil, true),
+            // защиты Фазы 4: core-словарь, 2-буквенный whitelist, ALL_CAPS, camelCase, цифры
+            ("dict v4: 'gemin' удалён из EN",     WordDict.has("gemin", 1), false),
+            ("dict v4: 'api' добавлен в EN",      WordDict.hasCore("api", 1), true),
+            ("dict v4: 'перкуссия' только в Huge (не в hasCore)", WordDict.hasCore("перкуссия", 0), false),
+            ("2-let: 'lf' -> 'да' разрешён",      WordDict.isAllowedTwoLetterAuto(curText: "lf", bestCore: "да", curLang: 1, bestLang: 0), true),
+            ("2-let: 'LF' (CAPS) запрещён",       WordDict.isAllowedTwoLetterAuto(curText: "LF", bestCore: "да", curLang: 1, bestLang: 0), false),
+            ("2-let: 'tv' -> 'ем' запрещён",      WordDict.isAllowedTwoLetterAuto(curText: "tv", bestCore: "ем", curLang: 1, bestLang: 0), false),
+            ("2-let: 'in' -> 'шт' запрещён",      WordDict.isAllowedTwoLetterAuto(curText: "in", bestCore: "шт", curLang: 1, bestLang: 0), false),
+            ("caps: 'TV' (Shift+T,V) = акроним",  Engine.isAllCapsAcronym(buildKeys("TV", isRu: false)), true),
+            ("caps: 'Ghbdtn' != акроним",         Engine.isAllCapsAcronym(buildKeys("Ghbdtn", isRu: false)), false),
+            ("camel: 'JoeSnow' = camelCase",      Engine.hasCamelCaseTransition(buildKeys("JoeSnow", isRu: false)), true),
+            ("camel: 'iPhone' = camelCase",       Engine.hasCamelCaseTransition(buildKeys("iPhone", isRu: false)), true),
+            ("camel: 'GHbdtn' != camelCase",      Engine.hasCamelCaseTransition(buildKeys("GHbdtn", isRu: false)), false),
+            ("sep: голая цифра '7' не сепаратор", KeyCodeMap.isSeparatorKey(0x1A, shift: false), false),
+            ("sep: Shift+'7' ('?'/'&') сепаратор", KeyCodeMap.isSeparatorKey(0x1A, shift: true), true),
             // дискриминатор умного режима: опечатка СВОЕГО языка ('hellp') —
             // possible → НЕ трогается; чужеродный мусор ('cvjmhb') — невозможен
             // → переворот разрешён
@@ -109,10 +124,21 @@ public enum SelfTest {
             ("huge: 'callback' в словаре",       WordDict.has("callback", 1), true),
             ("huge: 'перкуссия' НЕ в старом топе", !WordDict.ruBig.contains("перкуссия"), true),
             ("huge: возможное не сломано ('кшмрре')", LanguageTables.possibleWord("кшмрре", 0), false),
-            // паст-пути, бой 02:08/03:02 06.11: каретка и десинк-детект
-            ("paste: 'да ' = уже целевое (десинк)", Engine.pasteSelectionAlreadyTarget("да ", target: "да"), true),
-            ("paste: 'lf ' ≠ целевое",            Engine.pasteSelectionAlreadyTarget("lf ", target: "да"), false),
-            ("paste: 'да' без пробелов = целевое", Engine.pasteSelectionAlreadyTarget("да", target: "да"), true),
+            // P0-2 / P1-1 / P1-5 / P2-3: пунктуация на конце, домены, двубуквенные, CAPS/CapsLock
+            ("punct: 'here.' ядро в EN словаре",   WordDict.has(LanguageTables.lettersOnly("here."), 1), true),
+            ("punct: 'keys.' ядро в EN словаре",   WordDict.has(LanguageTables.lettersOnly("keys."), 1), true),
+            ("punct: 'her,' ядро в EN словаре",    WordDict.has(LanguageTables.lettersOnly("her,"), 1), true),
+            ("2-let: 'it.' защищено",              WordDict.isAllowedTwoLetterAuto(curText: "it", bestCore: "ше", curLang: 1, bestLang: 0), false),
+            ("2-let: 'vs.' защищено",              WordDict.isAllowedTwoLetterAuto(curText: "vs", bestCore: "мы", curLang: 1, bestLang: 0), false),
+            ("2-let: 'Lf!' -> 'Да!' допустимо",    WordDict.isAllowedTwoLetterAuto(curText: "Lf", bestCore: "Да", curLang: 1, bestLang: 0) && Engine.targetShapeOk("Да!"), true),
+            ("domain: 'main.py' защищён",          Engine.isDomainOrFileName("main.py"), true),
+            ("domain: 'vk.ru' защищён",            Engine.isDomainOrFileName("vk.ru"), true),
+            ("domain: 'ghbdtn.' не домен",         Engine.isDomainOrFileName("ghbdtn."), false),
+            ("caps: 'XNJ' RU-ядро 'что' без EN 'xnj'", WordDict.hasCore("что", 0) && !WordDict.hasCore("xnj", 1), true),
+            ("caps: 'YTN' RU-ядро 'нет' без EN 'ytn'", WordDict.hasCore("нет", 0) && !WordDict.hasCore("ytn", 1), true),
+            ("caps: 'GJRF' RU-ядро 'пока' без EN 'gjrf'", WordDict.hasCore("пока", 0) && !WordDict.hasCore("gjrf", 1), true),
+            ("caps: 'API' акроним EN без RU ядра",  Engine.isAllCapsAcronym(buildKeys("API", isRu: false)) && WordDict.hasCore("api", 1) && !WordDict.hasCore("фзш", 0), true),
+            ("caps: 'SQL' акроним EN без RU ядра",  Engine.isAllCapsAcronym(buildKeys("SQL", isRu: false)) && !WordDict.hasCore("ыйд", 0), true),
         ]
         for (name, got, want) in v3checks {
             let pass = got == want
@@ -160,10 +186,12 @@ public enum SelfTest {
             sb += "\(pass ? "PASS" : "FAIL"): retro '\(typed)' -> '\(target)' [\(got ? "FLIP" : "keep")] \(pass ? "" : "!!")(\(note))\n"
         }
 
-        // --- форма цели авто-замены (паритет C#): буквы ИЛИ буквы + один знак в конце ---
+        // --- форма цели авто-замены (паритет C#): буквы ИЛИ буквы + один знак в конце ИЛИ дефисные слова ---
         let shapes: [(String, Bool, String)] = [
             ("привет", true, "только буквы"), ("привет,", true, "буквы + знак в конце"),
-            ("тебя.", true, "хвост-двойник точкой"), ("et,e", false, "знак внутри — мусор"),
+            ("тебя.", true, "хвост-двойник точкой"), ("какой-то", true, "валидное дефисное слово"),
+            ("--help", false, "ведущий CLI-флаг отклонён"), ("-rf", false, "ведущий дефис отклонён"),
+            ("et,e", false, "знак внутри — мусор"),
             ("le,rf[", false, "знаки внутри и в конце"), ("e,,", false, "два знака в конце"),
             (",", false, "без букв"),
         ]
@@ -172,6 +200,31 @@ public enum SelfTest {
             let pass = got == want
             if !pass { fails += 1 }
             sb += "\(pass ? "PASS" : "FAIL"): shape '\(t)' [\(got ? "ok" : "reject")] \(pass ? "" : "!!")(\(note))\n"
+        }
+
+        // --- Shift-символы, инвертированный CapsLock ('gHBDTN') и переполнение WordBuffer ---
+        let capsKeys: [KeyRec] = Array("ghbdtn").enumerated().map { idx, ch in
+            KeyRec(CharMaps.keyCode(ofChar: ch, fromRu: false), idx == 0, true)
+        }
+        let wb = WordBuffer()
+        for _ in 0..<40 { wb.push(KeyRec(0x00, false, false)) }
+        let wbAt40 = wb.count == 40 && !wb.overflowed
+        wb.push(KeyRec(0x00, false, false))
+        let wbAt41 = wb.count == 0 && wb.overflowed
+        wb.clear()
+        let wbCleared = wb.count == 0 && !wb.overflowed
+
+        let extraChecks: [(String, Bool)] = [
+            ("shift-map: :<>\"{}~ -> ЖБЮЭХЪЁ", CharMaps.mapText(":<>\"{}~", toRu: true) == "ЖБЮЭХЪЁ"),
+            ("shift-map: ЖБЮЭХЪЁ -> :<>\"{}~", CharMaps.mapText("ЖБЮЭХЪЁ", toRu: false) == ":<>\"{}~"),
+            ("keycode: 'б' -> kVK_ANSI_Comma (0x2B)", CharMaps.keyCode(ofChar: "б", fromRu: true) == 0x2B),
+            ("keycode: ':' -> kVK_ANSI_Semicolon (0x29)", CharMaps.keyCode(ofChar: ":", fromRu: false) == 0x29),
+            ("camel: 'gHBDTN' (Caps+Shift) != camelCase", !Engine.hasCamelCaseTransition(capsKeys)),
+            ("buffer: overflow на >40 клавиш и сброс", wbAt40 && wbAt41 && wbCleared),
+        ]
+        for (name, got) in extraChecks {
+            if !got { fails += 1 }
+            sb += "\(got ? "PASS" : "FAIL"): [p0-p2] \(name)\(got ? "" : " !!")\n"
         }
 
         sb += fails == 0 ? "ALL TESTS PASSED\n" : "\(fails) TEST(S) FAILED\n"

@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.Windows.Forms;
+using OpenSwitcher.Core;
 
 namespace OpenSwitcher.UI
 {
@@ -172,9 +175,23 @@ namespace OpenSwitcher.UI
             }
         }
 
+        private static readonly Dictionary<string, Font> _fontCache = new Dictionary<string, Font>();
+        private static readonly object _fontLock = new object();
+        private static bool _dpiApiMissing;
+
+        /// <summary>Кэш GDI-шрифтов (вызывается из OnPaint — без утечки HFONT на каждом перерисовывании).</summary>
         public static Font Font(float size, bool bold)
         {
-            return new Font(Family, size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+            string fam = Family;
+            string key = fam + "|" + size.ToString(CultureInfo.InvariantCulture) + "|" + (bold ? "B" : "R");
+            lock (_fontLock)
+            {
+                Font f;
+                if (_fontCache.TryGetValue(key, out f)) return f;
+                f = new Font(fam, size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+                _fontCache[key] = f;
+                return f;
+            }
         }
 
         public static GraphicsPath RoundRect(Rectangle r, int radius)
@@ -191,10 +208,36 @@ namespace OpenSwitcher.UI
             return p;
         }
 
+        /// <summary>Коэффициент DPI без .NET 4.7 DeviceDpi и с безопасным откатом для Win 8.1.</summary>
+        public static float GetDpiScale(Control c)
+        {
+            if (!_dpiApiMissing)
+            {
+                try
+                {
+                    IntPtr hwnd = (c != null && c.IsHandleCreated) ? c.Handle : IntPtr.Zero;
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        uint d = Native.GetDpiForWindow(hwnd);
+                        if (d > 0) return d / 96f;
+                    }
+                }
+                catch (EntryPointNotFoundException) { _dpiApiMissing = true; }
+                catch (DllNotFoundException) { _dpiApiMissing = true; }
+                catch (Exception) { }
+            }
+            try
+            {
+                using (var g = (c != null && c.IsHandleCreated) ? c.CreateGraphics() : Graphics.FromHwnd(IntPtr.Zero))
+                    return g.DpiX > 0 ? g.DpiX / 96f : 1f;
+            }
+            catch (Exception) { return 1f; }
+        }
+
         /// <summary>Пиксели -> DevicePixel (для чёткости на масштабах >100%).</summary>
         public static int Dp(Control c, int px)
         {
-            return (int)Math.Round(px * c.DeviceDpi / 96.0);
+            return (int)Math.Round(px * GetDpiScale(c));
         }
     }
 

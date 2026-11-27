@@ -123,15 +123,15 @@ namespace OpenSwitcher
                 double curScore = LanguageTables.Score(LanguageTables.LettersOnly(curText), curLang);
                 double altScore = LanguageTables.Score(LanguageTables.LettersOnly(altText), altLang);
                 bool convert;
-                if (c.Live && !WordDict.Has(altText, altLang))
+                if (c.Live && !WordDict.HasCore(altText, altLang))
                 {
-                    convert = false; // живое исправление — только в словарные слова
+                    convert = false; // живое исправление — только в основные словарные слова
                 }
                 else
                 {
                     convert = LanguageTables.ShouldConvert(curText, curLang, curScore,
                                                             altText, altLang, altScore, 1.0);
-                    bool targetInDict = WordDict.Has(altText, altLang);
+                    bool targetInDict = WordDict.HasCore(altText, altLang);
                     bool curInDict = WordDict.Has(curText, curLang);
                     if (convert && curInDict && !targetInDict) convert = false;
                     if (!convert && targetInDict && !curInDict) convert = true;
@@ -189,12 +189,13 @@ namespace OpenSwitcher
                     pass ? "PASS" : "FAIL", r[0], got ? "ok" : "reject", pass ? "" : "!!", r[2]));
             }
 
-            // словарь членства (ADR-003) + deny-list v3 + умный режим (СПЕКА §5 11а)
+            // словарь членства (ADR-003) + deny-list v3/v4 + умный режим (СПЕКА §5 11а)
             var dictChecks = new[]
             {
                 new object[] { "перкуссия", 0, true,  "huge: редкое RU-слово в словаре" },
                 new object[] { "callback",  1, true,  "huge: редкое EN-слово в словаре" },
                 new object[] { "iban",      1, false, "deny-list v3: RU-прочтение с клавиш = «шифт»" },
+                new object[] { "gemin",     1, false, "deny-list v4: шум из субтитров" },
                 new object[] { "vel",       1, false, "3-буквенный мусор субтитров — не член (мин. 4 буквы)" }
             };
             foreach (object[] r in dictChecks)
@@ -203,7 +204,7 @@ namespace OpenSwitcher
                 bool pass = got == (bool)r[2];
                 if (!pass) fails++;
                 sb.AppendLine(string.Format("{0}: dict '{1}' [{2}] {3} ({4})",
-                    pass ? "PASS" : "FAIL", r[0], got ? "в словаре" : "нет", pass ? "" : "!!", r[4]));
+                    pass ? "PASS" : "FAIL", r[0], got ? "в словаре" : "нет", pass ? "" : "!!", r[3]));
             }
             int fuzzyDist;
             string fuzzyNeighbor = WordDict.DictNeighbor("смоьри", 0, 2, out fuzzyDist);
@@ -217,6 +218,12 @@ namespace OpenSwitcher
             if (!transPass) fails++;
             sb.AppendLine(string.Format("{0}: fuzzy 'првиет' ~= '{1}' dist{2} ({3})",
                 transPass ? "PASS" : "FAIL", transNeighbor ?? "-", transDist, "смежная транспозиция = 2 замены"));
+            int arb2Dist;
+            string arb2Neighbor = WordDict.DictNeighbor("пкивед", 0, 2, out arb2Dist);
+            bool arb2Pass = arb2Neighbor == null;
+            if (!arb2Pass) fails++;
+            sb.AppendLine(string.Format("{0}: fuzzy 'пкивед' == null ({1})",
+                arb2Pass ? "PASS" : "FAIL", "2 произв. замены отклонены O(L)"));
             int skipDist;
             string skipNeighbor = WordDict.DictNeighbor("смотр", 0, 2, out skipDist);
             bool skipPass = skipNeighbor != null && skipDist == 1;
@@ -229,6 +236,74 @@ namespace OpenSwitcher
             if (!extraPass) fails++;
             sb.AppendLine(string.Format("{0}: fuzzy 'смоотри' ~= '{1}' dist{2} ({3})",
                 extraPass ? "PASS" : "FAIL", extraNeighbor ?? "-", extraDist, "лишняя буква = удаление"));
+
+            // защиты Фазы 4: HasCore, 2-буквенный whitelist, ALL_CAPS, camelCase, цифры
+            var v4Checks = new[]
+            {
+                new object[] { "core: 'api' в HasCore", WordDict.HasCore("api", 1), true },
+                new object[] { "core: 'перкуссия' НЕ в HasCore", WordDict.HasCore("перкуссия", 0), false },
+                new object[] { "2-let: 'lf' -> 'да' разрешён", WordDict.IsAllowedTwoLetterAuto("lf", "да", 1, 0), true },
+                new object[] { "2-let: 'LF' (CAPS) запрещён", WordDict.IsAllowedTwoLetterAuto("LF", "да", 1, 0), false },
+                new object[] { "2-let: 'tv' -> 'ем' запрещён", WordDict.IsAllowedTwoLetterAuto("tv", "ем", 1, 0), false },
+                new object[] { "2-let: 'in' -> 'шт' запрещён", WordDict.IsAllowedTwoLetterAuto("in", "шт", 1, 0), false },
+                new object[] { "caps: 'TV' = акроним", Engine.IsAllCapsAcronym(BuildKeys("TV", false)), true },
+                new object[] { "caps: 'Ghbdtn' != акроним", Engine.IsAllCapsAcronym(BuildKeys("Ghbdtn", false)), false },
+                new object[] { "camel: 'JoeSnow' = camelCase", Engine.HasCamelCaseTransition(BuildKeys("JoeSnow", false)), true },
+                new object[] { "camel: 'iPhone' = camelCase", Engine.HasCamelCaseTransition(BuildKeys("iPhone", false)), true },
+                new object[] { "camel: 'GHbdtn' != camelCase", Engine.HasCamelCaseTransition(BuildKeys("GHbdtn", false)), false },
+                new object[] { "sep: голая '7' не сепаратор", Engine.IsSeparatorVk(0x37, false), false },
+                new object[] { "sep: Shift+'7' сепаратор", Engine.IsSeparatorVk(0x37, true), true },
+                new object[] { "punct: 'here.' в EN словаре", WordDict.Has(LanguageTables.LettersOnly("here."), 1), true },
+                new object[] { "punct: 'keys.' в EN словаре", WordDict.Has(LanguageTables.LettersOnly("keys."), 1), true },
+                new object[] { "punct: 'her,' в EN словаре", WordDict.Has(LanguageTables.LettersOnly("her,"), 1), true },
+                new object[] { "2-let: 'it.' защищено", WordDict.IsAllowedTwoLetterAuto("it", "ше", 1, 0), false },
+                new object[] { "2-let: 'vs.' защищено", WordDict.IsAllowedTwoLetterAuto("vs", "мы", 1, 0), false },
+                new object[] { "2-let: 'Lf!' -> 'Да!' допустимо", WordDict.IsAllowedTwoLetterAuto("Lf", "Да", 1, 0) && Engine.TargetShapeOk("Да!"), true },
+                new object[] { "domain: 'main.py' защищён", Engine.IsDomainOrFileName("main.py"), true },
+                new object[] { "domain: 'vk.ru' защищён", Engine.IsDomainOrFileName("vk.ru"), true },
+                new object[] { "domain: 'ghbdtn.' не домен", Engine.IsDomainOrFileName("ghbdtn."), false },
+                new object[] { "shape: 'какой-то' валидно", Engine.TargetShapeOk("какой-то"), true },
+                new object[] { "shape: '--help' отклонён", Engine.TargetShapeOk("--help"), false },
+                new object[] { "shape: '-rf' отклонён", Engine.TargetShapeOk("-rf"), false },
+                new object[] { "shift-map: :<>\"{}~ -> ЖБЮЭХЪЁ", CharMaps.MapText(":<>\"{}~", true) == "ЖБЮЭХЪЁ", true },
+                new object[] { "shift-map: ЖБЮЭХЪЁ -> :<>\"{}~", CharMaps.MapText("ЖБЮЭХЪЁ", false) == ":<>\"{}~", true },
+                new object[] { "vk: 'б' -> 0xBC", CharMaps.VkOfChar('б', true) == 0xBC, true },
+                new object[] { "caps: 'XNJ' RU-ядро 'что'", WordDict.HasCore("что", 0) && !WordDict.HasCore("xnj", 1), true },
+                new object[] { "caps: 'YTN' RU-ядро 'нет'", WordDict.HasCore("нет", 0) && !WordDict.HasCore("ytn", 1), true },
+                new object[] { "caps: 'GJRF' RU-ядро 'пока'", WordDict.HasCore("пока", 0) && !WordDict.HasCore("gjrf", 1), true },
+                new object[] { "caps: 'API' EN акроним", Engine.IsAllCapsAcronym(BuildKeys("API", false)) && WordDict.HasCore("api", 1) && !WordDict.HasCore("фзш", 0), true },
+                new object[] { "caps: 'SQL' EN акроним", Engine.IsAllCapsAcronym(BuildKeys("SQL", false)) && !WordDict.HasCore("ыйд", 0), true }
+            };
+            foreach (object[] r in v4Checks)
+            {
+                bool got = (bool)r[1];
+                bool pass = got == (bool)r[2];
+                if (!pass) fails++;
+                sb.AppendLine(string.Format("{0}: [v4] {1} {2}",
+                    pass ? "PASS" : "FAIL", r[0], pass ? "" : "!!"));
+            }
+
+            // Инвертированный CapsLock ('gHBDTN') и переполнение WordBuffer (>40)
+            var capsKeys = new List<KeyRec>();
+            string capsSample = "ghbdtn";
+            for (int i = 0; i < capsSample.Length; i++)
+                capsKeys.Add(new KeyRec(CharMaps.VkOfChar(capsSample[i], false), i == 0, true));
+            bool capsPass = !Engine.HasCamelCaseTransition(capsKeys);
+            if (!capsPass) fails++;
+            sb.AppendLine(string.Format("{0}: camel 'gHBDTN' (Caps+Shift) != camelCase {1}",
+                capsPass ? "PASS" : "FAIL", capsPass ? "" : "!!"));
+
+            var wb = new WordBuffer();
+            for (int i = 0; i < 40; i++) wb.Push(new KeyRec(0x41, false, false));
+            bool wb40 = wb.Count == 40 && !wb.Overflowed;
+            wb.Push(new KeyRec(0x41, false, false));
+            bool wb41 = wb.Count == 0 && wb.Overflowed;
+            wb.Clear();
+            bool wbClr = wb.Count == 0 && !wb.Overflowed;
+            bool wbPass = wb40 && wb41 && wbClr;
+            if (!wbPass) fails++;
+            sb.AppendLine(string.Format("{0}: WordBuffer overflow >40 & clear {1}",
+                wbPass ? "PASS" : "FAIL", wbPass ? "" : "!!"));
 
             // сверка скопированного с ожидаемым словом паст-конверта (бой 02:08/03:02 06.11:
             // гонка печати/реплея подсовывает чужой текст — вставлять нельзя)

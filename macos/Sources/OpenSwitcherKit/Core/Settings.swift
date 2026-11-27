@@ -9,6 +9,8 @@ public enum HK {
 }
 
 public final class Settings {
+    public static let defaultMacExclusions = "terminal, iterm, iterm2, warp, ghostty, alacritty, kitty, bitwarden, 1password, keychain access, связка ключей"
+
     // --- автоправка
     public var fixOnEnter = true
     public var autoConvertOnWordEnd = true
@@ -31,8 +33,7 @@ public final class Settings {
     public var hotAutoToggleMods: Int = 0
     public var hotPasteVk: Int = 0x09            // «V» — вставить без форматирования (как в Caramba)
     public var hotPasteMods: Int = HK.CMD | HK.SHIFT
-    public var lockAutoAfterManualSwitch = true // решение владельца: после ручного тапа автодетект молчит
-                                                 // отключает автодетект до новой сессии (defaultsV 10)
+    public var lockAutoAfterManualSwitch = true
     public var doubleShiftSwitch = true
 
     // --- жесты «как в Caramba»
@@ -43,18 +44,56 @@ public final class Settings {
     // --- система
     public var showPopup = true
     public var restoreClipboard = true
-    public var devLog = false  // режим разработчика: вести журнал решений в файл (DevLog в C#; для опенсорса — ВЫКЛ)
-    public var spaceDedupMs = 0 // дедуп двойных пробелов: второй пробел подряд в пределах окна глотается (0 = выкл)
-    public var tapMinMs = 0 // тап короче N мс не переключает раскладку (случайный задев); 0 = выкл — жёсткий порог ел реальные тапы
+    public var devLog = false  // режим разработчика: вести журнал решений в файл
+    public var spaceDedupMs = 0 // дедуп двойных пробелов (0 = выкл)
+    public var tapMinMs = 0 // тап короче N мс не переключает раскладку (0 = дефолтный анти-дребезг 15 мс)
     public var startWithSystem = false
     public var paused = false
-    public var exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe" // популярные игры (вин/мак общий список, .exe на маке матчится как подстрока)
-    // Поля, где авто-конверт идёт через выделение+вставку (без забоев):
-    // веб-приложения в Chromium — их обработчик ввода переигрывает BS-инжекции
-    // (';ддфф', бой 23:39 02.11). mac-only (на вин SendInput упорядочен)
-    public var pasteConvertApps = ""
+    public var exclusions = Settings.defaultMacExclusions
+    public var pasteConvertApps = "" // устаревшее ini-поле (сохранено для совместимости чтения/записи)
     public var themeMode = 0 // 0 системная / 1 светлая / 2 тёмная
-    public var defaultsV = 11
+    public var defaultsV = 12
+
+    public init() {}
+
+    public func clone() -> Settings {
+        let c = Settings()
+        c.fixOnEnter = fixOnEnter
+        c.autoConvertOnWordEnd = autoConvertOnWordEnd
+        c.minWordLen = minWordLen
+        c.sensitivity = sensitivity
+        c.hotUndoVk = hotUndoVk
+        c.hotUndoMods = hotUndoMods
+        c.hotFixWordVk = hotFixWordVk
+        c.hotFixWordMods = hotFixWordMods
+        c.hotFixSelVk = hotFixSelVk
+        c.hotFixSelMods = hotFixSelMods
+        c.hotRuVk = hotRuVk
+        c.hotRuMods = hotRuMods
+        c.hotEnVk = hotEnVk
+        c.hotEnMods = hotEnMods
+        c.hotAutoToggleVk = hotAutoToggleVk
+        c.hotAutoToggleMods = hotAutoToggleMods
+        c.hotPasteVk = hotPasteVk
+        c.hotPasteMods = hotPasteMods
+        c.lockAutoAfterManualSwitch = lockAutoAfterManualSwitch
+        c.doubleShiftSwitch = doubleShiftSwitch
+        c.optionFlip = optionFlip
+        c.pastePlain = pastePlain
+        c.shiftShiftToggle = shiftShiftToggle
+        c.showPopup = showPopup
+        c.restoreClipboard = restoreClipboard
+        c.devLog = devLog
+        c.spaceDedupMs = spaceDedupMs
+        c.tapMinMs = tapMinMs
+        c.startWithSystem = startWithSystem
+        c.paused = paused
+        c.exclusions = exclusions
+        c.pasteConvertApps = pasteConvertApps
+        c.themeMode = themeMode
+        c.defaultsV = defaultsV
+        return c
+    }
 }
 
 public enum SettingsStore {
@@ -78,9 +117,6 @@ public enum SettingsStore {
     static func migrate(_ s: inout Settings) {
         var migrated = false
         if s.defaultsV < 9 {
-            // defaultsV 9: F15 (0x71) нет на современных Mac-клавиатурах —
-            // дефолтные undo/fixsel снимаются; главная отмена — Backspace сразу
-            // после замены, выделение конвертит Option-тап (select-left fallback).
             if s.hotUndoVk == KeyCodeMap.f15 {
                 s.hotUndoVk = 0
                 s.hotUndoMods = 0
@@ -97,10 +133,19 @@ public enum SettingsStore {
             migrated = true
         }
         if s.defaultsV < 11 {
-            // defaultsV 11 (решение владельца 2026-09-23): после ручного
-            // переключения автодетект молчит — лок ВКЛ по умолчанию
             s.lockAutoAfterManualSwitch = true
             s.defaultsV = 11
+            migrated = true
+        }
+        if s.defaultsV < 12 {
+            // defaultsV 12: замена старого виндового списка .exe / пустого дефолта на macOS-приложения
+            // (терминалы и менеджеры паролей) и очистка устаревшего PasteConvertApps
+            let trimmed = s.exclusions.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.contains(".exe") {
+                s.exclusions = Settings.defaultMacExclusions
+            }
+            s.pasteConvertApps = ""
+            s.defaultsV = 12
             migrated = true
         }
         if migrated { save(s) }
@@ -122,24 +167,24 @@ public enum SettingsStore {
         case "DevLog": s.devLog = v == "1"
         case "StartWithWindows", "StartWithSystem": s.startWithSystem = v == "1"
         case "Paused": s.paused = v == "1"
-        case "SpaceDedupMs": s.spaceDedupMs = max(0, min(3000, Int(v) ?? 0))  // 0 = выкл, как в C#
-        case "TapMinMs": s.tapMinMs = max(0, min(500, Int(v) ?? 0))  // 0 = выкл, паритет C#
+        case "SpaceDedupMs": s.spaceDedupMs = max(0, min(3000, Int(v) ?? 0))
+        case "TapMinMs": s.tapMinMs = max(0, min(500, Int(v) ?? 0))
         case "MinWordLen": s.minWordLen = max(2, min(8, Int(v) ?? 3))
         case "Sensitivity": s.sensitivity = Double(v) ?? 1.0
-        case "HotFixWordVk": s.hotFixWordVk = Int(v) ?? s.hotFixWordVk  // битое значение — дефолт, как в C#
-        case "HotFixWordMods": s.hotFixWordMods = Int(v) ?? s.hotFixWordMods  // битое значение — дефолт, как в C#
-        case "HotFixSelVk": s.hotFixSelVk = Int(v) ?? s.hotFixSelVk  // битое значение — дефолт, как в C#
-        case "HotFixSelMods": s.hotFixSelMods = Int(v) ?? s.hotFixSelMods  // битое значение — дефолт, как в C#
-        case "HotRuVk": s.hotRuVk = Int(v) ?? s.hotRuVk  // битое значение — дефолт, как в C#
-        case "HotRuMods": s.hotRuMods = Int(v) ?? s.hotRuMods  // битое значение — дефолт, как в C#
-        case "HotEnVk": s.hotEnVk = Int(v) ?? s.hotEnVk  // битое значение — дефолт, как в C#
-        case "HotEnMods": s.hotEnMods = Int(v) ?? s.hotEnMods  // битое значение — дефолт, как в C#
-        case "HotAutoToggleVk": s.hotAutoToggleVk = Int(v) ?? s.hotAutoToggleVk  // битое значение — дефолт, как в C#
-        case "HotAutoToggleMods": s.hotAutoToggleMods = Int(v) ?? s.hotAutoToggleMods  // битое значение — дефолт, как в C#
-        case "HotUndoVk": s.hotUndoVk = Int(v) ?? s.hotUndoVk  // битое значение — дефолт, как в C#
-        case "HotUndoMods": s.hotUndoMods = Int(v) ?? s.hotUndoMods  // битое значение — дефолт, как в C#
-        case "HotPasteVk": s.hotPasteVk = Int(v) ?? s.hotPasteVk  // битое значение — дефолт, как в C#
-        case "HotPasteMods": s.hotPasteMods = Int(v) ?? s.hotPasteMods  // битое значение — дефолт, как в C#
+        case "HotFixWordVk": s.hotFixWordVk = Int(v) ?? s.hotFixWordVk
+        case "HotFixWordMods": s.hotFixWordMods = Int(v) ?? s.hotFixWordMods
+        case "HotFixSelVk": s.hotFixSelVk = Int(v) ?? s.hotFixSelVk
+        case "HotFixSelMods": s.hotFixSelMods = Int(v) ?? s.hotFixSelMods
+        case "HotRuVk": s.hotRuVk = Int(v) ?? s.hotRuVk
+        case "HotRuMods": s.hotRuMods = Int(v) ?? s.hotRuMods
+        case "HotEnVk": s.hotEnVk = Int(v) ?? s.hotEnVk
+        case "HotEnMods": s.hotEnMods = Int(v) ?? s.hotEnMods
+        case "HotAutoToggleVk": s.hotAutoToggleVk = Int(v) ?? s.hotAutoToggleVk
+        case "HotAutoToggleMods": s.hotAutoToggleMods = Int(v) ?? s.hotAutoToggleMods
+        case "HotUndoVk": s.hotUndoVk = Int(v) ?? s.hotUndoVk
+        case "HotUndoMods": s.hotUndoMods = Int(v) ?? s.hotUndoMods
+        case "HotPasteVk": s.hotPasteVk = Int(v) ?? s.hotPasteVk
+        case "HotPasteMods": s.hotPasteMods = Int(v) ?? s.hotPasteMods
         case "LockAutoAfterManualSwitch": s.lockAutoAfterManualSwitch = v == "1"
         case "PasteConvertApps": s.pasteConvertApps = v
         case "Exclusions": s.exclusions = v
@@ -149,8 +194,6 @@ public enum SettingsStore {
         }
     }
 
-    /// Записывает ini; false — запись не удалась (пусть вызывающий покажет ошибку,
-    /// а не молча потеряет настройки).
     @discardableResult
     public static func save(_ s: Settings) -> Bool {
         let lines = [
@@ -208,9 +251,11 @@ public enum Autostart {
     }
 
     public static func setEnabled(_ on: Bool) {
+        let domain = "gui/\(getuid())"
         if !on {
-            // unload по пути читает plist — снимаем загрузку ДО удаления файла
-            Process.launch("/bin/launchctl", ["unload", plistPath])
+            if Process.runSync("/bin/launchctl", ["bootout", domain, plistPath]) != 0 {
+                _ = Process.runSync("/bin/launchctl", ["unload", plistPath])
+            }
             try? FileManager.default.removeItem(atPath: plistPath)
             return
         }
@@ -230,9 +275,12 @@ public enum Autostart {
         """
         try? FileManager.default.createDirectory(atPath: (plistPath as NSString).deletingLastPathComponent,
                                                  withIntermediateDirectories: true)
+        _ = Process.runSync("/bin/launchctl", ["bootout", domain, plistPath])
+        _ = Process.runSync("/bin/launchctl", ["unload", plistPath])
         try? plist.write(toFile: plistPath, atomically: true, encoding: .utf8)
-        Process.launch("/bin/launchctl", ["unload", plistPath])
-        Process.launch("/bin/launchctl", ["load", plistPath])
+        if Process.runSync("/bin/launchctl", ["bootstrap", domain, plistPath]) != 0 {
+            _ = Process.runSync("/bin/launchctl", ["load", plistPath])
+        }
     }
 
     private static func xmlEscape(_ s: String) -> String {
@@ -247,12 +295,19 @@ public enum Autostart {
 }
 
 extension Process {
-    static func launch(_ path: String, _ args: [String]) {
+    @discardableResult
+    static func runSync(_ path: String, _ args: [String]) -> Int32 {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        try? p.run()
+        do {
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus
+        } catch {
+            return -1
+        }
     }
 }

@@ -76,11 +76,38 @@ namespace OpenSwitcher.Core
             PostKey(hwnd, vk, true);
         }
 
+        private static bool IsEditControl(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            try
+            {
+                var sb = new System.Text.StringBuilder(128);
+                if (Native.GetClassName(hwnd, sb, sb.Capacity) > 0)
+                {
+                    string cls = sb.ToString();
+                    if (cls.Equals("Edit", StringComparison.OrdinalIgnoreCase) ||
+                        cls.StartsWith("WindowsForms10.EDIT.", StringComparison.OrdinalIgnoreCase) ||
+                        cls.IndexOf("RichEdit", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
         private static void BackspaceOnce(IntPtr hwnd, bool useMessages)
         {
             if (useMessages && hwnd != IntPtr.Zero)
             {
-                SendKeyMessages(hwnd, 0x08); // VK_BACK
+                // P0-3: стандартные Win32 EDIT / TextBox / RichEdit удаляют символ по WM_CHAR(0x08).
+                // Если слать WM_KEYDOWN(VK_BACK), TranslateMessage поставит WM_CHAR(0x08) ПОСЛЕ уже
+                // отправленных в очередь букв замены ('ghbdtn ' -> 'ghbdtnп'). Шлём WM_CHAR('\b') напрямую.
+                if (IsEditControl(hwnd))
+                    PostChar(hwnd, '\b');
+                else
+                    SendKeyMessages(hwnd, 0x08); // VK_BACK
             }
             else
             {

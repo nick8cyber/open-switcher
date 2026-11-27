@@ -4,97 +4,94 @@ import ApplicationServices
 import CoreGraphics
 import QuartzCore
 
-/// Сердце программы (порт Engine.cs): CGEventTap, буфер слова, детект неверной
-/// раскладки, исполнение исправлений (по Enter, по концу слова, хоткеями,
-/// double-Shift), самообучение и откат автозамен.
+/// Сердце программы: неблокирующий `CGEventTap`, буфер слова, детект неверной
+/// раскладки, конвейерная инжекция исправлений (`injectorQueue`), самообучение
+/// и безопасный откат автозамен.
 public final class Engine {
-    public var s: Settings
+    private let stateLock = NSLock()
+    private var _s: Settings
+    public var s: Settings {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _s }
+        set { stateLock.lock(); _s = newValue; stateLock.unlock() }
+    }
 
     private var tap: CFMachPort?
     private var tapThread: Thread?
-    private var tapRunLoop: CFRunLoop?   // runloop потока тапа (для сериализации с main)
+    private var tapRunLoop: CFRunLoop?
+
+    /// Единая последовательная очередь синтетического ввода: гарантирует строгий
+    /// FIFO-порядок `Backspace × N -> 25 мс settle -> посимвольный Unicode + sep`
+    /// и никогда не блокирует поток `CGEventTap`.
+    private let injectorQueue = DispatchQueue(label: "os.injector", qos: .userInteractive)
+    /// Сколько задач сейчас выполняется в `injectorQueue` (читается и меняется на потоке тапа).
+    private var inFlightInjections = 0
 
     private let buf = WordBuffer()
     private var lastWord: [KeyRec] = []
     private var lastWordAt: TimeInterval = 0
     private var lastWordSepKey = 0        // разделитель сразу после последнего слова (0 = неизвестен/Enter)
     private var lastWordSepShift = false  // ... набран с Shift ('?', '!', RU ',')
-    private var lastWordApp: pid_t = 0    // приложение, где набрано последнее слово (0 = неизвестно)
-    // последний забой: после него «слово+разд» у каретки уже могло не остаться —
-    // точный переворот по памяти (lastWord) вслепую стирал чужой текст
-    // (бой 23.10.2026 23:20: юзер стёр 'ujdyj', тап стёр 'весь ui - там ui' — 4 слова)
+    private var lastWordApp: pid_t = 0    // приложение, где набрано последнее слово
     private var lastBsAt: TimeInterval = 0
-    // РЕПЛЕЙ-ДЕТЕКТ (бой 23:39 02.11: 'lf'->'да' в bb — поле САМО переиграло
-    // инжекцию: BS×3+L+F+space+space+BS×2+L+F за 60 мс; результат ';ддфф'):
-    // после convert OK на 300 мс армится окно; чужой backspace в нём = удар.
-    // 2 удара за сеанс — поле враждебно забоям, его авто-конверт переводится
-    // на паст-режим (выделение+вставка, ни одного BS)
-    private var replayArmUntil: TimeInterval = 0
-    private var replayStrikes: [pid_t: Int] = [:]
-    private var replayLastStrikeAt: TimeInterval = 0
-    private var replayHostileUntil: [pid_t: TimeInterval] = [:] // TTL 10 мин: ложный хостил не вечен
-    private var replayHostile: [pid_t: Bool] = [:]
-    // паттерн реплея: одиночный BS — НЕ реплей (бой 17:10 05.11: юзер сам правил
-    // ввод BS×2 через 44 мс после конверта — telegram ЛОЖНО помечен враждебным);
-    // реплей всегда ДОПЕЧАТЫВАЕТ клавиши слова (';ддфф': BS×3 затем L,F — клавиши 'lf')
-    private var replayWordCodes: [Int] = []
-    private var replayBsSeen = false
-    // свежая вставка (Cmd+V): paste в Electron коммитится асинхронно — инжекция
-    // в этом окне гонится с недокоммиченным текстом (боя 02:54; паритет: C# страдал
-    // тем же классом, но SendInput-порядок делал гонку невозможной)
     private var lastPasteAt: TimeInterval = 0
-    // ретро-флип одиночной буквы (§7, порт C#): 'f␣ns' -> «а ты». Одиночная буква + ровно один
-    // пробел прямо перед текущим словом; слово конвертируется из ТОЙ ЖЕ раскладки — буква с ним
-    private var prevSingle: [KeyRec]? = nil   // nil — кандидата нет
+
+    /// Токен помечен как код/логин/URL/путь (встретилась цифра, '_', '/', '@', '#') —
+    /// авто-конвертация его не трогает до следующей чистой границы (пробел / Enter).
+    private var wordTainted = false
+
+    // ретро-флип одиночной буквы (§7): 'f␣ns' -> «а ты»
+    private var prevSingle: [KeyRec]? = nil
     private var prevSingleLayoutID: String? = nil
     private var prevSingleApp: pid_t = 0
-    private var boundaryClean = true          // перед кареткой чистая граница слова (пробел/Enter/начало ввода)
-    private var wordStartClean = false        // слово в буфере началось после чистой границы ('b2b' — нет)
-    private var wordStartLayoutID: String? = nil // раскладка ПЕРВОЙ буквы слова: сменилась посреди — рендер буфера врёт (бой 00:19 'момогу')
-    private var noFlipUntil: TimeInterval = 0  // кулдаун 5 с после ручной правки (спека v3 §6.2)
+    private var boundaryClean = true
+    private var wordStartClean = false
+    private var wordStartLayoutID: String? = nil
+
+    private var noFlipUntil: TimeInterval = 0
     private var markCount = 0
     private var wdTicks = 0
-
     private var suppressUntil: TimeInterval = 0
+
+    // тап-клавиши смены раскладки (Shift / CapsLock / др.) и двойной Shift
     private var lastShiftDown: TimeInterval = 0
     private var anyKeySinceShift = true
-    private var tapVk = 0                  // клавиша, чей «тап» отслеживается
-    private var lastTapDoneAt: TimeInterval = 0 // когда сработал последний успешный тап (для дребезг-фильтра, C# 942c5ba)
+    private var tapVk = 0
+    private var lastTapDoneAt: TimeInterval = 0
     private var tapTarget = 0              // 0 = РУС, 1 = ENG
     private var tapDownAt: TimeInterval = 0
     private var tapAlone = false
 
-    // Option-тап «как в Caramba» (принудительный переворот слова): арм — на
-    // голом нажатии Option, действие — на отпускании в пределах 0.7 с
-    private var optTapVk = 0               // 0x3A/0x3D, пока тап вооружён; 0 = не арм
+    // Option-тап «как в Caramba» (принудительный переворот слова / быстрый откат ложной автозамены)
+    private var optTapVk = 0
     private var optTapDownAt: TimeInterval = 0
-    // «чистая пара» обоих Shift (вкл/выкл автопереключения): любой keyDown гасит
     private var shiftPairClean = false
+
+    // лок автодетекта после ручного выбора языка
     private var autoLocked = false
-    /// Когда был поставлен лок ручного переключения (для «переключил раскладку
-    /// ДО ввода» — лок переживает смену поля/окна в коротком окне, пароль-кейс)
     private var autoLockedAt: TimeInterval = 0
+    private var autoLockedLang = -1        // язык, выбранный вручную (0 = RU, 1 = EN, -1 = неизвестен)
+    private var autoLockedWordsTyped = 0   // сколько слов уже набрано после ручного переключения
 
-    /// Поставить лок ручного переключения (все ручные смены раскладки)
-    private func lockAutoSwitch() {
-        if s.lockAutoAfterManualSwitch {
-            autoLocked = true
-            autoLockedAt = Engine.ms()
-        }
-    }
     private var lastInputAt: TimeInterval = 0
-    private var lastResendSpaceAt: TimeInterval = 0
-    private var lastSpaceTextTick: TimeInterval = 0 // когда последний пробел ОКАЗАЛСЯ В ТЕКСТЕ (досыл ИЛИ нажатие) — для дедупа двойных (C# 3baec1e)
+    private var lastLetterAt: TimeInterval = 0
+    private var lastSpaceTextTick: TimeInterval = 0
 
-    // держалка main-таймера свежести кэша раскладок (TIS — только на main)
+    /// Физические клавиши, чей `keyDown` мы проглотили: их парный `keyUp` тоже глотаем,
+    /// чтобы в React/Electron/Telegram не прилетал осиротевший `Space`/`Enter` keyUp.
+    private var swallowedKeys: Set<Int> = []
+
     private var layoutRefreshTimer: Timer?
 
-    // точка отката последней автозамены
+    // точка отката последней замены
     private var undoPending = false
+    private var undoFromAuto = false       // true = точка поставлена АВТО-конвертацией (для авто-отказа по BS/Cmd+Z)
+    private var autoRejectEligible = false // P0-4: выживает ТОЛЬКО на серии чистых BS или мгновенных Cmd+Z / Opt+BS без промежуточного ввода
     private var undoText = ""
+    private var undoConvertedTail = ""     // P0-7: реально напечатанный у каретки хвост (для AX-гейта отката)
     private var undoLen = 0
-    private var undoPrefix = ""      // ретро-флип: исходная буква+пробел перед словом ('f␣'), вернуть при откате
-    private var undoPrefixLen = 0    // ... и длина напечатанного вместо неё («а␣» = 2)
+    private var undoErasedByBs = 0         // сколько символов заменённого слова юзер уже стёр Backspace'ом
+    private var undoPrefix = ""
+    private var undoPrefixLen = 0
     private var undoSepText = ""
     private var undoLayout: LayoutService.LayoutData?
     private var undoApp: pid_t = 0
@@ -104,45 +101,65 @@ public final class Engine {
     private var undoTailBroken = false
     private var lastConvertInfo = "-"
 
-    // ожидаемая раскладка (ложный лок автодетекта после ручной смены)
+    // ожидаемая раскладка и компенсация TIS-лага
     private var expectedLayoutID: String?
     private var expectedApp: pid_t = 0
     private var expectGraceUntil: TimeInterval = 0
+    private var _switchSerial = 0
+    private var switchSerial: Int {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _switchSerial }
+        set { stateLock.lock(); _switchSerial = newValue; stateLock.unlock() }
+    }
 
-    // компенсация лага смены раскладки после тапа Shift
+    /// Компенсация лага `TISSelectInputSource`: пока фактическая раскладка ОС не догнала
+    /// `gapLayout` (до `gapDeadline`), нажатые клавиши переводятся в `gapLayout` и
+    /// отправляются через `injectorQueue` без задержки отображения и без перестановки букв.
     private var gapActive = false
     private var gapLayout: LayoutService.LayoutData?
-    private var gapGen = 0               // поколение gap-окна: таймер досыла от прошлого тапа не трогает новое
-    private var gapBuf: [KeyRec] = []
     private var gapDeadline: TimeInterval = 0
 
-    // обучение
+    // самообучение
     private var rejected = Set<String>()
     private var accepted = Set<String>()
     private let rejectedCap = 1000
     private let learnedLock = NSLock()
 
-    // состояние переднего приложения
-    private var fgApp: pid_t = 0
-    private var fgProc = ""
-    private var fgIsOwnApp = false
-    private var procCache: [pid_t: String] = [:]
+    // состояние переднего приложения и AXObserver его окон/фокуса (синхронизировано через stateLock)
+    private var _fgApp: pid_t = 0
+    private var _fgProc = ""
+    private var _lastExternalProc = ""
+    private var _fgExec = ""
+    private var _fgBundle = ""
+    private var _fgIsOwnApp = false
+    private var fgApp: pid_t { stateLock.lock(); defer { stateLock.unlock() }; return _fgApp }
+    private var fgProc: String { stateLock.lock(); defer { stateLock.unlock() }; return _fgProc }
+    private var fgExec: String { stateLock.lock(); defer { stateLock.unlock() }; return _fgExec }
+    private var fgBundle: String { stateLock.lock(); defer { stateLock.unlock() }; return _fgBundle }
+    private var fgIsOwnApp: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _fgIsOwnApp }
+    private var procCache: [pid_t: (proc: String, exec: String, bundle: String)] = [:]
+    private var axObserver: AXObserver?
+    private var axObservedPid: pid_t = 0
+    private var lastFocusedElementHash: CFHashCode = 0
 
-    // собственное окно настроек: автоисправление только в «песочнице»
-    public var uiSettingsActive = false
-    public var sandboxFocused = false
+    private var _uiSettingsActive = false
+    private var _sandboxFocused = false
+    private var _inputSeq: UInt64 = 0
+    private func bumpInputSeq() { stateLock.lock(); _inputSeq &+= 1; stateLock.unlock() }
+    private var currentInputSeq: UInt64 { stateLock.lock(); defer { stateLock.unlock() }; return _inputSeq }
+    public var uiSettingsActive: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _uiSettingsActive }
+        set { stateLock.lock(); _uiSettingsActive = newValue; stateLock.unlock() }
+    }
+    public var sandboxFocused: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _sandboxFocused }
+        set { stateLock.lock(); _sandboxFocused = newValue; stateLock.unlock() }
+    }
 
-    // онбординг разрешений: авто-показ окна не чаще раза за запуск
     private var onboardingAutoShown = false
     private var readyInfoFired = false
 
-    // --------------------------------------------------------- онбординг-окно
-
-    /// Хук показа онбординг-окна: Core не зависит от UI, поэтому main.swift
-    /// присваивает сюда вызов OnboardingWindowController.show (App.showOnboarding).
     public static var showOnboardingHook: (() -> Void)?
 
-    /// Показ онбординга из любого потока: окно поднимается на main.
     static func showOnboarding() {
         DispatchQueue.main.async { showOnboardingHook?() }
     }
@@ -154,57 +171,82 @@ public final class Engine {
     static let ms: () -> TimeInterval = { CACurrentMediaTime() }
 
     public init(_ settings: Settings) {
-        s = settings
-        rebuildExclusionList()
-        rebuildPasteConvertList()
-        // прогрев словарей ДО создания тапа: ленивое построение корпусов
-        // (35k+20k слов, биграммы) занимает ~0.4-1 с — на потоке тапа это был бы
-        // системный фриз клавиатуры на первом слове (замерено в раунде 5)
+        _s = settings
+        _exclusionList = Engine.parseExclusions(settings.exclusions)
         _ = WordDict.ruBig
         _ = WordDict.enBig
         LanguageTables.ensureBigSets()
         _ = LanguageTables.possibleWord("тест", 0)
         _ = LanguageTables.possibleWord("test", 1)
         loadLearned()
-        // TIS-кэш раскладок: прогрев ДО создания тапа (Engine.init — main) и
-        // повторяющееся обновление на main каждые 0.25 с. Все TIS-вызовы
-        // (TISCopyCurrentKeyboardInputSource/TISCreateInputSourceList/TISSelect)
-        // на macOS 15 ассертят main-очередь — поток тапа читает только кэши.
         startLayoutRefreshTimer()
-        // офскрин-рендерам UI тап не нужен (и алерт зависнет без рантайма)
         if ProcessInfo.processInfo.environment["OS_DISABLE_TAP"] != "1" {
             startTap()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.checkConflictingSwitchersOnMain()
+            }
         }
         watchForeground()
     }
 
     deinit {
         layoutRefreshTimer?.invalidate()
+        teardownAxObserverOnMain()
         stopTap()
     }
 
-    /// main only: раз в 0.25 с обновляет кэш раскладок (TISCopyCurrentKeyboardInputSource
-    /// + сравнение id; полная перестройка списка — по TTL 30 с). Дёшево: микросекунды.
     private func startLayoutRefreshTimer() {
         layoutRefreshTimer?.invalidate()
-        LayoutService.refreshOnMain() // прогрев: кэш жив до первого тика
+        LayoutService.refreshOnMain()
         PasswordGuard.refreshOnMain()
         let t = Timer(timeInterval: 0.25, repeats: true) { _ in
             LayoutService.refreshOnMain()
-            PasswordGuard.refreshOnMain() // флаг «в фокусе поле пароля» для гейта конвертации
+            PasswordGuard.refreshOnMain()
         }
         RunLoop.main.add(t, forMode: .common)
         layoutRefreshTimer = t
     }
 
     public func apply(_ settings: Settings) {
-        s = settings
-        rebuildExclusionList()
-        rebuildPasteConvertList()
-        onSettingsApplied?()
+        let parsed = Engine.parseExclusions(settings.exclusions)
+        stateLock.lock()
+        _s = settings
+        _exclusionList = parsed
+        stateLock.unlock()
+        if Thread.isMainThread {
+            onSettingsApplied?()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.onSettingsApplied?() }
+        }
     }
 
-    // ------------------------------------------------------------------ хук
+    // --------------------------------------------------------- детектор конфликтов
+
+    private static let conflictingBundles: [(id: String, name: String)] = [
+        ("tech.caramba.switcher", "Caramba Switcher"),
+        ("ru.yandex.desktop.PuntoSwitcher", "Punto Switcher"),
+    ]
+
+    private func checkConflictingSwitchersOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        for app in NSWorkspace.shared.runningApplications where !app.isTerminated {
+            let bid = app.bundleIdentifier ?? ""
+            let lname = (app.localizedName ?? "").lowercased()
+            if let hit = Self.conflictingBundles.first(where: { $0.id == bid }) {
+                logLine("CONFLICT: обнаружен запущенный \(hit.name) (pid=\(app.processIdentifier))")
+                fireInfo("Конфликт: запущен \(hit.name) — закройте его, иначе ввод будет ломаться")
+                return
+            }
+            if lname.contains("caramba switcher") || lname.contains("punto switcher") {
+                let title = app.localizedName ?? "другой свитчер"
+                logLine("CONFLICT: обнаружен запущенный \(title) (pid=\(app.processIdentifier))")
+                fireInfo("Конфликт: запущен \(title) — закройте его")
+                return
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ хук (CGEventTap)
 
     private func createTapPort() -> CFMachPort? {
         let mask = (1 << CGEventType.keyDown.rawValue)
@@ -212,6 +254,7 @@ public final class Engine {
             | (1 << CGEventType.flagsChanged.rawValue)
             | (1 << CGEventType.leftMouseDown.rawValue)
             | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseDown.rawValue)
         return CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                  options: .defaultTap, eventsOfInterest: CGEventMask(mask),
                                  callback: { proxy, type, event, refcon in
@@ -224,34 +267,25 @@ public final class Engine {
     private func startTap() {
         guard let port = createTapPort() else {
             logLine("tap FAILED: нет разрешения («Универсальный доступ»)")
-            onboardingAutoShown = true // окно уже показано — watchdog его не дублирует
-            // создание .defaultTap-тапа само требует «Универсальный доступ»:
-            // онбординг-окно покажет нужный блок и живую проверку
+            onboardingAutoShown = true
             Self.showOnboarding()
-            // watchdog на потоке тапа позже сам повторит createTapPort()
             ensureTapThread()
             return
         }
         tap = port
         ensureTapThread(initialPort: port)
-        // тап создан сразу (разрешение с прошлого запуска): единоразово проверить
-        // «Универсальный доступ» / подтвердить «Работаю!» — после подъёма UI
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.onboardingCheckOnMain() }
     }
 
-    /// Поток с runloop тапа создаётся ОДИН раз; watchdog на нём же чинит/создаёт тап.
     private func ensureTapThread(initialPort: CFMachPort? = nil) {
         guard tapThread == nil else { return }
         let port = initialPort
         let thread = Thread { [weak self] in
             let rlCF = RunLoop.current.getCFRunLoop()
-            self?.tapRunLoop = rlCF // до run(): публичные переключения встают в очередь этого runloop
+            self?.tapRunLoop = rlCF
             if let port = port ?? self?.tap {
                 CFRunLoopAddSource(rlCF, CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0), .commonModes)
             }
-            // Телеметрия прав раз в минуту: точное состояние по мнению системы.
-            // Системные проверки прав достоверны только на main (с потока тапа —
-            // задокументированные false negatives), поэтому проверки и лог — там.
             CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 60, 0, 0) { _ in
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
@@ -264,8 +298,6 @@ public final class Engine {
             }.map { CFRunLoopAddTimer(rlCF, $0, .commonModes) }
 
             CFRunLoopAddTimer(rlCF, CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, 0, 10, 0, 0) { [weak self] _ in
-                // watchdog: macOS молча отключает тап при таймауте колбэка;
-                // если тап вовсе не создан (разрешение выдали позже) — пробуем снова
                 guard let self = self else { return }
                 if let t = self.tap {
                     if !CGEvent.tapIsEnabled(tap: t) {
@@ -273,11 +305,9 @@ public final class Engine {
                         self.resetTapState()
                         self.logLine("tap REVIVED after death")
                     } else if self.wdTicks % 10 == 9 {
-                        self.logLine("watchdog: heartbeat ok") // раз в 100 с, не спамим
+                        self.logLine("watchdog: heartbeat ok")
                     }
                     self.wdTicks += 1
-                    // тап жив: если «Универсальный доступ» подтянулся (или его нет
-                    // с самого запуска) — один раз подсказка либо «Работаю!»
                     self.onboardingCheckAsync()
                 } else if let port = self.createTapPort() {
                     self.tap = port
@@ -285,12 +315,13 @@ public final class Engine {
                                        CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0), .commonModes)
                     self.resetTapState()
                     self.logLine("tap CREATED after permission grant")
-                    self.onboardingCheckAsync() // «Работаю!» или подсказка про «Универсальный доступ»
+                    self.onboardingCheckAsync()
                 }
             }, .commonModes)
             RunLoop.current.run()
         }
         thread.name = "OpenSwitcherTap"
+        thread.qualityOfService = .userInteractive
         thread.start()
         tapThread = thread
     }
@@ -300,38 +331,29 @@ public final class Engine {
         tap = nil
     }
 
-    /// Счётчик смен раскладки: отменяет устаревшие verifySwitch-ретраи
-    /// (иначе отложенный ретрай откатывает более свежий выбор юзера).
-    private var switchSerial = 0
-
-    /// Отображаемое имя переднего приложения (для «добавить текущее» в исключениях).
     public var currentAppName: String { fgProc }
+    public var lastExternalAppName: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _lastExternalProc.isEmpty ? _fgProc : _lastExternalProc
+    }
 
-    /// Счётчики самообучения (для строки в настройках).
     public var learnedCounts: (rejected: Int, accepted: Int) {
         learnedLock.lock()
         defer { learnedLock.unlock() }
         return (rejected.count, accepted.count)
     }
 
-    /// Открыть файл в текстовом редакторе по умолчанию.
     public static func openInEditor(_ path: String) {
         let exists = FileManager.default.fileExists(atPath: path)
         if !exists { FileManager.default.createFile(atPath: path, contents: nil) }
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
-    /// Внешняя смена раскладки (системное меню) — ретраи больше не актуальны.
     public func bumpSwitchSerial() {
         switchSerial += 1
     }
 
-    /// TISSelectInputSource допустим только на main (macOS 15 ассертит очередь —
-    /// краш в TSMGetInputSourceProperty с потока тапа): из тап-контекста уводим
-    /// на main. Порядок инжекции не зависит от TISSelect — юникод-инжекция идёт
-    /// сразу, сама смена раскладки применяется асинхронно (verifySwitch/gap это
-    /// уже покрывают). ВСЕ смены раскладки движка идут через эту точку —
-    /// источник пишется в лог: «переворот без записи в лог» невозможен.
     private func switchLayoutOnMain(_ data: LayoutService.LayoutData, source: String) {
         let from = LayoutService.currentLayout()?.id.prefix(8) ?? "?"
         let to = data.id.prefix(8)
@@ -339,23 +361,19 @@ public final class Engine {
         DispatchQueue.main.async { LayoutService.switchTo(data) }
     }
 
-    /// Проверка применения раскладки через 400 мс; TISSelectInputSource асинхронен —
-    /// при лаге/игноре повторяем одиночно (fallback, v3 §10/§16). Ретрай жив только
-    /// пока не произошло более новой смены (нашей или внешней). Main only.
     private func verifySwitch(target: LayoutService.LayoutData) {
         let serial = switchSerial
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self = self, self.switchSerial == serial else { return }
+            LayoutService.refreshOnMain()
             if LayoutService.currentLayout()?.id == target.id { return }
             self.logLine("switch lag/ignored -> TISSelect retry")
-            self.logLine("layout switch: ? -> \(target.id.prefix(8)) (verify-retry)")
             _ = LayoutService.switchTo(target)
         }
     }
 
-    /// Сброс parity-состояния модификаторов/тапа (после потери событий).
     private func resetTapState() {
-        pressedMods.removeAll()
+        swallowedKeys.removeAll()
         tapVk = 0
         tapAlone = false
         optTapVk = 0
@@ -364,25 +382,14 @@ public final class Engine {
 
     // ------------------------------------------------------- онбординг разрешений
 
-    /// Единый статус обоих разрешений (меню → «Разрешения и диагностика»):
-    /// tap — событийный тап создан; accessibility — AX trusted.
     public func permissionsState() -> (tap: Bool, accessibility: Bool) {
         (tap != nil, accessibilityTrusted(prompt: false))
     }
 
-    /// Онбординг из фоновых мест (watchdog на потоке тапа, startTap):
-    /// сама проверка дешёвая, но показ окна — только с main.
     private func onboardingCheckAsync() {
         DispatchQueue.main.async { [weak self] in self?.onboardingCheckOnMain() }
     }
 
-    /// Только main: онбординг-окно вместо старых алертов — авто-показ не чаще
-    /// раза за запуск (закрытое юзером окно не достаём; из меню онбординг
-    /// открывается всегда). Состояния тапа и AX вычисляются НЕЗАВИСИМО: ранний
-    /// return при отсутствии тапа (старая логика) навсегда прятал AX-подсказку —
-    /// создание .defaultTap-тапа само требует «Универсальный доступ», и юзер
-    /// застревал с одним сообщением про «Мониторинг ввода». Само окно покажет
-    /// нужный блок: у него живая проверка раз в секунду.
     private func onboardingCheckOnMain() {
         guard onboardingAllowed, tapThread != nil else { return }
         let tapOk = tap != nil
@@ -400,52 +407,70 @@ public final class Engine {
         }
     }
 
-    /// Попап «Работаю!» при закрытии онбординг-окна (одноразово: тот же
-    /// readyInfoFired-гвард, что и у фоновой проверки, — двойного попапа нет).
     public func fireReadyInfoFromOnboarding() {
         guard !readyInfoFired else { return }
         readyInfoFired = true
         fireInfo("Работаю! Напечатайте ghbdtn и пробел")
     }
 
-    /// Offscreen-рендеры и selftest (OS_DISABLE_TAP=1) — без онбординга, рендер не висит.
     private var onboardingAllowed: Bool {
         ProcessInfo.processInfo.environment["OS_DISABLE_TAP"] != "1"
     }
 
+    // ------------------------------------------------------- фильтрация событий тапа
+
+    /// Проверка: несёт ли событие `virtualKey == 0` кастомную Unicode-строку (диктовка,
+    /// эмодзи-панель, текстовые замены, синтетический юникод сторонних утилит), чтобы
+    /// не принять `0x00` за физическую клавишу 'a' / 'ф'.
+    private static func isCustomUnicodeKeyZero(_ event: CGEvent, code: Int) -> Bool {
+        guard code == 0x00 else { return false }
+        let flags = event.flags
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
+            return false
+        }
+        var len = 0
+        var chars = [UniChar](repeating: 0, count: 8)
+        event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &chars)
+        guard len > 0 else { return false }
+        if len > 1 { return true }
+        let s = String(utf16CodeUnits: chars, count: 1).lowercased()
+        // в RU/EN раскладках клавиша 0x00 даёт 'a' или 'ф'
+        return s != "a" && s != "ф"
+    }
+
     private func tapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            logLine("tap DISABLED by system (\(type == .tapDisabledByTimeout ? "timeout" : "user input")) — events were LOST, reviving") // момент потери событий: память разошлась с полем, все гейты это видят
+            logLine("tap DISABLED by system (\(type == .tapDisabledByTimeout ? "timeout" : "user input")) — reviving")
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
-            // события могли быть потеряны пока тап был мёртв — parity flagsChanged
-            // инвертирован: сбрасываем, иначе отпускание читается как нажатие и
-            // следующий Shift даст ложный тап
             resetTapState()
             return Unmanaged.passUnretained(event)
         }
-        // собственная инжекция — пропускаем молча
+        // 1) Собственная инжекция — пропускаем мгновенно
         if event.getIntegerValueField(TextConverter.userField) == TextConverter.selfMagic {
             return Unmanaged.passUnretained(event)
         }
-        if type == .keyDown || type == .leftMouseDown || type == .rightMouseDown {
-            // только НАЖАТИЯ: keyUp/flagsChanged триггера (пробел, чей keyDown породил
-            // конверт) приходят в первые ~30-100 мс и ложно рвали seq-гвард, убивая
-            // паст-путь на каждом конверте (аудит 06.11, дефект 2)
-            // ЭХО-РЕПЛЕЙ поля НЕ живой ввод юзера (метки 20:14 17.11: bb переиздало
-            // BS×3+клавиши слова за 33 мс после конверта — seq-гвард убивал паст и
-            // слово не переворачивалось): BS/клавиша слова в arm-окне реплей-детекта
-            // не бампят счётчик. Страховка остаётся: строгая сверка selNow==wantSel
-            // отказывает при ЛЮБОМ реальном изменении содержимого
-            let replayEcho = type == .keyDown && Engine.ms() < replayArmUntil && {
-                let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
-                return kc == KeyCodeMap.backspace
-                    || (KeyCodeMap.isLetterKey(kc) && replayWordCodes.contains(kc))
-            }()
-            if !replayEcho { inputSeq &+= 1 } // живой ввод: паст-пути по нему детектят гонку с печатью юзера
-        }
         if consumeSessionReset() { resetSession() }
 
-        // ДИАГНОСТИКА (временно): полное эхо входящих клавиатурных событий
+        // 2) Чужая синтетика (сторонние утилиты, автозаполнение паролей, текстовые экспандеры):
+        //    у реального HID-ввода eventSourceUnixProcessID == 0.
+        let srcPid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        if srcPid != 0 {
+            if s.devLog, type == .keyDown {
+                let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
+                logLine(String(format: "ev-foreign: pid=%lld code=0x%02X (ignored, buffer cleared)", srcPid, kc))
+            }
+            if type == .keyDown {
+                buf.clear()
+                lastWordSepKey = 0
+                prevSingle = nil
+                boundaryClean = false
+                wordTainted = true
+                autoRejectEligible = false
+                if undoPending { undoTailBroken = true }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
         if s.devLog, type == .keyDown || type == .keyUp || type == .flagsChanged {
             let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
             let fl = event.flags
@@ -460,12 +485,28 @@ public final class Engine {
 
         switch type {
         case .keyDown:
-            if !onKeyDown(event) { return nil } // проглотить
+            let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            if Self.isCustomUnicodeKeyZero(event, code: code) {
+                buf.clear()
+                lastWordSepKey = 0
+                prevSingle = nil
+                boundaryClean = false
+                if undoPending { undoTailBroken = true }
+                return Unmanaged.passUnretained(event)
+            }
+            if !onKeyDown(event) {
+                swallowedKeys.insert(code)
+                return nil
+            }
+            swallowedKeys.remove(code)
         case .keyUp:
-            if !onKeyUp(event) { return nil }
+            let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            let wasSwallowed = swallowedKeys.remove(code) != nil
+            let passUp = onKeyUp(event)
+            if wasSwallowed || !passUp { return nil }
         case .flagsChanged:
             if !onFlagsChanged(event) { return nil }
-        case .leftMouseDown, .rightMouseDown:
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             onMouseDown()
         default: break
         }
@@ -479,33 +520,28 @@ public final class Engine {
         return (f.contains(.maskControl), f.contains(.maskAlternate), f.contains(.maskCommand))
     }
 
-    // ------------------------------------------------------------------ переднее окно
+    // ------------------------------------------------------------------ переднее окно и AXObserver
 
     private var fgObserver: NSObjectProtocol?
-    private var winObserver: NSObjectProtocol?
+    private var launchObserver: NSObjectProtocol?
 
     private func watchForeground() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            // блок-based наблюдатель: Engine — не NSObject, селекторный API рискован
             self.fgObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
             ) { [weak self] _ in
                 self?.foregroundChanged()
             }
-            // смена ОКНА внутри одного приложения (Cmd+`) — тоже новая сессия ввода;
-            // key-окно меняется только у активного приложения
-            self.winObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+            self.launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
             ) { [weak self] _ in
-                self?.foregroundChanged(alwaysReset: true)
+                self?.checkConflictingSwitchersOnMain()
             }
             self.syncForegroundFromWorkspace()
         }
     }
 
-    /// Флаг «сеанс надо сбросить»: main только ставит его, сам сброс выполняет
-    /// ПОТОК ТАПА в начале следующего события — иначе гонки на lastWord/gapBuf/undo.
     private let resetLock = NSLock()
     private var pendingResetFlag = false
 
@@ -522,62 +558,136 @@ public final class Engine {
         return false
     }
 
-    /// Выполняется на потоке тапа: полный сброс сеанса ввода (аналог WinEventProcHandler).
     private func resetSession() {
         if buf.count > 0 { lastWord = buf.snapshot() }
         lastWordSepKey = 0
         lastWordApp = 0
         buf.clear()
-        prevSingle = nil; boundaryClean = true // новое окно — начало ввода
+        wordTainted = false
+        prevSingle = nil
+        boundaryClean = true
         anyKeySinceShift = true
         tapAlone = false
+        optTapVk = 0
         undoPending = false
+        autoRejectEligible = false
         undoTailBroken = true
-        gapActive = false; gapBuf.removeAll()
-        // Лок ручного переключения переживает смену поля/окна, если переключение
-        // было только что (<10 с): юзер сменил раскладку ДО ввода — под следующий
-        // ввод (поле пароля в другом приложении), и снос лока на клике ломал пароль.
-        // Остальные случаи — лок от старого поля умирает вместе с сеансом.
-        if !(autoLocked && Engine.ms() - autoLockedAt < 10) { autoLocked = false }
-        expectedLayoutID = nil // как _expectedValid=false в C#
-        lastResendSpaceAt = 0
-        lastSpaceTextTick = 0 // окно дедупа не переносится в другое окно  // окно эха не переносится в другое окно
+        gapActive = false
+        gapLayout = nil
+        if !(autoLocked && Engine.ms() - autoLockedAt < 10) {
+            autoLocked = false
+            autoLockedLang = -1
+            autoLockedWordsTyped = 0
+        }
+        expectedLayoutID = nil
+        lastSpaceTextTick = 0
     }
 
-    /// Вызывается на main: обновляет fgApp/fgProc/fgIsOwnApp и запрашивает
-    /// сброс сеанса при смене приложения/окна (аналог WinEventProcHandler).
     private func foregroundChanged(alwaysReset: Bool = false) {
         let prevApp = fgApp
         syncForegroundFromWorkspace()
+        PasswordGuard.forceRefreshOnMain()
         guard alwaysReset || (fgApp != 0 && prevApp != 0 && prevApp != fgApp) else { return }
         requestSessionReset()
     }
 
-    /// Только main-поток: NSWorkspace не потокобезопасен, из тапа не вызывать.
     private func syncForegroundFromWorkspace() {
+        dispatchPrecondition(condition: .onQueue(.main))
         let front = NSWorkspace.shared.frontmostApplication
-        fgApp = front?.processIdentifier ?? 0
-        let bundle = front?.bundleIdentifier ?? ""
-        fgIsOwnApp = bundle == "com.openswitcher.app" || bundle.hasPrefix("com.openswitcher")
-        if fgProc.isEmpty || procCache[fgApp] == nil {
-            var name = (front?.localizedName ?? bundle).lowercased()
-            if name.hasSuffix(".app") { name.removeLast(4) }
-            fgProc = name
-            if procCache.count > 200 { procCache.removeAll() } // защита от месячного роста
-            if !name.isEmpty { procCache[fgApp] = name }
+        let appPid = front?.processIdentifier ?? 0
+        var bundle = (front?.bundleIdentifier ?? "").lowercased()
+        let isOwn = bundle == "com.openswitcher.app" || bundle.hasPrefix("com.openswitcher")
+        var name: String
+        var exec: String
+        if let cached = procCache[appPid], !cached.proc.isEmpty {
+            name = cached.proc
+            exec = cached.exec
+            bundle = cached.bundle
         } else {
-            fgProc = procCache[fgApp] ?? ""
+            var n = (front?.localizedName ?? bundle).lowercased()
+            if n.hasSuffix(".app") { n.removeLast(4) }
+            var e = (front?.executableURL?.lastPathComponent ?? "").lowercased()
+            if e.hasSuffix(".app") { e.removeLast(4) }
+            name = n
+            exec = e
+            if procCache.count > 200 { procCache.removeAll() }
+            if appPid != 0 && !name.isEmpty {
+                procCache[appPid] = (name, exec, bundle)
+            }
+        }
+        stateLock.lock()
+        _fgApp = appPid
+        _fgProc = name
+        _fgExec = exec
+        _fgBundle = bundle
+        _fgIsOwnApp = isOwn
+        if !isOwn && !name.isEmpty { _lastExternalProc = name }
+        stateLock.unlock()
+        installAxObserverOnMain(for: appPid)
+    }
+
+    /// Подписка на смену активного окна и поля ввода внутри переднего приложения
+    /// (заменяет неработавший локальный `NSWindow.didBecomeKeyNotification`).
+    private func installAxObserverOnMain(for pid: pid_t) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if pid == axObservedPid && axObserver != nil { return }
+        teardownAxObserverOnMain()
+        guard pid > 0, !fgIsOwnApp, accessibilityTrusted(prompt: false) else { return }
+        var obs: AXObserver?
+        let err = AXObserverCreate(pid, { _, element, notification, refcon in
+            guard let refcon = refcon else { return }
+            let me = Unmanaged<Engine>.fromOpaque(refcon).takeUnretainedValue()
+            let notif = notification as String
+            PasswordGuard.forceRefreshOnMain()
+            if notif == (kAXFocusedWindowChangedNotification as String) {
+                me.requestSessionReset()
+            } else if notif == (kAXFocusedUIElementChangedNotification as String) {
+                let h = CFHash(element)
+                if h != me.lastFocusedElementHash {
+                    me.lastFocusedElementHash = h
+                    // Не рвём буфер во время живой печати (автокомплит-попапы меняют элемент
+                    // через 10–50 мс после буквы), но сбрасываем при переходе в другое поле
+                    if Engine.ms() - me.lastLetterAt > 0.25 {
+                        me.requestSessionReset()
+                    }
+                }
+            }
+        }, &obs)
+        guard err == .success, let observer = obs else { return }
+        let axApp = AXUIElementCreateApplication(pid)
+        let ptr = Unmanaged.passUnretained(self).toOpaque()
+        AXObserverAddNotification(observer, axApp, kAXFocusedWindowChangedNotification as CFString, ptr)
+        AXObserverAddNotification(observer, axApp, kAXFocusedUIElementChangedNotification as CFString, ptr)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        axObserver = observer
+        axObservedPid = pid
+    }
+
+    private func teardownAxObserverOnMain() {
+        if let obs = axObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+            axObserver = nil
+        }
+        axObservedPid = 0
+    }
+
+    private func lockAutoSwitch(lang: Int = -1) {
+        if s.lockAutoAfterManualSwitch {
+            autoLocked = true
+            autoLockedAt = Engine.ms()
+            autoLockedLang = lang
+            autoLockedWordsTyped = 0
         }
     }
 
-    /// Вызывается из тапа на каждое нажатие: ТОЛЬКО проверка лока раскладки.
-    /// currentLayout() читается ОДИН раз (кэшируется в LayoutService с TTL 0.1 c).
     private func updateForeground() {
         guard let cur = LayoutService.currentLayout() else { return }
-        // раскладка сменилась вне движка — юзер задал язык явно: лок автодетекта
         if let expected = expectedLayoutID, fgApp == expectedApp, cur.id != expected,
-           s.lockAutoAfterManualSwitch, Engine.ms() >= expectGraceUntil {
-            lockAutoSwitch()
+           Engine.ms() >= expectGraceUntil {
+            let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
+            let curLang = LanguageTables.langOf(LayoutService.render(cur, probe))
+            lockAutoSwitch(lang: curLang)
+            noFlipUntil = max(noFlipUntil, Engine.ms() + 1.5)
         }
         expectedLayoutID = cur.id
         expectedApp = fgApp
@@ -588,118 +698,200 @@ public final class Engine {
         expectedLayoutID = data.id
         expectedApp = fgApp
         expectGraceUntil = Engine.ms() + 1.2
-        switchSerial += 1 // отменяет висящие verifySwitch-ретраи
+        switchSerial += 1
     }
 
-    private var exclusionList: [String] = []
-    private var pasteConvertList: [String] = []
-    // счётчик живого ввода (растёт на каждом НЕ-своем событии в тапе): паст-пути
-    // сверяют его до/во время выделения — удар юзера в окне выделения замещает
-    // его и СТИРАЕТ слово (бой 02:08 06.11: '' nj' стёрлось ударом 'x')
-    private var inputSeq: UInt64 = 0
-
-    private func rebuildPasteConvertList() {
-        pasteConvertList = s.pasteConvertApps.lowercased()
-            .split(whereSeparator: { ",;".contains($0) })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+    /// Эффективная текущая раскладка с учётом активного окна `gapActive`:
+    /// если мы сами переключили раскладку и досылаем нажатия в `gapLayout`,
+    /// то текст на экране находится именно в `gapLayout`.
+    private func effectiveCurrentLayout() -> LayoutService.LayoutData? {
+        if gapActive, let gl = gapLayout {
+            if LayoutService.currentLayout()?.id == gl.id || Engine.ms() >= gapDeadline {
+                gapActive = false
+                gapLayout = nil
+            } else {
+                return gl
+            }
+        }
+        return LayoutService.currentLayout()
     }
 
-    /// Поле, где забой-инжекция разрушает текст (Electron склеивает/теряет быстрые
-    /// CGEvent-бёрсты — бои 01.11 17:40, 02:54; метка 11.11 20:00: bs=9 съел 28
-    /// символов перед словом): перечислено в PasteConvertApps или помечено
-    /// реплей-враждебным. Единый критерий для ВСЕХ веток стирания: в таком поле
-    /// BS-путь запрещён вообще — только выделение+вставка или честный отказ
-    private func fieldBsUnsafe() -> Bool {
-        let hostile = replayHostile[fgApp] == true && Engine.ms() < (replayHostileUntil[fgApp] ?? 0)
-        return hostile || pasteConvertList.contains(fgProc)
+    /// Нужно ли переводить и отправлять текущую клавишу через `injectorQueue`
+    /// (пока выполняется замена ИЛИ система ещё не применила новую раскладку).
+    private var shouldForwardViaInjector: Bool {
+        if inFlightInjections > 0 { return true }
+        if gapActive, let gl = gapLayout {
+            if LayoutService.currentLayout()?.id == gl.id || Engine.ms() >= gapDeadline {
+                gapActive = false
+                gapLayout = nil
+                return false
+            }
+            return true
+        }
+        return false
     }
 
-    private func rebuildExclusionList() {
-        exclusionList = s.exclusions.lowercased()
+    private func enqueueForwardedUnicode(_ text: String) {
+        guard !text.isEmpty else { return }
+        inFlightInjections += 1
+        injectorQueue.async { [weak self] in
+            TextConverter.sendUnicode(text, interCharDelayUs: 0)
+            self?.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
+            }
+        }
+    }
+
+    private func enqueueForwardedBackspace() {
+        inFlightInjections += 1
+        injectorQueue.async { [weak self] in
+            TextConverter.sendBackspaces(1, delayUs: 0)
+            self?.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
+            }
+        }
+    }
+
+    private func enqueueForwardedEnter(shift: Bool) {
+        inFlightInjections += 1
+        injectorQueue.async { [weak self] in
+            TextConverter.sendEnter(shift: shift)
+            self?.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
+            }
+        }
+    }
+
+    private func armGap(for target: LayoutService.LayoutData) {
+        gapActive = true
+        gapLayout = target
+        gapDeadline = Engine.ms() + 0.55
+    }
+
+    private var _exclusionList: [String] = []
+
+    private static func parseExclusions(_ raw: String) -> [String] {
+        return raw.lowercased()
             .split(whereSeparator: { ",;".contains($0) })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
 
     private func isExcludedHere() -> Bool {
-        // собственное окно настроек: исключаем всё, кроме «песочницы»
-        if fgIsOwnApp {
-            return !(uiSettingsActive && sandboxFocused)
+        stateLock.lock()
+        let isOwn = _fgIsOwnApp
+        let uiActive = _uiSettingsActive
+        let sboxFocused = _sandboxFocused
+        let proc = _fgProc
+        let exec = _fgExec
+        let bundle = _fgBundle
+        let list = _exclusionList
+        stateLock.unlock()
+
+        if isOwn {
+            return !(uiActive && sboxFocused)
         }
-        if exclusionList.isEmpty || fgProc.isEmpty { return false }
-        return exclusionList.contains(fgProc)
+        if list.isEmpty { return false }
+        for item in list {
+            if !proc.isEmpty && proc == item { return true }
+            if !exec.isEmpty && exec == item { return true }
+            if !bundle.isEmpty && bundle == item { return true }
+        }
+        return false
     }
 
-    // ------------------------------------------------------------------ обработка клавиш
+    // ------------------------------------------------------------------ модификаторы (безсостоятельно)
 
-    /// Физическое состояние модификаторных клавиш. flagsChanged приходит и на
-    /// нажатие, и на отпускание; бит maskShift общий для обоих Shift, а у Caps
-    /// бит-состояние вообще не меняется на отпускании — различаем только чётностью.
-    private var pressedMods: Set<Int> = []
+    /// Аппаратное определение нажатия/отпускания конкретного модификатора через
+    /// device-dependent маски `IOKit/IOLLEvent.h` (`NX_DEVICE*KEYMASK`).
+    /// Не инвертируется после сна, Lock Screen или парольного поля (`SecureEventInput`).
+    private static func isModPressed(code: Int, flags: CGEventFlags) -> Bool {
+        let raw = flags.rawValue
+        switch code {
+        case KeyCodeMap.leftShift:
+            if (raw & 0x0000_0006) != 0 { return (raw & 0x0000_0002) != 0 }
+            return flags.contains(.maskShift)
+        case KeyCodeMap.rightShift:
+            if (raw & 0x0000_0006) != 0 { return (raw & 0x0000_0004) != 0 }
+            return flags.contains(.maskShift)
+        case 0x3A: // leftOption
+            if (raw & 0x0000_0060) != 0 { return (raw & 0x0000_0020) != 0 }
+            return flags.contains(.maskAlternate)
+        case 0x3D: // rightOption
+            if (raw & 0x0000_0060) != 0 { return (raw & 0x0000_0040) != 0 }
+            return flags.contains(.maskAlternate)
+        case 0x37: // leftCommand
+            if (raw & 0x0000_0018) != 0 { return (raw & 0x0000_0008) != 0 }
+            return flags.contains(.maskCommand)
+        case 0x36: // rightCommand
+            if (raw & 0x0000_0018) != 0 { return (raw & 0x0000_0010) != 0 }
+            return flags.contains(.maskCommand)
+        case 0x3B: // leftControl
+            if (raw & 0x0000_2001) != 0 { return (raw & 0x0000_0001) != 0 }
+            return flags.contains(.maskControl)
+        case 0x3E: // rightControl
+            if (raw & 0x0000_2001) != 0 { return (raw & 0x0000_2000) != 0 }
+            return flags.contains(.maskControl)
+        case KeyCodeMap.capsLock:
+            return CGEventSource.keyState(.hidSystemState, key: CGKeyCode(KeyCodeMap.capsLock))
+        default:
+            return false
+        }
+    }
 
     private func onFlagsChanged(_ event: CGEvent) -> Bool {
         let flags = currentFlags(event)
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
         let now = Engine.ms()
         let m = heldModsFromFlags(flags)
+        let isPress = Self.isModPressed(code: code, flags: flags)
+
         if s.devLog, KeyCodeMap.isModifier(code) {
-            logLine(String(format: "flags: code=0x%02X press=%d tapVk=%d alone=%d", code, pressedMods.contains(code) ? 0 : 1, tapVk, tapAlone ? 1 : 0))
+            logLine(String(format: "flags: code=0x%02X press=%d tapVk=%d alone=%d", code, isPress ? 1 : 0, tapVk, tapAlone ? 1 : 0))
         }
 
-        // press/release по чётности: событие на уже «нажатой» клавише — её отпускание
-        let wasPressed = pressedMods.contains(code)
-        if wasPressed { pressedMods.remove(code) } else { pressedMods.insert(code) }
-        let isPress = !wasPressed
-
-        // ЛЮБОЙ другой модификатор-down гасит Option-тап (тап — только голый
-        // Option: Shift/Ctrl/Cmd-чорды не страдают); само нажатие Option армит
-        // ниже в своей ветке
         if isPress && code != 0x3A && code != 0x3D { optTapVk = 0 }
 
         let isShiftKey = code == KeyCodeMap.leftShift || code == KeyCodeMap.rightShift
-        // Shift — тап-клавиша раскладки? (тогда двойной Shift отключён)
         let shiftIsTapKey = (s.hotRuMods == 0 && (s.hotRuVk == KeyCodeMap.leftShift || s.hotRuVk == KeyCodeMap.rightShift))
             || (s.hotEnMods == 0 && (s.hotEnVk == KeyCodeMap.leftShift || s.hotEnVk == KeyCodeMap.rightShift))
         let isCapsTapKey = code == KeyCodeMap.capsLock
             && ((s.hotRuMods == 0 && s.hotRuVk == code) || (s.hotEnMods == 0 && s.hotEnVk == code))
 
         if isShiftKey && isPress {
-            let otherShift = code == KeyCodeMap.leftShift ? KeyCodeMap.rightShift : KeyCodeMap.leftShift
-            // Оба Shift одновременно (как в Caramba) — вкл/выкл автопереключения:
-            // чистая пара (ни одной клавиши между двумя Shift-down) гасит оба
-            // Shift-тапа и дёргает глобальный тумблер паузы
-            if s.shiftShiftToggle && pressedMods.contains(otherShift) && shiftPairClean {
-                shiftPairClean = false
-                lastShiftDown = 0
-                anyKeySinceShift = true
+            let bothShiftsHeld = (flags.rawValue & 0x0000_0006) == 0x0000_0006
+            // Если зажаты оба Shift одновременно — одиночный Shift-тап ЗАПРЕЩЁН
+            if bothShiftsHeld {
                 tapVk = 0
                 tapAlone = false
-                logLine("both-shifts: toggle auto")
-                toggleAuto()
-                return true // оба бита и так выставлены — флаги не глотаем
+                if s.shiftShiftToggle && shiftPairClean {
+                    shiftPairClean = false
+                    lastShiftDown = 0
+                    anyKeySinceShift = true
+                    logLine("both-shifts: toggle auto")
+                    toggleAuto()
+                }
+                return true
             }
-            // двойной Shift — сменить раскладку; ОТКЛЮЧЁН, пока тап-переключение
-            // висит на Shift'ах (v3 §10/§17.14: иначе второй тап «съедается»)
             if !anyKeySinceShift && (now - lastShiftDown) >= 0 && (now - lastShiftDown) < 0.4
                 && s.doubleShiftSwitch && !shiftIsTapKey {
                 lastShiftDown = 0
                 anyKeySinceShift = true
                 tapAlone = false
                 switchToOtherLayout()
-                return true // flagsChanged не глотаем — бит и так выставлен
+                return true
             }
             lastShiftDown = now
             anyKeySinceShift = false
-            // парольное поле: Shift там — заглавные/символы, тап не армим вовсе
-            if PasswordGuard.isSecureFocused {
+            if PasswordGuard.isSecureFocused || m.ctrl || m.alt || m.cmd {
                 anyKeySinceShift = true
                 tapAlone = false
                 return true
             }
             if (s.hotRuMods == 0 && s.hotRuVk == code) || (s.hotEnMods == 0 && s.hotEnVk == code) {
-                // дребезг/авторепит: тап быстрее 200 мс после предыдущего не армится
-                // (двойное переключение «туда-обратно» рвёт слово посреди набора — C# 942c5ba)
                 if lastTapDoneAt != 0 && (now - lastTapDoneAt) < 0.2 {
                     logLine("tap debounce: too soon after previous tap")
                 } else {
@@ -709,11 +901,11 @@ public final class Engine {
                     tapAlone = true
                 }
             }
-            shiftPairClean = true // первый Shift чист: ждём второй (keyDown отменит)
+            shiftPairClean = true
             return true
         }
+
         if isShiftKey && !isPress {
-            // отпускание Shift — завершение тапа (смена бита глотать бессмысленно)
             if s.devLog {
                 logLine(String(format: "shift-up: code=0x%02X tapVk=%d alone=%d dt=%.3f", code, tapVk, tapAlone ? 1 : 0, now - tapDownAt))
             }
@@ -722,41 +914,32 @@ public final class Engine {
         }
 
         if isCapsTapKey {
-            if m.ctrl || m.alt || m.cmd { return true } // чужое сочетание — как есть
+            if m.ctrl || m.alt || m.cmd { return true }
             if isPress {
-                // арминг как в оригинале; нативное включение капса глотаем
                 tapVk = code
                 tapTarget = (s.hotRuMods == 0 && s.hotRuVk == code) ? 0 : 1
                 tapDownAt = now
                 tapAlone = true
                 return false
             }
-            // отпускание — завершение тапа; тоже глотаем
             _ = fireTapIfArmed(code: code, now: now, flags: flags)
             return false
         }
 
-        // ---- Option-тап «как в Caramba»: короткий голый тап Option — принудительный
-        // переворот слова. Гасится любым keyDown (onKeyDown), другим модификатором
-        // (выше) и кликом мыши — реальные Option+клавиша / Cmd+Option+… не страдают.
-        if code == 0x3A || code == 0x3D { // левый/правый Option
+        // Option-тап «как в Caramba»
+        if code == 0x3A || code == 0x3D {
             if isPress {
                 anyKeySinceShift = true
                 if code != tapVk { tapAlone = false }
-                // Буфер НЕ чистим: голый тап Option = «переверни слово, которое я
-                // печатаю прямо сейчас» (Caramba). Чистка на down убивала живой
-                // путь: тап посреди слова (ещё без пробела) всегда отказывал —
-                // 4 отказа подряд 30-31.10 ('no fresh word') при живом буфере.
-                // Чужие сочетания гасятся disarm'ом в keyDown и веткой alt-буквы.
-                // армим только голый Option: зажатые Ctrl/Cmd/Shift — чужое сочетание
                 let mOpt = heldModsFromFlags(flags)
                 if s.optionFlip && !mOpt.ctrl && !mOpt.cmd && !flags.contains(.maskShift) {
                     optTapVk = code
                     optTapDownAt = now
                 } else {
                     optTapVk = 0
-                    buf.clear() // Option-чорд — не набор
-                    prevSingle = nil; boundaryClean = false
+                    buf.clear()
+                    prevSingle = nil
+                    boundaryClean = false
                 }
             } else {
                 fireOptionTapIfArmed(code: code, now: now, flags: flags)
@@ -765,41 +948,33 @@ public final class Engine {
         }
 
         if isPress {
-            // прочие модификаторы — чужие для тапа: сброс «одиночности»
             anyKeySinceShift = true
             if code != tapVk { tapAlone = false }
-            if code == 0x3B || code == 0x3E || code == 0x3A || code == 0x3D || code == 0x37 || code == 0x36 {
-                buf.clear() // Ctrl/Alt/Cmd — не набор
-                // дальше — сочетание (Cmd+V/Cmd+Z...): текст перед кареткой неизвестен (порт C#)
-                prevSingle = nil; boundaryClean = false
+            if code == 0x3B || code == 0x3E || code == 0x37 || code == 0x36 {
+                buf.clear()
+                prevSingle = nil
+                boundaryClean = false
             }
         }
         return true
     }
 
-    /// Завершение тапа клавиши раскладки. true — пропустить событие.
     private func fireTapIfArmed(code: Int, now: TimeInterval, flags: CGEventFlags) -> Bool {
         guard tapVk != 0, code == tapVk else { return true }
         tapVk = 0
-        // в оригинале KEYUP в suppress-окне не диспетчеризуется — тап не срабатывает
         if now < suppressUntil { return true }
         let m = heldModsFromFlags(flags)
-        // Тап короче tapMinMs — задев: раскладку не переключаем. НАСТРОЙКА
-        // tapMinMs, ДЕФОЛТ 0 = ВЫКЛ: жёсткий порог 0.12 с ел РЕАЛЬНЫЕ
-        // рефлекторные тапы юзера на вин (бой 07.10 — переключения перестали
-        // работать, откат 5f390d9). Включать только осознанно после калибровки
-        // по логу ('tap not fired ... dt=')
         let dt = now - tapDownAt
-        let minHold = Double(s.tapMinMs) / 1000.0
-        let alone = tapAlone && !m.ctrl && !m.alt && !m.cmd
-            && (minHold <= 0 || dt >= minHold) && dt < 0.7
+        let minHold = max(0.015, Double(s.tapMinMs) / 1000.0)
+        // На отпускании Shift бит maskShift обязан погаснуть (второй Shift не зажат),
+        // а длительность чистого тапа — до 0.40 с (удержание дольше = раздумье перед заглавной).
+        let otherShiftStillHeld = (code == KeyCodeMap.leftShift || code == KeyCodeMap.rightShift) && flags.contains(.maskShift)
+        let alone = tapAlone && !otherShiftStillHeld && !m.ctrl && !m.alt && !m.cmd
+            && dt >= minHold && dt < 0.40
         if !alone, s.devLog {
-            logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, now - tapDownAt, now < suppressUntil ? 1 : 0))
+            logLine(String(format: "tap not fired: tapAlone=%d ctrl=%d alt=%d cmd=%d dt=%.3f suppress=%d", tapAlone ? 1 : 0, m.ctrl ? 1 : 0, m.alt ? 1 : 0, m.cmd ? 1 : 0, dt, now < suppressUntil ? 1 : 0))
         }
         if alone {
-            // парольное поле: Shift там жмут ради ЗАГЛАВНЫХ/СИМВОЛОВ — тап-переключение
-            // в secure-поле не ходит вовсе (каждый Shift для 'A' переворачивал раскладку
-            // вслепую; бой 05:03:42-54: четыре ручных перебора раскладки в одном пароле)
             if PasswordGuard.isSecureFocused {
                 logLine("tap skip: password field")
                 return true
@@ -807,21 +982,19 @@ public final class Engine {
             logLine("tap fired: lang=\(tapTarget)")
             lastTapDoneAt = now
             updateForeground()
-            switchToLanguage(tapTarget)
+            switchToLanguageOnTap(tapTarget)
         }
         return true
     }
 
-    /// Отпускание Option — завершение Option-тапа «как в Caramba».
     private func fireOptionTapIfArmed(code: Int, now: TimeInterval, flags: CGEventFlags) {
         guard optTapVk != 0, code == optTapVk else { return }
         optTapVk = 0
-        // в suppress-окне не диспетчеризуем — как Shift-тап (инжекция в полёте)
-        if now < suppressUntil { return }
+        if now < suppressUntil && !(undoPending && keysSinceUndoPoint == 0) { return }
         let m = heldModsFromFlags(flags)
-        // только голый: любой модификатор, ещё зажатый на отпускании, — чужое сочетание
         guard !m.ctrl && !m.alt && !m.cmd && !flags.contains(.maskShift) else { return }
-        guard (now - optTapDownAt) >= 0 && (now - optTapDownAt) < 0.7 else { return }
+        let dt = now - optTapDownAt
+        guard dt >= 0.012 && dt < 0.45 else { return }
         logLine("option-tap fired")
         carambaFlip()
     }
@@ -855,29 +1028,32 @@ public final class Engine {
         matchHot(codeEvent: code, event, vkHot: s.hotFixWordVk, modsHot: s.hotFixWordMods)
     }
 
-    /// Возвращает true — пропустить клавишу дальше, false — проглотить.
+    // ------------------------------------------------------------------ обработка клавиш
+
     private func onKeyDown(_ event: CGEvent) -> Bool {
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        PasswordGuard.notifyActivity()
 
-        // ЛЮБАЯ клавиша между нажатием и отпусканием гасит «чистые» жесты:
-        // Option-тап и пару обоих Shift
         optTapVk = 0
         shiftPairClean = false
 
-        // F8 (kVK_F8 = 0x64) — метка проблемы в журнале (спека v3 §15): юзер жмёт
-        // при глюке, в лог падает снимок состояния. Не глотается — F8 продолжает работать.
+        if !KeyCodeMap.isModifier(code) &&
+            !matchHot(codeEvent: code, event, vkHot: s.hotFixSelVk, modsHot: s.hotFixSelMods) &&
+            !isFixWordHotkey(code, event) {
+            bumpInputSeq()
+        }
+
+        // F8 (kVK_F8 = 0x64) — метка состояния в журнале
         if code == 0x64 {
             markCount += 1
             updateForeground()
-            // журнал выключен — вместо снимка подсказка юзеру (как в C#:
-            // FireInfo «Журнал отключён…» + выход без записи); F8 не глотается
             if !s.devLog {
                 fireInfo("Журнал отключён — включите «Режим разработчика»")
                 return true
             }
-            // рендер снимка (UCKeyTranslate) — только при включённом журнале
-            let mBuf = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "") : ""
-            let mLast = lastWord.isEmpty ? "" : (LayoutService.currentLayout().map { LayoutService.render($0, lastWord) } ?? "")
+            let curL = effectiveCurrentLayout()
+            let mBuf = buf.count > 0 ? (curL.map { LayoutService.render($0, buf.snapshot()) } ?? "") : ""
+            let mLast = lastWord.isEmpty ? "" : (curL.map { LayoutService.render($0, lastWord) } ?? "")
             var mRetro = "-"
             if let ps = prevSingle, let pl = LayoutService.getLayouts().first(where: { $0.id == prevSingleLayoutID }) {
                 mRetro = "'" + LayoutService.render(pl, ps) + "'"
@@ -885,338 +1061,286 @@ public final class Engine {
             logLine("================ USER MARK #\(markCount) ================")
             logLine("mark: proc=\(fgProc) buf='\(mBuf)' lastWord='\(mLast)' (\(String(format: "%.1f", Engine.ms() - lastWordAt))s ago)" +
                 " undo=\(undoPending ? "pending ('\(undoText)'\(undoTailBroken ? ", tail broken" : ""))" : "no") locked=\(autoLocked ? 1 : 0)" +
-                " retroCand=\(mRetro)" +
-                " suppress=\(Engine.ms() < suppressUntil ? "yes" : "no")" +
-                " lastConvert=\(lastConvertInfo)")
-            fireInfo("Метка #\(markCount) записана в лог") // паритет C# Engine.cs:384
+                " tainted=\(wordTainted ? 1 : 0) retroCand=\(mRetro)" +
+                " inFlight=\(inFlightInjections) lastConvert=\(lastConvertInfo)")
+            fireInfo("Метка #\(markCount) записана в лог")
+            return true
         }
+
         let flags = currentFlags(event)
         let shift = flags.contains(.maskShift)
         let caps = flags.contains(.maskAlphaShift)
         let m = heldMods(event)
         let now = Engine.ms()
 
-        // любой реальный забой двигает каретку влево — снимает доверие к
-        // «слово+разд стоят прямо у каретки» (гейт точного переворота)
         if code == KeyCodeMap.backspace {
             lastBsAt = now
-            // РЕПЛЕЙ-ДЕТЕКТ, фаза 1: BS в окне после конверта — только ЗАПИСЬ
-            // (одиночный BS = правка юзера, не реплей — бой 17:10)
-            if now < replayArmUntil { replayBsSeen = true }
         }
-        // фаза 2: после BS в окне прилетела БУКВА СЛОВА — вот это реплей
-        if replayBsSeen && now < replayArmUntil && KeyCodeMap.isLetterKey(code)
-            && replayWordCodes.contains(code) {
-            replayBsSeen = false
-            // затухание: страйки старше 60 с не копятся (бой 17:10 — юзер правил
-            // ввод BS+ретайп того же слова: паттерн совпал, но это не реплей)
-            if now - replayLastStrikeAt > 60 { replayStrikes[fgApp] = 0 }
-            let strikes = (replayStrikes[fgApp] ?? 0) + 1
-            replayStrikes[fgApp] = strikes
-            replayLastStrikeAt = now
-            logLine("REPLAY STRIKE #\(strikes): BS+клавиша слова после конвертации в \(fgProc)")
-            if strikes >= 2 {
-                replayHostileUntil[fgApp] = now + 600 // TTL 10 мин: ложный хостил не вечен
-                if replayHostile[fgApp] != true {
-                    replayHostile[fgApp] = true
-                    logLine("REPLAY-HOSTILE: \(fgProc) — авто-конверт на паст-режиме 10 мин (выделение+вставка)")
-                    fireInfo("Это поле искажает автозамены — перевожу на вставку")
-                }
-            }
-        }
-        // паритет C# (SessionPauseMs=3000): лок живёт только внутри сеанса
-        // набора — пауза длиннее 3 с кончает сеанс, следующий ввод начинается
-        // с чистым автодетектом (бой 18:24: пауза 35 с, лок всё ещё молчал)
+
         if !KeyCodeMap.isModifier(code) {
             if autoLocked && (now - lastInputAt) >= 3.0 {
                 autoLocked = false
+                autoLockedLang = -1
+                autoLockedWordsTyped = 0
                 logLine(String(format: "auto-unlock: session pause %.0f ms", (now - lastInputAt) * 1000))
             }
             lastInputAt = now
         }
-        // Cmd+V = вставка: поле Electron коммитит её асинхронно — инжекции
-        // дают дорогу (0.4 с), иначе гонка с недокоммиченным текстом
-        if m.cmd && code == KeyCodeMap.ansiCode(ofLatin: "v") { lastPasteAt = now }
+
+        // Cmd+V / Cmd+A / Cmd+X / Cmd+T / Cmd+C / Cmd+W — команды меняют выделение/документ/вкладку: ломаем откат
+        if m.cmd && (code == KeyCodeMap.ansiCode(ofLatin: "v") || code == KeyCodeMap.ansiCode(ofLatin: "a") ||
+                     code == KeyCodeMap.ansiCode(ofLatin: "x") || code == KeyCodeMap.ansiCode(ofLatin: "t") ||
+                     code == KeyCodeMap.ansiCode(ofLatin: "w")) {
+            if code == KeyCodeMap.ansiCode(ofLatin: "v") { lastPasteAt = now }
+            autoRejectEligible = false
+            if undoPending { undoPending = false; undoTailBroken = true }
+        }
+
+        // Cmd+Z сразу после автозамены — юзер отменил нашу автозамену стандартным Undo:
+        // заносим слово в rejected и включаем кулдаун 5 с (только если это первое действие после автозамены!)
+        if m.cmd && !shift && !m.alt && !m.ctrl && code == KeyCodeMap.ansiCode(ofLatin: "z") {
+            if undoPending && undoFromAuto && autoRejectEligible && !undoTailBroken && keysSinceUndoPoint == 0 && (now - undoAt) < 8.0 {
+                let bad = undoText
+                logLine("auto-reject via Cmd+Z: '\(bad)'")
+                rememberRejected(bad)
+                removeAccepted(bad)
+                noFlipUntil = now + 5.0
+                undoPending = false
+            }
+            autoRejectEligible = false
+            if undoPending { undoTailBroken = true }
+        }
 
         anyKeySinceShift = true
-        // ЛЮБАЯ клавиша между нажатием и отпусканием тап-клавиши отменяет тап —
-        // иначе Shift→буква→отпускание switching раскладку на каждой заглавной
         tapAlone = false
 
-        // пауза автоперевода — глобальный тумблер
-        if s.hotAutoToggleVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotAutoToggleVk, modsHot: s.hotAutoToggleMods) {
+        // global / manual hotkeys + tap keys — игнорируем key-autorepeat при удержании (P2-5)
+        let isAutoRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+
+        // глобальный тумблер паузы
+        if !isAutoRepeat && s.hotAutoToggleVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotAutoToggleVk, modsHot: s.hotAutoToggleMods) {
             toggleAuto()
             return false
         }
 
-        // эхо-пробел: ДО счётчиков и suppress-гейта — точный порядок C# KeyboardProc
-        // (проглоченное эхо не должно трогать keysSinceUndoPoint/lastInputAt)
-        if code == KeyCodeMap.space {
-            if lastResendSpaceAt != 0 && buf.count == 0 && (now - lastResendSpaceAt) < 0.6 {
-                logLine("space-echo swallowed")
-                lastResendSpaceAt = 0 // одноразово: следующий реальный пробел не глотаем (v3 §6.1)
-                return false
-            }
-            lastResendSpaceAt = 0
-        } else {
-            lastResendSpaceAt = 0
-            // не пробел (F8-метка текст не трогает) — перед кареткой больше не наш пробел: дедуп
-            // глотает только пробел СРАЗУ после пробела ('слово, дальше' — пробел после запятой
-            // законный; раньше условие «пустой буфер» его ело), порт C# _spaceAtCaretTick
-            if code != 0x64 { lastSpaceTextTick = 0 }
+        // P2-1: убран 600 мс space-echo фильтр (собственная инжекция уже отфильтрована по PID источника),
+        // чтобы не съедать намеренный второй пробел при SpaceDedupMs = 0
+        if code != KeyCodeMap.space && code != 0x64 {
+            lastSpaceTextTick = 0
         }
 
-        // ---- guard отката: любые реальные нажатия, кроме исключений
         if !KeyCodeMap.isModifier(code) && !isUndoHotkey(code, event) && !isFixWordHotkey(code, event)
             && !(undoPending && code == KeyCodeMap.backspace) {
             keysSinceUndoPoint += 1
         }
 
-        // Лок ручного переключения (решение владельца 2026-09-29): держится, пока
-        // активно то же поле ввода и в нём идёт печать, — паузы в наборе его НЕ
-        // снимают. Ушёл из поля (смена приложения или окна) → resetSession()
-        // снимает лок вместе с остальным сеансом ввода.
-        if !KeyCodeMap.isModifier(code) { lastInputAt = now } // (пауза-экспирация лока — выше, до этого)
+        updateForeground()
 
-        if now < suppressUntil {
-            // GAP В SUPPRESS (бой 17:10 'naa'): конверт переключил раскладку и
-            // вызвал suppress; буквы в suppress-окне идут мимо gap-ветки (она
-            // ниже) и рендерятся СТАРОЙ раскладкой в момент TISSelect-лага.
-            // gap активен и глотает буквы/BS — доставим новой раскладкой
-            if gapActive, let gl = gapLayout {
-                if LayoutService.currentLayout()?.id == gl.id || now >= gapDeadline {
-                    flushGap()
-                    gapActive = false
-                } else if KeyCodeMap.isLetterKey(code) && !m.cmd && !m.ctrl && !m.alt {
-                    gapBuf.append(KeyRec(code, shift, caps))
-                    return false
-                } else if code == KeyCodeMap.backspace {
-                    if gapBuf.isEmpty {
-                        // пустой gapBuf: BS идёт в поле — буфер синхронно схлопывается
-                        // (дефект аудита №3, twin главной gap-ветки)
-                        if buf.count > 0 { buf.pop() } else { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
-                        return true
-                    }
-                    gapBuf.removeLast()
-                    return false
-                } else {
-                    // пробел/Enter/знак: как в главной gap-ветке — СНАЧАЛА досылаем
-                    // накопленное, потом клавиша идёт дальше (иначе буквы, набранные
-                    // до пробела, переезжают ЗА него — перестановка текста)
-                    flushGap()
-                    gapActive = false
-                }
-            }
-            // suppress-окно: конвертация запрещена, но буфер синхронизируем
-            if KeyCodeMap.isLetterKey(code) {
-                // Cmd/Ctrl/Alt+буква — команда/спецзнак, не текст: буфер под ноль (как в основной ветке)
-                if m.cmd || m.ctrl || m.alt {
-                    buf.clear(); lastWordSepKey = 0
-                    prevSingle = nil; boundaryClean = false
-                } else {
-                    if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id }
-                    buf.push(KeyRec(code, shift, caps))
-                    if undoPending && !undoTailBroken {
-                        if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
-                        else { undoTailBroken = true }
-                    }
-                }
-            } else if KeyCodeMap.isSeparatorKey(code) {
-                // разделитель (пробел, цифры, знаки): граница слова обязана делить буфер,
-                // иначе слова слипаются ('чтосправками') и конвертация теряется (v3 §6.4)
-                if buf.count > 0 {
-                    lastWord = buf.snapshot()
-                    lastWordAt = now
-                    lastWordApp = 0
-                }
-                lastWordSepKey = 0 // и при пустом буфере: 'привет␣' + пробел — после слова уже два символа
-                // знак дошёл до приложения — он часть хвоста отката (порт C#), иначе Break
-                // после быстрого 'ghbdtn␣vbh␣' стирал на символ меньше и оставлял 'п'.
-                // Ctrl/Alt/Cmd-сочетания текста не вставляют — не хвост
-                if !(m.ctrl || m.alt || m.cmd) && undoPending && !undoTailBroken {
-                    if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
-                    else { undoTailBroken = true }
-                }
-                if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) { lastSpaceTextTick = now } // пробел ушёл в текст
-                // в suppress слово не конвертируется — кандидата ретро-флипа не армим
-                prevSingle = nil
-                boundaryClean = code == KeyCodeMap.space && !shift && !(m.ctrl || m.alt || m.cmd)
-                buf.clear()
-            } else if code == KeyCodeMap.backspace {
-                // забой: тот же учёт, что в основной ветке — иначе откат после быстрого
-                // забоя стирал на символ больше (порт C#)
-                if m.ctrl || m.alt || m.cmd {
-                    buf.clear()
-                    lastWordSepKey = 0
-                    prevSingle = nil; boundaryClean = false
-                    if undoPending { undoTailBroken = true }
-                } else {
-                    if buf.count == 0 { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
-                    buf.pop()
-                    if undoPending && !undoTailBroken {
-                        if !undoTail.isEmpty { undoTail.removeLast() }
-                        else { undoTailBroken = true } // стёрли сам заменённый текст/досланный разделитель
-                    }
-                }
-            } else if code == KeyCodeMap.enter {
-                // буфер не делим (известное расхождение), но откат после Enter запрещён
-                lastWordSepKey = 0
-                prevSingle = nil; boundaryClean = true
-                if undoPending { undoTailBroken = true }
-            }
-            // Enter проходит насквозь и буфер НЕ делит (известное расхождение)
-            return true
-        }
-        updateForeground() // как в C#: UpdateForeground внутри OnKeyDown, вне suppress
-
-        // ---- ручные действия: работают всегда
-
-        // Backspace после автозамены — ОБЫЧНЫЙ ЗАБОЙ (порт C# 07.10, юзер
-        // запретил backspace-cancel: в Caramba/Punto отмена — только Break,
-        // хоткей ниже; он же кладёт слово в rejected). Забой при пустом хвосте
-        // ломает точку отката (undoTailBroken в обработчике backspace) —
-        // Break после правки честно откажется, force-flip подхватит
-
-        // отмена последней автозамены
-        if matchHot(codeEvent: code, event, vkHot: s.hotUndoVk, modsHot: s.hotUndoMods) {
-            prevSingle = nil // ручная правка текста — ретро-кандидат недостоверен
+        // ---- ручные хоткеи (работают и вне авто-режима)
+        if !isAutoRepeat && matchHot(codeEvent: code, event, vkHot: s.hotUndoVk, modsHot: s.hotUndoMods) {
+            prevSingle = nil
             if let undoBlock = undoBlockReason() {
-                // откатить нечего ИЛИ откат уже невозможен (протух/хвост сломан/другое окно) —
-                // Break = переворот последнего слова (порт C#: бой 28.09 16:53 — протухшая
-                // точка отката 'pdjyjr' перехватывала Break, 'СУЩ' в буфере не перевернуть)
                 logLine("hotkey: undo -> \(undoBlock), force flip")
                 if !forceFlipLastWord() {
                     fireInfo(undoPending ? Engine.undoBlockMessage(undoBlock)
-                                         : "Курсор не сразу после слова — выдели его и нажми Shift+Break")
+                                         : "Курсор не сразу после слова — выдели его и нажми Option")
                 }
             } else {
                 logLine("hotkey: undo")
-                noFlipUntil = Engine.ms() + 5.0 // откат = «не так» — движок молчит 5 с (C#:617)
+                noFlipUntil = Engine.ms() + 5.0
                 undoLastConversion()
             }
             return false
         }
-        if matchHot(codeEvent: code, event, vkHot: s.hotFixWordVk, modsHot: s.hotFixWordMods) {
+        if !isAutoRepeat && matchHot(codeEvent: code, event, vkHot: s.hotFixWordVk, modsHot: s.hotFixWordMods) {
             logLine("hotkey: fix-last-word")
             prevSingle = nil
             doFixLastWord()
             return false
         }
-        if matchHot(codeEvent: code, event, vkHot: s.hotFixSelVk, modsHot: s.hotFixSelMods) {
+        if !isAutoRepeat && matchHot(codeEvent: code, event, vkHot: s.hotFixSelVk, modsHot: s.hotFixSelMods) {
             logLine("hotkey: fix-selection")
             prevSingle = nil; boundaryClean = false
             beginFixSelection(fromFixWord: false)
             return false
         }
-        // Вставить без форматирования (как в Caramba): переназначаемый хоткей;
-        // не задан (vk == 0) или PastePlain выключен — функция выкл
-        if s.pastePlain && matchHot(codeEvent: code, event, vkHot: s.hotPasteVk, modsHot: s.hotPasteMods) {
+        if !isAutoRepeat && s.pastePlain && !isExcludedHere() && !PasswordGuard.isSecureFocused &&
+            matchHot(codeEvent: code, event, vkHot: s.hotPasteVk, modsHot: s.hotPasteMods) {
             logLine("hotkey: paste-plain")
             prevSingle = nil; boundaryClean = false
             pastePlainAction()
             return false
         }
-        // сочетания-раскладки с модификаторами
-        if s.hotRuMods != 0 && s.hotRuVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotRuVk, modsHot: s.hotRuMods) {
+        if !isAutoRepeat && s.hotRuMods != 0 && s.hotRuVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotRuVk, modsHot: s.hotRuMods) {
             switchToLanguage(0)
             return false
         }
-        if s.hotEnMods != 0 && s.hotEnVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotEnVk, modsHot: s.hotEnMods) {
+        if !isAutoRepeat && s.hotEnMods != 0 && s.hotEnVk != 0 && matchHot(codeEvent: code, event, vkHot: s.hotEnVk, modsHot: s.hotEnMods) {
             switchToLanguage(1)
             return false
         }
-        // тап-клавиши раскладок (не Shift): с зажатыми модификаторами пропускаем
-        if (s.hotRuMods == 0 && s.hotRuVk != 0 && code == s.hotRuVk) ||
-           (s.hotEnMods == 0 && s.hotEnVk != 0 && code == s.hotEnVk) {
+        if !isAutoRepeat && ((s.hotRuMods == 0 && s.hotRuVk != 0 && code == s.hotRuVk) ||
+           (s.hotEnMods == 0 && s.hotEnVk != 0 && code == s.hotEnVk)) {
             if m.ctrl || m.alt || m.cmd { return true }
             tapVk = code
             tapTarget = (s.hotRuMods == 0 && code == s.hotRuVk) ? 0 : 1
             tapDownAt = now
             tapAlone = true
-            return false // глотаем нажатие, чтобы не делало своего
+            return false
         }
 
-        // ---- компенсация лага смены раскладки
-        if gapActive {
-            let curID = LayoutService.currentLayout()?.id
-            if curID == gapLayout?.id || now >= gapDeadline {
-                flushGap()
-                gapActive = false
-            } else {
-                if KeyCodeMap.isLetterKey(code) {
-                    // Cmd/Ctrl/Option+буква в лаге смены раскладки — команда или
-                    // спецзнак: в отложенные буквы не пишем, отдаём как есть
-                    // (Option раньше попадал в gapBuf и доезжал буквой — дефект аудита №4)
-                    if m.cmd || m.ctrl || m.alt {
-                        flushGap()
-                        gapActive = false
-                        return true
-                    }
-                    gapBuf.append(KeyRec(code, shift, caps))
-                    return false // доставим после применения раскладки
-                }
-                if code == KeyCodeMap.backspace {
-                    if gapBuf.isEmpty {
-                        // пустой gapBuf: BS идёт в поле — буфер обязан синхронно
-                        // схлопнуться, иначе следующая конвертация стёрла бы лишнее
-                        // (дефект аудита №3)
-                        if buf.count > 0 { buf.pop() } else { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
-                        return true
-                    }
-                    gapBuf.removeLast()
-                    return false
-                }
-                flushGap()
-                return true
-            }
-        }
-
-        // ---- авто-логика; в исключённых приложениях глушим
-        if isExcludedHere() { buf.clear(); return true }
-
-        if KeyCodeMap.isLetterKey(code) {
-            // Cmd/Ctrl/Alt+буква — сочетание-команда или спецзнак (Cmd+A/C/V/Z,
-            // Option+буква = ™/œ/…), а не текст: после него текст у каретки
-            // ненадёжен — как Tab/Esc, буфер под ноль. Пушить букву нельзя:
-            // фантомная «ф» от Cmd+A собирала «фты» -> 'ans' и переворачивала
-            // раскладку пинг-понгом (бой 23:31)
-            if m.cmd || m.ctrl || m.alt {
-                buf.clear(); lastWordSepKey = 0
-                prevSingle = nil; boundaryClean = false
-                return true
-            }
-            let rec = KeyRec(code, shift, caps)
-            if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id } // что стоит перед словом (ретро-флип)
-            buf.push(rec)
-            if undoPending && !undoTailBroken && !m.ctrl && !m.alt && !m.cmd {
-                if undoTail.count < 16 { undoTail.append(rec) }
-                else { undoTailBroken = true }
-            }
+        // В исключённых приложениях и полях пароля не вмешиваемся в ввод вовсе
+        if isExcludedHere() || PasswordGuard.isSecureFocused {
+            buf.clear()
+            wordTainted = false
+            gapActive = false
             return true
         }
 
-        if code == KeyCodeMap.backspace {
-            if m.ctrl || m.alt || m.cmd {
+        let cmdMods = m.ctrl || m.alt || m.cmd
+        let backslashYo = LayoutService.usesBackslashForYo()
+
+        // ---- Буквы (включая знаки-двойники, '-' и 'ё' на 0x2A в стандартной раскладке Apple)
+        if KeyCodeMap.isLetterKey(code, allowBackslashYo: backslashYo) {
+            if cmdMods {
                 buf.clear()
                 lastWordSepKey = 0
-                prevSingle = nil; boundaryClean = false
+                wordTainted = false
+                prevSingle = nil
+                boundaryClean = false
+                autoRejectEligible = false
                 if undoPending { undoTailBroken = true }
                 return true
             }
-            // забой при пустом буфере стирает разделитель/само слово — каретка уже
-            // не за [слово+разд], точный force-flip стёр бы лишний символ; ретро-кандидат
-            // ('f␣' — стёрли пробел) и чистота границы тоже больше не известны
-            if buf.count == 0 { lastWordSepKey = 0; prevSingle = nil; boundaryClean = false }
-            buf.pop()
+            // '-' или Shift + '-' ('_'): если в начале буфера (-rf, --help) или snake_case -> токен не-слово
+            if code == KeyCodeMap.minus {
+                if buf.count == 0 || shift {
+                    wordTainted = true
+                }
+            }
+            autoRejectEligible = false
+            lastLetterAt = now
+            let effLayout = effectiveCurrentLayout()
+            let rec = KeyRec(code, shift, caps)
+            if buf.count == 0 {
+                wordStartClean = boundaryClean && !wordTainted
+                wordStartLayoutID = effLayout?.id
+            }
+            buf.push(rec)
+            if buf.overflowed {
+                wordTainted = true
+                prevSingle = nil
+            }
             if undoPending && !undoTailBroken {
-                if !undoTail.isEmpty { undoTail.removeLast() }
+                if undoTail.count < 16 { undoTail.append(rec) }
                 else { undoTailBroken = true }
+            }
+            if shouldForwardViaInjector, let gl = effLayout, let ch = LayoutService.renderKey(gl, rec) {
+                enqueueForwardedUnicode(ch)
+                return false
             }
             return true
         }
 
-        if code == KeyCodeMap.enter {
-            let modified = m.ctrl || m.alt || m.cmd || shift
+        // ---- Голые цифры 0..9 + Numpad-цифры / операторы (P1-7):
+        // НЕ конвертируем предшествующий кусок слова ('snow7', 'gpt4'), помечаем токен смешанным
+        if KeyCodeMap.isDigitKey(code) && (!shift || KeyCodeMap.isKeypadDigitKey(code)) {
+            if cmdMods {
+                buf.clear()
+                lastWordSepKey = 0
+                prevSingle = nil
+                boundaryClean = false
+                autoRejectEligible = false
+                if undoPending { undoTailBroken = true }
+                return true
+            }
+            buf.clear()
+            wordTainted = true
+            autoRejectEligible = false
+            lastWordSepKey = 0
+            prevSingle = nil
+            boundaryClean = false
+            if undoPending && !undoTailBroken {
+                if undoTail.count < 16 { undoTail.append(KeyRec(code, false, caps)) }
+                else { undoTailBroken = true }
+            }
+            if shouldForwardViaInjector, let gl = effectiveCurrentLayout(),
+               let ch = LayoutService.renderKey(gl, KeyRec(code, false, false)) {
+                enqueueForwardedUnicode(ch)
+                return false
+            }
+            return true
+        }
+
+        if KeyCodeMap.isKeypadOpKey(code) {
+            buf.clear()
+            wordTainted = true
+            autoRejectEligible = false
+            lastWordSepKey = 0
+            prevSingle = nil
+            boundaryClean = false
+            if undoPending { undoTailBroken = true }
+            return true
+        }
+
+        // ---- Backspace
+        if code == KeyCodeMap.backspace {
+            if cmdMods {
+                // Opt+BS / Cmd+BS сразу после ложной автозамены — тоже явное стирание нашего слова
+                if undoPending && undoFromAuto && autoRejectEligible && !undoTailBroken && undoTail.isEmpty && keysSinceUndoPoint == 0 && (now - undoAt) < 8.0 {
+                    let bad = undoText
+                    logLine("auto-reject via word-BS: '\(bad)'")
+                    rememberRejected(bad)
+                    removeAccepted(bad)
+                    noFlipUntil = now + 5.0
+                }
+                autoRejectEligible = false
+                buf.clear()
+                lastWordSepKey = 0
+                prevSingle = nil
+                boundaryClean = false
+                if undoPending { undoPending = false; undoTailBroken = true }
+                return true
+            }
+            if buf.count == 0 {
+                lastWordSepKey = 0
+                prevSingle = nil
+                boundaryClean = false
+            }
+            buf.pop()
+            if undoPending {
+                if !undoTailBroken && !undoTail.isEmpty {
+                    undoTail.removeLast()
+                    autoRejectEligible = false
+                } else {
+                    undoTailBroken = true
+                    // Если юзер сразу после автозамены вручную стирает само заменённое слово
+                    // Backspace'ами — учимся на ошибке (только если серия BS пошла без промежуточных символов!)
+                    if undoFromAuto && autoRejectEligible && (now - undoAt) < 8.0 {
+                        undoErasedByBs += 1
+                        let threshold = max(2, undoLen - 1)
+                        if undoErasedByBs >= threshold {
+                            let bad = undoText
+                            logLine("auto-reject via BS×\(undoErasedByBs): '\(bad)'")
+                            rememberRejected(bad)
+                            removeAccepted(bad)
+                            noFlipUntil = now + 5.0
+                            undoPending = false
+                            autoRejectEligible = false
+                        }
+                    }
+                }
+            }
+            if inFlightInjections > 0 {
+                enqueueForwardedBackspace()
+                return false
+            }
+            return true
+        }
+
+        // ---- Enter / KeypadEnter
+        if code == KeyCodeMap.enter || code == KeyCodeMap.keypadEnter {
+            let modified = cmdMods || shift
             var converted = false
             let word = buf.snapshot()
             if !word.isEmpty && !modified {
@@ -1224,107 +1348,136 @@ public final class Engine {
                 lastWordAt = now
                 lastWordApp = fgApp
             }
-            // после Enter (любого, и при пустом буфере: 'слово␣' + Enter) точный
-            // переворот невозможен — строка ушла/перенеслась, Break печатал бы в пустое поле
             lastWordSepKey = 0
-            // (сброс sep для пути без разделителя — в конце tryConvertWord)
-            if !modified && s.fixOnEnter {
-                converted = tryConvertWord(word, resendKey: KeyCodeMap.enter, resendShift: false, manual: false) // ретро-флип 'f␣ns'+Enter — внутри
+            if !modified && code == KeyCodeMap.enter && s.fixOnEnter && now >= suppressUntil && !word.isEmpty {
+                converted = tryConvertWord(word, resendKey: KeyCodeMap.enter, resendShift: false, manual: false)
             }
-            prevSingle = nil; boundaryClean = true // новая строка / сообщение ушло
-            // одиночные буквы на Enter не конвертируются (как и на пробеле):
-            // у одной буквы нет сигнала намерения
+            if !converted && autoLocked && !word.isEmpty {
+                autoLockedWordsTyped += 1
+            }
+            prevSingle = nil
+            boundaryClean = true
+            wordTainted = false
             undoTailBroken = true
+            autoRejectEligible = false
             buf.clear()
-            return !converted
-        }
-
-        if code == KeyCodeMap.tab || code == KeyCodeMap.esc {
-            buf.clear(); lastWordSepKey = 0
-            prevSingle = nil; boundaryClean = false // что перед кареткой — неизвестно
+            if converted { return false }
+            if inFlightInjections > 0 && !cmdMods {
+                enqueueForwardedEnter(shift: shift)
+                return false
+            }
             return true
         }
 
-        if KeyCodeMap.isSeparatorKey(code) {
-            let modified = m.ctrl || m.alt || m.cmd || shift
+        // ---- Tab / Esc
+        if code == KeyCodeMap.tab || code == KeyCodeMap.esc {
+            buf.clear()
+            lastWordSepKey = 0
+            wordTainted = false
+            prevSingle = nil
+            boundaryClean = false
+            autoRejectEligible = false
+            if undoPending { undoTailBroken = true }
+            return true
+        }
+
+        // ---- Разделители конца слова (пробел, '=', '/', '\' если не ё, Shift+цифра)
+        if KeyCodeMap.isSeparatorKey(code, shift: shift, allowBackslashYo: backslashYo) {
+            let modified = cmdMods || shift
             var converted = false
             let bufWas = buf.count
-            // эхо-состояние ДО конвертации: она сама ставит тик досыла —
-            // флаг, снятый после, всегда 'y' (артефакт, морочил диагностику)
-            let echoBefore = lastResendSpaceAt != 0 && (now - lastResendSpaceAt) < 0.6
 
-            // дедуп двойных пробелов (настройка SpaceDedupMs): второй пробел подряд
-            // при пустом буфере в пределах окна глотается — защита от рефлекса
-            // двойного нажатия после конвертаций (порт C# Engine.cs:802-811)
-            // (now — в СЕКУНДАХ, окно — в мс: раньше сравнение без /1000 давало окно в 2000 с,
-            // и пробел после запятой/цифры съедался почти всегда). Shift+пробел — тоже пробел
-            if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) && !s.paused && s.spaceDedupMs > 0 &&
+            // Дедуп двойных пробелов
+            if code == KeyCodeMap.space && !cmdMods && !s.paused && s.spaceDedupMs > 0 &&
                 buf.count == 0 && lastSpaceTextTick != 0 && (now - lastSpaceTextTick) < Double(s.spaceDedupMs) / 1000.0 {
                 logLine("space: dedup swallowed")
-                return false // проглотить (в текст не идёт)
+                return false
             }
 
-            // ОДИНОЧНЫЕ БУКВЫ НЕ КОНВЕРТИРУЮТСЯ АВТОМАТИЧЕСКИ (порт фикса win b1b11cf):
-            // у одной буквы нет сигнала намерения — wordness-флип то не срабатывал
-            // когда нужен ('f' в начале фразы), то портил латинские токены
-            // ('b2b' -> 'b2и': цифра рвёт слово, вторая 'b' становилась «одиночной»).
-            // Осознанный переворот — Break (force-flip).
-            // Исключение — ретро-флип: буква переворачивается ВМЕСТЕ со следующим
-            // сконвертированным словом ('f␣ns' -> «а ты»), см. tryConvertWord.
+            // Префиксы команд/упоминаний/путей при пустом буфере ('/plan', '@nick', '#tag', '$var'):
+            // помечают следующий за ними токен как не-слово до пробела/Enter
+            let isSlashPrefix = (code == KeyCodeMap.slash && !shift && buf.count == 0)
+            let isMentionOrTagPrefix = (shift && buf.count == 0 && (code == 0x13 /* @ */ || code == 0x14 /* # */ || code == 0x15 /* $ */))
+            if isSlashPrefix || isMentionOrTagPrefix {
+                wordTainted = true
+            }
 
-            // Ctrl/Alt/Cmd — шорткат, не вмешиваемся; Shift — НЕ шорткат: '?', '!', '"', RU ','
-            // — текст и конец слова (порт C#, бой 29.09 19:24:37: слово+'?' не конвертилось)
-            let cmdMods = m.ctrl || m.alt || m.cmd
-            if !converted && !cmdMods && s.autoConvertOnWordEnd && buf.count > 0 {
+            if !cmdMods && s.autoConvertOnWordEnd && now >= suppressUntil && buf.count > 0 {
                 let word = buf.snapshot()
                 converted = tryConvertWord(word, resendKey: code, resendShift: shift, manual: false)
             }
+
+            // Если голый '/' после слова НЕ сконвертировал его ('fix/branch', 'https://site/path'),
+            // остаток пути до пробела тоже считаем путём/URL и не трогаем
+            if !converted && code == KeyCodeMap.slash && !shift && !cmdMods {
+                wordTainted = true
+            }
+
             if buf.count > 0 && !cmdMods {
                 lastWord = buf.snapshot()
                 lastWordAt = now
                 lastWordApp = fgApp
-                lastWordSepKey = code // разделитель сразу после слова — нужен точному перевороту
-                lastWordSepShift = shift // '?' = Shift+/ — перепечатать тем же знаком
+                lastWordSepKey = code
+                lastWordSepShift = shift
+                if !converted && autoLocked && code == KeyCodeMap.space {
+                    autoLockedWordsTyped += 1
+                }
             } else {
-                // второй разделитель подряд ('слово.␣', 'слово␣␣') или сочетание-команда —
-                // после слова уже не ровно один известный символ (порт C#)
                 lastWordSepKey = 0
             }
-            // Shift — НЕ шорткат: '!', '?', ',' (RU Shift+/), Shift+пробел доходят до текста
-            // и обязаны быть в хвосте ('привет мир!' + Break стирал на символ меньше), порт C#
-            if !(m.ctrl || m.alt || m.cmd) && !converted && undoPending && !undoTailBroken && code != KeyCodeMap.tab {
+
+            if !cmdMods && !converted && undoPending && !undoTailBroken {
                 if undoTail.count < 16 { undoTail.append(KeyRec(code, shift, caps)) }
                 else { undoTailBroken = true }
             }
-            // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь (v3 §15)
-            // пробел ушёл в текст (досыл замены ставит тик сам) — следующий пробел подряд дедуп проглотит
-            if code == KeyCodeMap.space && !(m.ctrl || m.alt || m.cmd) && !converted { lastSpaceTextTick = now }
-            if code == KeyCodeMap.space && !modified {
-                // текст слова в лог: полный транскрипт — любое «порезанное» слово
-                // видно в логе даже при отказе конвертации
-                let wordText = buf.count > 0 ? (LayoutService.currentLayout().map { LayoutService.render($0, buf.snapshot()) } ?? "?") : "-"
-                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) word='\(wordText)' echoInWindow=\(echoBefore ? "y" : "n")")
+
+            if code == KeyCodeMap.space && !cmdMods && !converted {
+                lastSpaceTextTick = now
             }
-            // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
-            // для СЛЕДУЮЩЕГО слова ('f␣' ждёт 'ns'). 'b2b␣' — нет: 'b' начата после цифры
+            if code == KeyCodeMap.space && !modified {
+                let curL = effectiveCurrentLayout()
+                let wordText = buf.count > 0 ? (curL.map { LayoutService.render($0, buf.snapshot()) } ?? "?") : "-"
+                logLine("space: \(converted ? "flip+resend" : "pass") bufWas=\(bufWas) word='\(wordText)'")
+            }
+
             let plainSpace = code == KeyCodeMap.space && !modified
-            if plainSpace && !converted && buf.count == 1 && wordStartClean {
+            if plainSpace && !converted && buf.count == 1 && wordStartClean && !wordTainted {
                 prevSingle = buf.snapshot()
-                prevSingleLayoutID = LayoutService.currentLayout()?.id
+                prevSingleLayoutID = effectiveCurrentLayout()?.id
                 prevSingleApp = fgApp
             } else {
                 prevSingle = nil
             }
+
+            if !converted {
+                autoRejectEligible = false
+            }
+            if cmdMods && undoPending {
+                undoTailBroken = true
+            }
+            if plainSpace {
+                wordTainted = false
+            }
             boundaryClean = plainSpace
             buf.clear()
-            return !converted
+
+            if converted { return false }
+            if !cmdMods && shouldForwardViaInjector, let gl = effectiveCurrentLayout(),
+               let ch = LayoutService.renderKey(gl, KeyRec(code, shift, false)), !ch.isEmpty {
+                enqueueForwardedUnicode(ch)
+                return false
+            }
+            return true
         }
 
-        // F-клавиши, навигация, Ins/Del — сброс буфера (реальные macOS-коды)
+        // ---- Навигация, стрелки, F-клавиши
         if KeyCodeMap.isNavigationKey(code) {
             buf.clear()
-            lastWordSepKey = 0 // каретка сдвинута — уже не за [слово+разд]
-            prevSingle = nil; boundaryClean = false
+            lastWordSepKey = 0
+            wordTainted = false
+            prevSingle = nil
+            boundaryClean = false
+            autoRejectEligible = false
             if undoPending { undoTailBroken = true }
             return true
         }
@@ -1334,81 +1487,34 @@ public final class Engine {
 
     private func onKeyUp(_ event: CGEvent) -> Bool {
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
-        // тап-клавиши (не Shift) завершаются здесь
         if tapVk != 0 && code == tapVk && code != KeyCodeMap.leftShift && code != KeyCodeMap.rightShift {
-            let _ = fireTapIfArmed(code: code, now: Engine.ms(), flags: event.flags)
-            return false // keyUp проглоченной тап-клавиши тоже глотается (IsSwallowableTap)
+            _ = fireTapIfArmed(code: code, now: Engine.ms(), flags: event.flags)
+            return false
         }
         return true
     }
 
     private func onMouseDown() {
+        PasswordGuard.notifyActivity()
+        bumpInputSeq()
         if buf.count > 0 { lastWord = buf.snapshot() }
         lastWordSepKey = 0
         lastWordApp = 0
         buf.clear()
+        wordTainted = false
         tapAlone = false
-        optTapVk = 0          // Option+клик — реальное сочетание, не тап
-        shiftPairClean = false // клик между Shift-down ломает «одновременность»
-        prevSingle = nil      // каретка переехала: 'f␣' уже не перед словом
-        lastSpaceTextTick = 0 // и что перед ней — неизвестно (дедуп пробела снят)
-        boundaryClean = true  // клик в поле — как начало ввода
+        optTapVk = 0
+        shiftPairClean = false
+        prevSingle = nil
+        lastSpaceTextTick = 0
+        boundaryClean = true
         keysSinceUndoPoint += 1
+        autoRejectEligible = false
         if undoPending { undoTailBroken = true }
     }
 
-    private func flushGap() {
-        guard !gapBuf.isEmpty, let gl = gapLayout else { return }
-        let str = LayoutService.render(gl, gapBuf)
-        TextConverter.sendUnicode(str)
-        logLine("gap: flushed \(gapBuf.count) keys as '\(str)'")
-        // досланные буквы — часть текущего слова и хвоста отката (порт C#): без этого
-        // следующая конвертация/откат стирали на столько символов меньше
-        for rec in gapBuf {
-            if buf.count == 0 { wordStartClean = boundaryClean; wordStartLayoutID = LayoutService.currentLayout()?.id }
-            buf.push(rec)
-            if undoPending && !undoTailBroken {
-                if undoTail.count < 16 { undoTail.append(rec) } else { undoTailBroken = true }
-            }
-        }
-        lastSpaceTextTick = 0
-        gapBuf.removeAll()
-    }
+    // ------------------------------------------------------------------ потоки и AX-проверка экрана
 
-    /// Армировать gap-окно после ЛЮБОГО переключения раскладки движком
-    /// (конверт/force-flip/паст-флип): TISSelect асинхронен — буквы, набранные
-    /// в окне применения (~100-400 мс), отрисовываются СТАРОЙ раскладкой
-    /// (бой 02:07 'yaaнуrfr': конверт 'ye'->'ну' переключил на RU, юзер продолжил
-    /// печатать в EN-лаг — фарш из трёх состояний). Gap-буфер досылает их
-    /// уже новой раскладкой. Тап-переключения армируют gap давнее (§6.5)
-    private func armGapForEngineSwitch(_ target: LayoutService.LayoutData) {
-        gapActive = true
-        gapLayout = target
-        gapBuf.removeAll()
-        gapDeadline = Engine.ms() + 0.8
-        armGapFlushTimer()
-    }
-
-    /// Досыл gap-буфера по дедлайну, не дожидаясь следующей клавиши (порт C# ArmGapFlushTimer):
-    /// проглоченная в просвете буква иначе висела невидимой до следующего нажатия.
-    private func armGapFlushTimer() {
-        gapGen += 1
-        let gen = gapGen
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) { [weak self] in
-            self?.performOnTapThread { [weak self] in
-                guard let self = self, gen == self.gapGen, self.gapActive else { return } // новый тап / окно сменилось
-                self.flushGap()
-                self.gapActive = false
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ действия
-
-    /// Сериализация публичных действий на потоке тапа: меню/горячие пути зовут
-    /// их с main, а тело мутирует gapBuf/gapActive/autoLocked, которые читает
-    /// живой тап-поток. На потоке тапа — исполняем сразу; тапа нет (selftest)
-    /// — исполняем как есть.
     private func performOnTapThread(_ body: @escaping () -> Void) {
         if CFRunLoopGetCurrent() === tapRunLoop {
             body()
@@ -1420,193 +1526,82 @@ public final class Engine {
         }
     }
 
-    /// Синхронный заход на поток тапа за живым состоянием (владелец inputSeq/fgApp —
-    /// он). nil — тап не ответил за 0.2 с; вызывающий трактует как «безопасный отказ».
-    private func syncOnTap<T>(_ body: @escaping () -> T) -> T? {
-        if CFRunLoopGetCurrent() === tapRunLoop { return body() }
-        guard let rl = tapRunLoop else { return nil }
-        var out: T? = nil
-        let sem = DispatchSemaphore(value: 0)
-        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) {
-            out = body()
-            sem.signal()
+    private enum AutoScreenVerdict { case proceed, alreadyTarget }
+
+    /// Быстрая проверка экрана ПЕРЕД авто-инжекцией (вызывается на `injectorQueue`,
+    /// ВНЕ `tapCallback`!). Не блокирует ввод пользователя.
+    private func checkScreenBeforeAutoInject(expectedTail: String, targetText: String) -> AutoScreenVerdict {
+        let gate = screenTailAtCaretOnMain(expectedTail, timeout: 0.06)
+        if gate.available && !gate.matches && gate.actual.hasSuffix(targetText) {
+            return .alreadyTarget
         }
-        CFRunLoopWakeUp(rl)
-        _ = sem.wait(timeout: .now() + 0.3)
-        return out
+        return .proceed
     }
 
-    /// Печатает ли юзер СЕЙЧАС (или увёл фокус): выделение, открытое поверх живой
-    /// печати, замещается следующим ударом и слово стирается (бой 02:08 06.11).
-    /// Снимок берётся на потоке тапа — без гонок. Расхождение/нет ответа = отмена
-    /// (безопасная сторона; «нет ответа» отдельно помечается в лог — тап бывает
-    /// занят settle-ретреем, это не печать).
-    private func pasteTypingAbort(seq0: UInt64, fg0: pid_t) -> Bool {
-        guard let snap = syncOnTap({ () -> (UInt64, pid_t) in (self.inputSeq, self.fgApp) }) else {
-            logLine("paste-check: тап не ответил за таймаут — отмена по безопасности (не печать)")
-            return true
-        }
-        return snap.0 != seq0 || snap.1 != fg0
+    /// Строгая проверка хвоста у каретки для РУЧНЫХ действий (`Option`-тап / `Undo`),
+    /// вызывается на `injectorQueue` вне `tapCallback`.
+    private func verifyTailForManualAction(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
+        let g1 = screenTailWithOptionalTrimmedSpace(expectedTail, timeout: 0.08)
+        if g1.matches || !g1.available { return g1 }
+        usleep(35_000)
+        return screenTailWithOptionalTrimmedSpace(expectedTail, timeout: 0.08)
     }
 
-    /// Гашение выделения БЕЗ сдвига каретки. Бои 02:08/03:02 06.11: отказ гасил
-    /// выделение голой стрелкой ВЛЕВО — каретка прыгала в начало слова, печать
-    /// юзера втыкалась в чужое место, «задевает, стирает лишнее». Option+Shift+Left
-    /// выделяет СЛЕВА от каретки, значит стрелка ВПРАВО схлопывает выделение в его
-    /// конец = исходная позиция каретки. Пустое чтение AX — выделения нет, не шлём
-    /// ничего; nil (AX молчит) — выделение скорее живо, гасим вправо.
-    private func deselectSelectionCaretSafe(_ selRead: String?) {
-        if let s = selRead, s.isEmpty { return } // выделения нет — каретка и так на месте
-        TextConverter.sendCombo(keyCode: 0x7C /* Right */, mods: 0)
-    }
-
-    /// Слово уже в целевой раскладке на экране (бой 03:02: десинк памяти движка и
-    /// системы — поле уже содержало «да», выделение дало «да ») — переворот не нужен.
-    static func pasteSelectionAlreadyTarget(_ sel: String, target: String) -> Bool {
-        sel.trimmingCharacters(in: .whitespacesAndNewlines) == target
-    }
-
-    /// Замер экрана вокруг инжекции: текст фокусного поля до и через 0.4 с после —
-    /// единственная правда об «отрезало лишнее» (самоотчёт движка не считается).
-    /// Текст не изменился после инжекции = цель не съела замену («определил,
-    /// но не заменил») — фиксируется явно.
-    private func screenProbe(expectedAfter: String = "", removedTail: String = "") {
-        DispatchQueue.main.async { [weak self] in
-            let before = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
-            self?.logLine("screen-before: '\(before)'")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                let after = PasswordGuard.focusedText().map { String($0.suffix(80)) } ?? "?"
-                self?.logLine("screen-after: '\(after)'")
-                if before == after && after != "?" {
-                    self?.logLine("INJECTION NOT APPLIED: текст не изменился — цель не съела замену")
-                    self?.fireInfo("Замена не применилась этим приложением — переверни вручную") // 04:57: тап «молча не сработал» — юзер не знал почему
-                }
-                // ПОСТ-ПРОВЕРКА УРОНА (бой 17:40: bs=13 при допуске 12/13 съел 52
-                // чужих символа — стало видно только по разнице окон): поле обязано
-                // кончаться ожидаемой заменой; не кончается — инжекция ушла не туда,
-                // громкий маркер для разбора (автовосстановление невозможно)
-                if !expectedAfter.isEmpty && after != "?" && !after.contains(expectedAfter) {
-                    self?.logLine("DAMAGE SUSPECTED: замена '\(expectedAfter)' не найдена в поле — инжекция ушла не туда/переформатировала")
-                }
-                // УРОН ПРЕФИКСА (метка 11.11 20:00: bs=9 в bb уничтожил 28 символов
-                // ПЕРЕД словом — замена нашлась, проверка выше молчала): голова
-                // поля до стёртого хвоста обязана пережить инжекцию; исчезла —
-                // урон фиксируется сразу, а не по жалобе
-                if !removedTail.isEmpty && before != "?" && after != "?" {
-                    var head: String? = nil
-                    if before.hasSuffix(removedTail) {
-                        head = String(before.dropLast(removedTail.count))
-                    } else if before.dropLast().hasSuffix(removedTail) {
-                        head = String(before.dropLast(removedTail.count + 1)) // сепаратор между хвостом и кареткой
-                    }
-                    if let head, !head.isEmpty {
-                        let keep = String(head.suffix(40))
-                        if keep.count >= 8 && !after.contains(keep) {
-                            self?.logLine("DAMAGE PREFIX: '...\(keep.suffix(24))' исчез из поля — инжекция съела текст перед словом")
-                            self?.fireInfo("Замена задела текст перед словом — проверь поле")
-                        }
-                    }
-                }
-                // СКЛЕЙКА (бой 19:08:56 'bизучи'): последний символ СТЁРТОГО слова
-                // прилип к замене (Electron склеил быстрые BS — bs=5 дошёл как 4).
-                // Сигнатура: [последняя буква стёртого]+[замена] присутствует в поле
-                if removedTail.isEmpty == false, expectedAfter.isEmpty == false,
-                   let lastChar = removedTail.last, after.contains(String(lastChar) + expectedAfter) {
-                    self?.logLine("DAMAGE GLUE: '\(lastChar)\(expectedAfter.prefix(12))…' — потерян backspace, стёртое слово осталось частично")
-                    self?.fireInfo("Замена с прилипшей буквой — проверь хвост")
-                }
-            }
-        }
-    }
-
-    /// Выделенный текст фокусного элемента: с потока тапа — семафорный заход на
-    /// main (AX только там — инвариант TSM-краша fa5235a). nil/пусто — выделения нет.
-    private func selectedTextOnMain() -> String? {
-        if Thread.isMainThread { return PasswordGuard.selectedText() }
-        var box: String?? = nil
-        let sem = DispatchSemaphore(value: 0)
-        DispatchQueue.main.async {
-            box = PasswordGuard.selectedText()
-            sem.signal()
-        }
-        _ = sem.wait(timeout: .now() + 0.2)
-        return box ?? nil
-    }
-
-    /// Верификация хвоста для инжекции. Допуск — ТОЛЬКО опциональный хвостовой
-    /// сепаратор (редакторы тримят trailing space: AX его не показывает, хотя
-    /// поле его содержит). Скользящий допуск k/n (12/13 … 7/13) УДАЛЁН: на
-    /// лгущем под нагрузкой AX-каретке Electron он принимал частичное
-    /// совпадение и открывал инжекцию в ЧУЖОЕ место — бой 17:40 01.11:
-    /// bs=13 при 12/13 съел 52 чужих символа, слово осталось на месте.
-    /// Не совпало после ретрая 60 мс — честный отказ.
-    private func verifyTailForInjection(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
-        // Electron под нагрузкой отдаёт ПРОТУХШИЙ AX (бой 17:48: поле уже с новым
-        // словом, AX показывал состояние на секунды старше; 17:45 — пустоту).
-        // Вердикт только по УСТАКАНИВШЕМУСЯ значению: читаем, пока меняется,
-        // максимум 400 мс; совпало — PASS. Стабильно НЕ совпало — отказ.
-        // Пустое значение — поле не отдаёт текст: вслепую по памяти (паритет C#,
-        // порядок cghid гарантирует исполнение после накопленных клавиш)
-        var last = screenTailForInjectionTail(expectedTail)
-        if last.matches { return (true, true, last.actual) }
-        var stableCount = 0
-        // бюджет ~0.3 с: ретраи на тап-потоке — длиннее окно = лаг печати юзера
-        // и риск tapDisabled (дефект аудита №7: худший случай 1.4 с)
-        for _ in 0..<2 {
-            usleep(60_000)
-            let next = screenTailForInjectionTail(expectedTail)
-            if next.matches { return (true, true, next.actual) }
-            if !next.available || next.actual.isEmpty { return (false, false, next.actual) }
-            if next.actual == last.actual {
-                stableCount += 1
-                if stableCount >= 1 { return (true, false, next.actual) } // устаканилось и НЕ совпало
-            } else {
-                stableCount = 0
-            }
-            last = next
-        }
-        return (true, false, last.actual) // 400 мс менялось и не совпало — отказ
-    }
-
-    /// Хвост совпадает, если поле кончается им — с опциональным последним
-    /// сепаратором (пробел): trailing-space трим редакторов не должен
-    /// ломать гейт, но ЛЮБЫЕ иные расхождения — отказ
-    private func screenTailForInjectionTail(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
-        let gate = screenTailAtCaret(expectedTail)
-        if gate.matches { return gate }
+    private func screenTailWithOptionalTrimmedSpace(_ expectedTail: String, timeout: TimeInterval) -> (available: Bool, matches: Bool, actual: String) {
+        let gate = screenTailAtCaretOnMain(expectedTail, timeout: timeout)
+        if gate.matches || !gate.available { return gate }
         if expectedTail.hasSuffix(" ") {
             let trimmed = String(expectedTail.dropLast())
-            let g2 = screenTailAtCaret(trimmed)
-            if g2.matches {
-                logLine("verify: хвост без триммого пробела — принят")
-                return (g2.available, true, g2.actual)
-            }
-            return (g2.available, false, g2.actual)
+            let g2 = screenTailAtCaretOnMain(trimmed, timeout: timeout)
+            if g2.matches { return (g2.available, true, g2.actual) }
         }
         return gate
     }
 
-    /// Хвост у каретки по экрану (AX): совпадает ли с тем, что собираемся стереть.
-    /// AX-запросы допустимы только с main: с потока тапа — семафорный заход на main
-    /// (main нигде не ждёт поток тапа — deadlock невозможен). available=false —
-    /// значение фокусного элемента не читается (не AX-текст / нет доступа).
-    private func screenTailAtCaret(_ expectedTail: String) -> (available: Bool, matches: Bool, actual: String) {
-        var available = false
-        var matches = false
-        var actual = ""
+    private final class TailCheckBox {
+        private let lock = NSLock()
+        private var available = false
+        private var matches = false
+        private var actual = ""
+        func set(available: Bool, matches: Bool, actual: String) {
+            lock.lock()
+            self.available = available
+            self.matches = matches
+            self.actual = actual
+            lock.unlock()
+        }
+        func get() -> (available: Bool, matches: Bool, actual: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (available, matches, actual)
+        }
+    }
+
+    private final class SelectedTextBox {
+        private let lock = NSLock()
+        private var value: String? = nil
+        func set(_ v: String?) { lock.lock(); value = v; lock.unlock() }
+        func get() -> String? { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    /// Читает текст до каретки на `main`. Если каретка не читается (`caret == nil`) или
+    /// активно выделение (`hasSelection == true` при ожидании каретки), НЕ подставляет
+    /// конец всего документа, чтобы никогда не стереть середину чужого абзаца.
+    private func screenTailAtCaretOnMain(_ expectedTail: String, timeout: TimeInterval = 0.08) -> (available: Bool, matches: Bool, actual: String) {
+        let box = TailCheckBox()
         let read = {
             guard let focused = PasswordGuard.focusedTextAndCaret() else { return }
-            let (text, caret) = focused
-            // позиция каретки приходит в UTF-16-единицах значения — режем по ним же
-            let before: String
-            if let c = caret, c >= 0, c <= text.utf16.count {
-                before = String(decoding: text.utf16.prefix(c), as: UTF16.self)
-            } else {
-                before = text // каретка не читается — считаем её в конце поля
+            let (text, caret, hasSelection) = focused
+            if hasSelection {
+                box.set(available: true, matches: false, actual: "<selection>")
+                return
             }
-            available = true
-            actual = String(before.suffix(expectedTail.count + 4))
-            matches = before.hasSuffix(expectedTail)
+            // Если каретка не отдана элементом — достоверно проверить точку вставки нельзя:
+            // возвращаем available=false вместо ложного предположения «курсор в конце текста».
+            guard let c = caret, c >= 0, c <= text.utf16.count else { return }
+            let before = String(decoding: text.utf16.prefix(c), as: UTF16.self)
+            let act = String(before.suffix(expectedTail.count + 4))
+            box.set(available: true, matches: before.hasSuffix(expectedTail), actual: act)
         }
         if Thread.isMainThread {
             read()
@@ -1616,10 +1611,24 @@ public final class Engine {
                 read()
                 sem.signal()
             }
-            _ = sem.wait(timeout: .now() + 0.2)
+            _ = sem.wait(timeout: .now() + timeout)
         }
-        return (available, matches, actual)
+        return box.get()
     }
+
+    private func selectedTextOnMain(timeout: TimeInterval = 0.08) -> String? {
+        if Thread.isMainThread { return PasswordGuard.selectedText() }
+        let box = SelectedTextBox()
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            box.set(PasswordGuard.selectedText())
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + timeout)
+        return box.get()
+    }
+
+    // ------------------------------------------------------------------ переключение раскладки
 
     public func switchToLanguage(_ lang: Int) {
         performOnTapThread { [weak self] in self?.switchToLanguageOnTap(lang) }
@@ -1627,7 +1636,7 @@ public final class Engine {
 
     private func switchToLanguageOnTap(_ lang: Int) {
         updateForeground()
-        prevSingle = nil // юзер выбрал язык явно — букву до переключения не трогаем
+        prevSingle = nil
         guard let target = LayoutService.findLayoutByLang(lang) else {
             fireInfo(lang == 0 ? "Русская раскладка не найдена" : "Английская раскладка не найдена")
             return
@@ -1635,10 +1644,9 @@ public final class Engine {
         switchLayoutOnMain(target, source: "switch-to-lang")
         verifySwitch(target: target)
         expectLayout(target)
-        lockAutoSwitch()
-        gapActive = true; gapLayout = target; gapBuf.removeAll()
-        gapDeadline = Engine.ms() + 0.8
-        armGapFlushTimer()
+        lockAutoSwitch(lang: lang)
+        noFlipUntil = Engine.ms() + 1.5
+        armGap(for: target)
         fireInfo(lang == 0 ? "РУС" : "ENG")
     }
 
@@ -1650,44 +1658,70 @@ public final class Engine {
         updateForeground()
         prevSingle = nil
         let layouts = LayoutService.getLayouts()
-        guard let curID = LayoutService.currentLayout()?.id,
+        guard let curID = effectiveCurrentLayout()?.id,
               let other = layouts.first(where: { $0.id != curID }) else { return }
         let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
-        let name = LanguageTables.langOf(LayoutService.render(other, probe)) == 0 ? "РУС" : "ENG"
+        let lang = LanguageTables.langOf(LayoutService.render(other, probe))
+        let name = lang == 0 ? "РУС" : "ENG"
         switchLayoutOnMain(other, source: "switch-other")
         verifySwitch(target: other)
         expectLayout(other)
-        lockAutoSwitch()
-        gapActive = true; gapLayout = other; gapBuf.removeAll()
-        gapDeadline = Engine.ms() + 0.8
-        armGapFlushTimer()
+        lockAutoSwitch(lang: lang)
+        noFlipUntil = Engine.ms() + 1.5
+        armGap(for: other)
         fireInfo("Раскладка: \(name)")
     }
 
-    /// Попытка конвертации слова (порт TryConvertWord).
+    // ------------------------------------------------------------------ защита регистра / кода
+
+    /// Есть ли переход `строчная -> ЗАГЛАВНАЯ` внутри слова (`JoeSnow`, `iPhone`, `macOS`, `OpenSwitcher`).
+    /// Учитывает `shift != caps`. Быстрое зажатие Shift на первых двух буквах (`GHbdtn`)
+    /// перехода `lower -> UPPER` НЕ имеет и продолжает конвертироваться нормально.
+    public static func hasCamelCaseTransition(_ keys: [KeyRec]) -> Bool {
+        guard keys.count >= 2 else { return false }
+        // P2-3: инвертированный CapsLock ('gHBDTN' -> 'пРИВЕТ': Caps ON + Shift только на первой букве) —
+        // это случайный сбой регистра, а не camelCase-идентификатор
+        if keys[0].caps && keys[0].shift && keys.dropFirst().allSatisfy({ !$0.shift && $0.caps }) {
+            return false
+        }
+        var prevUpper = keys[0].shift != keys[0].caps
+        for i in 1..<keys.count {
+            guard KeyCodeMap.letters[keys[i].code] != nil ||
+                  KeyCodeMap.signLetterKeys[keys[i].code] != nil ||
+                  keys[i].code == KeyCodeMap.backslash else {
+                continue
+            }
+            let curUpper = keys[i].shift != keys[i].caps
+            if !prevUpper && curUpper { return true }
+            prevUpper = curUpper
+        }
+        return false
+    }
+
+    /// Аббревиатура `ALL_CAPS`, набранная с зажатым Shift (при выключенном CapsLock), 2..5 букв:
+    /// `TV`, `PR`, `UI`, `API`, `SDK`, `VIP`, `SQL` — не трогаем автоконвертацией.
+    public static func isAllCapsAcronym(_ keys: [KeyRec]) -> Bool {
+        guard keys.count >= 2 && keys.count <= 5 else { return false }
+        return keys.allSatisfy { $0.shift && !$0.caps && KeyCodeMap.letters[$0.code] != nil }
+    }
+
+    // ------------------------------------------------------------------ авто-конвертация слова
+
     private func tryConvertWord(_ word: [KeyRec], resendKey: Int, resendShift: Bool, manual: Bool) -> Bool {
-        var why: String? = nil
-        if s.paused { why = "paused" }
-        else if word.count < 2 {
-            // сама буква в логе: без неё не отличить законное «в» от брошенного 'f' перед 'ns'->'ты'
-            let letter = word.count == 1 ? (LayoutService.currentLayout().map { " '\(LayoutService.render($0, word))'" } ?? "") : ""
-            why = "too-short (\(word.count)\(letter))"
+        if s.paused { logLine("convert skip: paused"); return false }
+        if word.count < 2 {
+            let letter = word.count == 1 ? (effectiveCurrentLayout().map { " '\(LayoutService.render($0, word))'" } ?? "") : ""
+            logLine("convert skip: too-short (\(word.count)\(letter))")
+            return false
         }
-        else if !manual && s.lockAutoAfterManualSwitch && autoLocked {
-            // ЛИМИТ ЖИЗНИ ЛОКА — 10 с (бой 18:24 01.11: юзер тапнул раскладку ради
-            // 'bb', через 36 с набрал 'ye ghjdthzq' как русский текст — лок без
-            // срока молчал всё это время; экспирация была только в resetSession,
-            // т.е. никогда, пока юзер в том же поле). Замысел 8cf7674: лок прикрывает
-            // СРАЗУ предстоящий ввод (поле пароля и т.п.), а не весь сеанс в поле
-            if Engine.ms() - autoLockedAt >= 10 {
-                autoLocked = false
-                logLine("lock expired (10s) — авто-детект снова работает")
-            } else { why = "locked" }
+        if !manual && PasswordGuard.isSecureFocused {
+            logLine("convert skip: password field")
+            return false
         }
-        // Поле пароля (AXSecureTextField): конвертации там нет ВОВСЕ — буквы
-        // невидимы, любой флип раскладки посреди ввода ломает пароль целиком
-        else if !manual && PasswordGuard.isSecureFocused { why = "password field" }
-        if let why = why { logLine("convert skip: \(why)"); return false }
+        if !manual && wordTainted {
+            logLine("convert skip: tainted token (code/digits/path)")
+            return false
+        }
 
         updateForeground()
         if isExcludedHere() { logLine("convert skip: excluded app"); return false }
@@ -1696,69 +1730,118 @@ public final class Engine {
         if layouts.count < 2 { logLine("convert skip: one layout"); return false }
         let cands = LayoutService.renderAll(word, layouts)
 
-        guard let curID = LayoutService.currentLayout()?.id,
-              let cur = cands.first(where: { $0.layoutID == curID }) else {
-            logLine("convert skip: cur unknown"); return false
-        }
-        if cur.lang < 0 { logLine("convert skip: cur unknown lang"); return false }
-
-        // РАСКЛАДКА СМЕНИЛАСЬ ПОСРЕДИ СЛОВА (бой 00:19 05.11 'момогу': «могу»
-        // набрано в РУ, раскладка перевернулась — движок пересчитал буфер в EN,
-        // конверт продублировал готовое слово). Смешанное слово конвертить нельзя:
-        // рендер буфера одной раскладкой врёт. Ручной путь — мимо (юзер настаивает)
-        if !manual, let startID = wordStartLayoutID, startID != cur.layoutID {
-            logLine("convert skip: раскладка сменилась посреди слова (старт '\(startID.prefix(8))' -> текущая '\(cur.layoutID.prefix(8))')")
+        guard let curID = effectiveCurrentLayout()?.id,
+              let cur = cands.first(where: { $0.layoutID == curID }),
+              cur.lang >= 0 else {
+            logLine("convert skip: cur unknown")
             return false
+        }
+
+        if !manual, let startID = wordStartLayoutID, startID != cur.layoutID {
+            logLine("convert skip: раскладка сменилась посреди слова")
+            return false
+        }
+
+        // Защита camelCase/PascalCase (JoeSnow, OpenSwitcher); ALL_CAPS проверяем ниже после анализа цели (P2-3)
+        if !manual {
+            if Self.hasCamelCaseTransition(word) {
+                logLine("convert skip: camelCase ('\(cur.text)')")
+                return false
+            }
         }
 
         let typedLow = cur.text.lowercased()
         learnedLock.lock()
-        let isRejected = !manual && rejected.contains(typedLow)
+        let isRejectedWord = !manual && rejected.contains(typedLow)
         let acceptedWord = !manual && accepted.contains(typedLow)
         learnedLock.unlock()
-        if isRejected {
+
+        if isRejectedWord {
             logLine("convert skip: learned-rejected '\(cur.text)'")
             return false
         }
 
         guard let best = cands.filter({ $0.layoutID != curID && $0.lang >= 0 }).max(by: { $0.score < $1.score }) else {
-            logLine("convert skip: no candidate"); return false
+            logLine("convert skip: no candidate")
+            return false
         }
 
-        // РУ->EN авто-переворот коротких (<5 букв): до 3 букв — всегда нет
-        // («ща», «рф» — правильный русский, EN-прочтение 'of'/'ha' — мусор).
-        // 3-4 буквы — отказ только если набранное ПРАВИЛЬНОЕ русское («еще», «она»);
-        // мусор вроде 'кфп' конвертится в словарную EN-цель ('rag', 'git') — гейт
-        // целиком блокировал класс коротких EN-слов (бой 03:19:46). Цель без словаря
-        // отсечётся главным правилом ниже. Порт C# (гейт расслаблен, 28.09).
+        // Умный лок после ручного переключения раскладки:
+        // Первое слово после тапа Shift защищено на 100% (пароли, ники, одиночные вставки).
+        // На последующих словах (autoLockedWordsTyped >= 1), если юзер забыл переключиться обратно
+        // и набрал >= 4 букв явного слова другого языка (цель в основном словаре, а набранное
+        // биграммно невозможно в текущем языке: 'cfqn'->'сайт', 'ghbdtn'->'привет') — снимаем лок.
+        if !manual && s.lockAutoAfterManualSwitch && autoLocked {
+            let elapsed = Engine.ms() - autoLockedAt
+            if elapsed >= 10.0 {
+                autoLocked = false
+                autoLockedLang = -1
+                autoLockedWordsTyped = 0
+                logLine("lock expired (10s)")
+            } else {
+                let bestCore = LanguageTables.lettersOnly(best.text)
+                let curCore = LanguageTables.lettersOnly(cur.text)
+                let unambiguousForgotSwitch = autoLockedWordsTyped >= 1
+                    && word.count >= 4
+                    && WordDict.hasCore(bestCore, best.lang)
+                    && !WordDict.has(curCore, cur.lang)
+                    && !LanguageTables.possibleWord(curCore, cur.lang)
+                if unambiguousForgotSwitch {
+                    autoLocked = false
+                    autoLockedLang = -1
+                    autoLockedWordsTyped = 0
+                    logLine("auto-unlock: unambiguous wrong-layout word '\(cur.text)' -> '\(best.text)'")
+                } else {
+                    logLine("convert skip: locked")
+                    return false
+                }
+            }
+        }
+
+        // Порог минимальной длины (s.minWordLen, по умолчанию 3) + закрытый белый список частых 2-буквенных слов
+        if !manual && !acceptedWord && word.count < s.minWordLen {
+            let allowedEnd: Bool
+            if (resendKey == KeyCodeMap.space || resendKey == KeyCodeMap.enter) && !resendShift {
+                allowedEnd = true
+            } else if resendKey != 0 {
+                allowedEnd = (resendKey == KeyCodeMap.comma || resendKey == KeyCodeMap.period ||
+                              (resendShift && resendKey == 0x12 /* 1 = ! */) ||
+                              (resendShift && (resendKey == 0x1A /* 7 = ? */ || resendKey == KeyCodeMap.slash /* ? */)) ||
+                              resendKey == KeyCodeMap.semicolon || resendKey == KeyCodeMap.quote)
+            } else {
+                allowedEnd = false
+            }
+            let bestCore = LanguageTables.lettersOnly(best.text)
+            if !(word.count == 2 && wordStartClean && allowedEnd &&
+                 WordDict.isAllowedTwoLetterAuto(curText: cur.text, bestCore: bestCore, curLang: cur.lang, bestLang: best.lang)) {
+                logLine("convert skip: below minWordLen ('\(cur.text)' -> '\(best.text)')")
+                return false
+            }
+        }
+
+        let curCoreLetters = LanguageTables.lettersOnly(cur.text)
+        // РУ -> EN короткие слова
         if !manual && !acceptedWord && cur.lang == 0 && best.lang == 1 && word.count < 5 &&
-            (word.count < 3 || WordDict.has(cur.text, 0)) {
+            (word.count < 3 || WordDict.has(curCoreLetters, 0)) {
             logLine("convert skip: ru->en short ('\(cur.text)' -> '\(best.text)')")
             return false
         }
 
-        // РУ->EN: набранное — правильное русское (словарь ИЛИ морфология 55k-корпуса)
-        // => EN-прочтение не рассматривается вовсе. Порт C# 81ae150, расширенный со
-        // словаря на possibleWord: «ебаная», «говно», «твого» вне словаря, но это
-        // явно русский текст — скачировать их против EN-мусора — мина (бой 00:39)
+        // РУ -> EN защита любого реального/возможного русского слова
         if !manual && !acceptedWord && cur.lang == 0 && best.lang == 1 &&
-            (WordDict.has(cur.text, 0) || LanguageTables.possibleWord(cur.text, 0)) {
+            (WordDict.has(curCoreLetters, 0) || LanguageTables.possibleWord(curCoreLetters, 0)) {
             logLine("convert skip: ru->en real ('\(cur.text)' -> '\(best.text)')")
             return false
         }
 
-        // Кулдаун после ручной правки — первым делом (v3 §6.2)
         if !manual && !acceptedWord && Engine.ms() < noFlipUntil {
-            logLine("convert skip: cool-down after manual fix")
+            logLine("convert skip: cool-down")
             return false
         }
 
         var bestText = best.text
-        var fuzzyNeighbor: (neighbor: String, dist: Int)? = nil // умный режим: цель ≈ словарное слово на дистанции 1-2
+        var fuzzyNeighbor: (neighbor: String, dist: Int)? = nil
         if !manual && !acceptedWord {
-            // хвостовая клавиша-«двойник» (б/ю/ж/э в конце слова): пробуем трактовать её
-            // как ЗНАК — «ghbdtn,» должно стать «привет,», а не «приветб». Если
-            // прочтение со знаком валиднее (словарь/морфология) — целимся в него (v3 §5.10)
             if let lastKey = word.last, word.count > 1, KeyCodeMap.isPunctTwinKey(lastKey.code),
                bestText.count > 1, let pc = KeyCodeMap.punctCharOfKey(lastKey.code) {
                 let alt = String(bestText.dropLast()) + String(pc)
@@ -1768,24 +1851,12 @@ public final class Engine {
                     (altCore.count >= 3 && LanguageTables.possibleWord(altCore, best.lang))
                 let baseValid = WordDict.has(baseCore, best.lang) ||
                     (baseCore.count >= 3 && LanguageTables.possibleWord(baseCore, best.lang))
-                // словарное слово+знак сильнее несловарного «возможного» с лишней буквой
-                // ('nt,z.' -> «тебя.», а не «тебяю»; порт C#, бой 02.10 19:08:53)
                 let altDict = WordDict.has(altCore, best.lang), baseDict = WordDict.has(baseCore, best.lang)
                 if altValid && (!baseValid || (altDict && !baseDict)) { bestText = alt }
             }
             let core = LanguageTables.lettersOnly(bestText)
-            // цель: словарное слово ИЛИ «возможное» слово языка от 3 букв (v3 §5.11)
             if !WordDict.has(core, best.lang) &&
                 (core.count < 3 || !LanguageTables.possibleWord(core, best.lang)) {
-                // УМНЫЙ РЕЖИМ (решение владельца 01.11): цель — словарное слово с
-                // опечаткой в 1-2 буквы (только замены: 'смоьри' ≈ 'смотри' —
-                // dist1, бой 17:29 'cvjmhb'; 'првиет' ≈ 'привет' — dist2, смежная
-                // транспозиция), набранное — глубокий мусор своего языка (не
-                // словарное И по биграммам невозможное: 'hellp' — possibleWord,
-                // это опечатка EN-слова и НЕ трогается). Переворот всё равно,
-                // буквы сохраняются как набраны — опечатку правит юзер. Защита
-                // от «погрешности»: dist1 от 4 букв, dist2 от 6; маржа скора —
-                // 1x для dist1, 2x для dist2 (margin-гейт ниже)
                 let curCore = LanguageTables.lettersOnly(cur.text)
                 if core.count >= 4,
                    !WordDict.has(curCore, cur.lang),
@@ -1800,9 +1871,6 @@ public final class Engine {
             }
         }
 
-        // форма цели (v3 §5.11): только буквы ИЛИ буквы + ОДИН знак в конце. Знак ВНУТРИ
-        // ('et,e' из русского слова с «б») — мусор всегда, и для выученных пар: старая
-        // проверка вычитала длину букв и пропускала знак в середине (порт C#, бой 02.10)
         if !manual && !Engine.targetShapeOk(bestText) {
             logLine("convert skip: target-not-letters ('\(bestText)')")
             return false
@@ -1812,44 +1880,63 @@ public final class Engine {
                                                 bestText: bestText, bestLang: best.lang, bestScore: best.score,
                                                 sensitivity: s.sensitivity)
         if !pass && acceptedWord && bestText == LanguageTables.lettersOnly(bestText) {
-            pass = true // цель — только буквы (v3 §5.13)
+            pass = true
         }
 
-        if !pass && !acceptedWord && WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) && !WordDict.has(cur.text, cur.lang) {
+        let bestCore = LanguageTables.lettersOnly(bestText)
+        let curCore = LanguageTables.lettersOnly(cur.text)
+
+        // P2-3: аббревиатуры (TV, API, SQL) защищаем, НО русские слова в ALL_CAPS без английских
+        // гласных (XNJ -> ЧТО, YTN -> НЕТ, GJRF -> ПОКА) разрешаем к автоконвертации
+        if !manual && cur.lang == 1 && Self.isAllCapsAcronym(word) {
+            let hasEnVowel = curCore.lowercased().contains(where: { "aeiou".contains($0) })
+            let isRuCapsWord = word.count >= 3 && best.lang == 0 && !hasEnVowel &&
+                fuzzyNeighbor == nil && !WordDict.has(curCore, 1) && WordDict.hasCore(bestCore, 0)
+            if !isRuCapsWord {
+                logLine("convert skip: all-caps acronym ('\(cur.text)')")
+                return false
+            }
+            logLine("convert: ru all-caps word ('\(cur.text)' -> '\(bestText)')")
+        }
+
+        if !manual && !acceptedWord && cur.lang == 1 && Engine.isDomainOrFileName(cur.text) {
+            logLine("convert skip: domain/filename ('\(cur.text)')")
+            return false
+        }
+
+        // P0-2: Защита английских слов со знаками препинания ("here.", "it.", "her,", "keys.", "vs."):
+        // если набранное английское ядро — валидное слово в словаре, не переключаем на русский
+        if !manual && !acceptedWord && cur.lang == 1 && best.lang == 0 && WordDict.has(curCore, 1) {
+            logLine("convert skip: en-word with punctuation ('\(cur.text)' -> '\(bestText)')")
+            return false
+        }
+
+        if !manual && !acceptedWord && cur.lang == 1 && cur.text.contains("-") {
+            let parts = cur.text.split(separator: "-")
+            if parts.count >= 2 && parts.allSatisfy({ WordDict.has(String($0), 1) }) {
+                logLine("convert skip: en compound word ('\(cur.text)')")
+                return false
+            }
+        }
+
+        // dict-over-score разрешён ТОЛЬКО для чистого основного словаря (hasCore),
+        // чтобы шум из 350k субтитров (Huge) не пробивал скоринг в одиночку
+        if !pass && !acceptedWord && WordDict.hasCore(bestCore, best.lang) && !WordDict.has(curCore, cur.lang) {
             pass = true
             logLine("convert: dict-over-score ('\(cur.text)' -> '\(bestText)')")
         }
 
-        // ЗНАК-ДВОЙНИК ВНУТРИ НАБРАННОГО ('buhf.cm': '.' — это «ю» в RU): в настоящем
-        // английском точка/запятая/апостроф внутри «слова» почти невозможна — это
-        // русский текст с б/ю/ж/э, набранный в EN-раскладке (Caramba: «невозможность
-        // знака»). Цель чисто буквенная и возможная по корпусу → конвертим без словаря
-        // и без запаса скора. НО НЕ если буквенное ядро — настоящее EN-слово:
-        // 'twitter,' — это слово+запятая, а не русский текст с «б» на конце.
-        // Порт C# (d7470ab; порог 5 букв — 38aada3: короткие четвёрки-мусоры
-        // биграммами больше не спасаются). ПРАВИЛО ОТСУТСТВОВАЛО В МАКЕ — найдено
-        // сравнением с Windows 01.11
-        let bestCore = LanguageTables.lettersOnly(bestText)
         if !pass && !acceptedWord && cur.lang == 1 && best.lang == 0 &&
             cur.text.contains(where: { ",.;'".contains($0) }) &&
             bestText == bestCore &&
             LanguageTables.possibleWord(bestCore, 0) &&
-            !WordDict.has(LanguageTables.lettersOnly(cur.text), 1) &&
+            !WordDict.has(curCore, 1) &&
             bestCore.count >= 5 {
             pass = true
             logLine("convert: punct-twin signal ('\(cur.text)' -> '\(bestText)')")
         }
 
-        // цель не словарная (только «возможная» по биграммам): авто-переворот
-        // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
-        // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
-        // Словарные цели — обычный порог, выученные — без порога
-        // (порт C# 2fc5eaf «По бою 18:45»; прежний порт с single-margin
-        // «both-not-in-dict» опечаточный мусор пропускал)
-        if pass && !acceptedWord &&
-            !WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) {
-            // словарная цель — обычный порог; умный режим: dist1 — 1x (сильный
-            // сигнал), dist2 — 2x (слабее — полный запас несловарной цели)
+        if pass && !acceptedWord && !WordDict.has(bestCore, best.lang) {
             let need = ((fuzzyNeighbor?.dist ?? 2) == 1 ? 1 : 2) * LanguageTables.baseMargin / max(0.3, s.sensitivity)
             if best.score - cur.score < need {
                 logLine("convert skip: non-dict margin ('\(cur.text)' -> '\(bestText)')")
@@ -1857,10 +1944,7 @@ public final class Engine {
             }
         }
 
-        // последнее предохранительное: набранное — частое слово, цель — нет:
-        // не трогаем (выученные пары не проверяем — юзер настоял) (C#:1213-1220)
-        if pass && !acceptedWord && WordDict.has(cur.text, cur.lang) &&
-            !WordDict.has(LanguageTables.lettersOnly(bestText), best.lang) {
+        if pass && !acceptedWord && WordDict.has(curCore, cur.lang) && !WordDict.has(bestCore, best.lang) {
             logLine("convert skip: cur-in-dict, target-not ('\(cur.text)' -> '\(bestText)')")
             return false
         }
@@ -1869,8 +1953,12 @@ public final class Engine {
             return false
         }
 
-        // ретро-флип одиночной буквы перед словом ('f␣ns' -> «а ты», порт C#): только авто-замена
-        // по разделителю/Enter, буква набрана в той же раскладке и приложении, ровно один пробел
+        if Engine.ms() - lastPasteAt < 0.35 {
+            logLine("convert skip: paste settle window")
+            return false
+        }
+
+        // Ретро-флип одиночной буквы перед словом ('f␣ns' -> «а ты»)
         var retroFrom: String? = nil, retroTo = ""
         if !manual && resendKey != 0, let ps = prevSingle, prevSingleApp == fgApp,
            prevSingleLayoutID == cur.layoutID,
@@ -1878,267 +1966,139 @@ public final class Engine {
            let bestL = layouts.first(where: { $0.id == best.layoutID }) {
             let pCur = LayoutService.render(curL, ps)
             let pBest = LayoutService.render(bestL, ps)
-            if Engine.retroFlipLetterOk(pCur, cur.lang, pBest, best.lang) { retroFrom = pCur; retroTo = pBest }
-            else { logLine("retro-flip skip: '\(pCur)' -> '\(pBest)' (not a one-letter word pair)") }
+            if Engine.retroFlipLetterOk(pCur, cur.lang, pBest, best.lang) {
+                retroFrom = pCur
+                retroTo = pBest
+            }
         }
         prevSingle = nil
-        let retroPrefix = retroFrom.map { $0 + " " } ?? ""   // 'f␣' — как набрано
-        let retroText = retroFrom != nil ? retroTo + " " : "" // «а␣» — чем заменяем
-        let retroLog = retroFrom != nil ? " (+retro '" + (retroFrom ?? "") + "' -> '" + retroTo + "')" : ""
+        let retroPrefix = retroFrom.map { $0 + " " } ?? ""
+        let retroText = retroFrom != nil ? retroTo + " " : ""
+        let retroLog = retroFrom != nil ? " (+retro '\(retroFrom!)' -> '\(retroTo)')" : ""
 
-        // ГЕЙТ ПО ЭКРАНУ перед стиранием (регулярные стирания слов у юзера, бой
-        // 23.10 23:20): память мак-тапа расходится с реальным вводом (события
-        // теряются), и вслепую посчитанные backspace'ы стирают соседние слова
-        // НАСОВСЕМ. Сверяем хвост у каретки с тем, что собираемся стереть;
-        // не совпало — отказ без инжекции: слово остаётся как набрано, разделитель
-        // доставится обычным путём (converted=false), юзер перевернёт руками.
-        // Экран не читается (AX молчит) — инжектируем как раньше (паритет C#).
-        // свежая Cmd+V-вставка: поле ещё асинхронно коммитит её — стирание
-        // сейчас гонится с недообработанным текстом (бой 02:54). Честный
-        // отказ: слово как набрано, переворот позже руками
-        if Engine.ms() - lastPasteAt < 0.4 {
-            logLine("convert skip: свежая вставка (paste race) — поле ещё коммитит")
-            return false
-        }
-        // Гейт на авто-пути — СОВЕТНИК, не блокиратор (бой 04:25: 'ltkfq' прошёл
-        // все ворота, но AX bb отдал протухший снимок 'лаю?' — отказ на ровном
-        // месте; при том все клавиши слова видел тап, вставок не было, инжекция
-        // идёт в общей очереди после накопленных клавиш — модель C#, где экрана
-        // нет вовсе и стираний не бывало). Совпало — подтверждение в лог;
-        // протух/не совпал — идём по памяти движка, урон ловят DAMAGE-пробы
+        let curLayoutObj = layouts.first(where: { $0.id == cur.layoutID })
+        let bestLayoutObj = layouts.first(where: { $0.id == best.layoutID })
+        let sepText = (resendKey != 0 && resendKey != KeyCodeMap.enter)
+            ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift, layout: curLayoutObj) : ""
+        let sentSep = Engine.sepInLayout(resendKey, resendShift, bestLayoutObj, sepText)
+
+        let bsCount = word.count + retroPrefix.count
         let expectedTail = retroPrefix + cur.text
-        let gate = verifyTailForInjection(expectedTail)
-        // Слово УЖЕ на экране в целевом виде (бой 00:19 05.11 'момогу': юзер печатал
-        // «могу» в РУ, раскладка сменилась посреди слова — движок пересчитал буфер
-        // в EN и продублировал готовое слово BS-инжекцией). Устаканившийся экран
-        // показывает best.text = инжекция не нужна, честный отказ
-        if gate.available && !gate.matches && gate.actual == bestText {
-            logLine("convert skip: экран уже показывает '\(bestText)' — слово не в той раскладке только в памяти движка")
-            return false
-        }
-        if gate.available {
-            logLine(gate.matches
-                ? "convert verify: хвост '\(expectedTail)' у каретки подтверждён"
-                : "convert verify: AX протух ('\(gate.actual)') — иду по памяти (ключи отслежены)")
-        } else {
-            logLine("convert verify: экран не читается — инжектирую вслепую (паритет C#)")
-        }
-
-        lastWordSepKey = 0 // ручной/беспраздельный путь: точный force-flip разоружаем (C#:1236)
-        // bs= и app= в лог: сколько символов стирается и КУДА ушла инжекция —
-        // «определил, но не заменил» = целевой процесс не съел инжекцию
-        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey) bs=\(word.count + retroPrefix.count) app=\(fgProc))")
+        logLine("convert OK: '\(cur.text)' -> '\(bestText)'\(retroLog) (resend=\(resendKey) bs=\(bsCount) app=\(fgProc))")
         lastConvertInfo = "'\(retroPrefix)\(cur.text)' -> '\(retroText)\(bestText)'"
         lastWord = word
+        lastWordSepKey = 0
 
-        suppress(0.6)
-        replayArmUntil = Engine.ms() + 0.3 // реплей-детект (фаза 1: BS)
-        replayWordCodes = word.map { $0.code }
-        replayBsSeen = false
-        // ВРАЖДЕБНОЕ ПОЛЕ (2+ удара реплея): BS-инжекция запрещена, конверт через
-        // выделение+вставку (механизм паст-режима, ни одного BS). Сепаратор: слово
-        // уже с ним в поле? Нет — сепаратор только что нажат и проглочен движком:
-        // выделяем слово, вставляем замену+сепаратор, BS не нужен вовсе
-        if fieldBsUnsafe(),
-           let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            logLine("convert: replay-hostile поле — паст-режим ('\(cur.text)' -> '\(bestText)')")
-            suppress(0.3)
-            let from = cur.text, to = bestText
-            // сепаратор проглатывается ради паст-конверта — досылается после вставки.
-            // sepChar — знак как набран (восстановление при отказе); pasteSep — в
-            // раскладке цели (порт sentSep забой-пути: 'проверь'+Shift+7 хотел '?')
-            let sepChar = resendKey == KeyCodeMap.enter ? "\n"
-                : (resendKey != 0 ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : "")
-            let pasteSep = resendKey == KeyCodeMap.enter ? "\n"
-                : Engine.sepInLayout(resendKey, resendShift, bl, sepChar)
-            let w2 = word
-            // выделяется [ретро-префикс+слово] и заменяется ОДНОЙ вставкой
-            // [ретро+цель+сеп]: иначе ретро-буква терялась ('f ns' -> 'f ты'),
-            // а sep отдельным sendUnicode обгонял асинхронный paste-коммит Electron
-            // и вставал ПЕРЕД словом ('jr ' -> ' ок', 'gjxtve' -> ' почему' — метки)
-            let wantSel = retroPrefix + from
-            let pasteText = retroText + to + pasteSep
-            let seq0 = inputSeq, fg0 = fgApp // мы на потоке тапа — снимок без гонки
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                usleep(30_000) // тап-колбэк давно вернулся; >60 мс окно ловит печать юзера
-                // юзер печатает/правит/фокус ушёл — НЕ выделяем: удар по живому
-                // выделению замещает его и стирает слово (бой 02:08 06.11)
-                if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
-                    // сепаратор не досылаем: ввод юзера в полёте, досыл даст двойной
-                    // пробел/вставку в чужое место; слова МОГУТ склеиться — осознанный
-                    // трейдофф (аудит 06.11, дефект 4)
-                    self.logLine("convert paste-abort: юзер печатает/фокус ушёл — выделение не делаю, слово как набрано (сепаратор не досылён: возможна склейка слов)")
-                    return
-                }
-                TextConverter.targetPid = fg0
-                // посимвольное выделение: Opt+Shift+Left гранулируется редактором —
-                // Electron склеивает '85in' одним токеном, а 'contains'-проверка
-                // пускала расширенное выделение под вставку (съедала '85');
-                // Shift+Left×n выделяет ровно ожидаемый хвост, сверка — строгая
-                for _ in 0..<wantSel.count { TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.SHIFT) }
-                usleep(30_000) // дать серии дойти до поля до первого чтения
-                var selOpt = self.selectedTextOnMain()
-                var selNow = selOpt ?? ""
-                var tries = 0
-                var userTyping = false
-                while selNow != wantSel && tries < 2 {
-                    usleep(50_000)
-                    if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
-                        // юзер начал печатать по живому выделению — его удар уже
-                        // заменил выделение; НИ ОДНОЙ клавиши не шлём (Right сдвинул
-                        // бы его каретку, sep встал бы в чужое место — аудит 06.11, дефект 1)
-                        userTyping = true
-                        break
-                    }
-                    selOpt = self.selectedTextOnMain()
-                    selNow = selOpt ?? ""
-                    tries += 1
-                }
-                if userTyping {
-                    self.logLine("convert paste-abort: юзер печатает по выделению — не мешаю (клавиш не шлю)")
-                    return
-                }
-                let already = Engine.pasteSelectionAlreadyTarget(selNow, target: to)
-                guard selOpt != nil, selNow == wantSel || already else {
-                    // остаточное окно гонки (вход-чек был на +30 мс, чтение могло
-                    // опоздать): удар юзера уже заменил выделение — НИ ОДНОЙ клавиши
-                    // (Right сдвинул бы его каретку, sep воткнулся в живой ввод)
-                    if self.pasteTypingAbort(seq0: seq0, fg0: fg0) {
-                        self.logLine("convert paste-refuse: юзер печатает — гашение и сепаратор не шлю, каретка его")
-                        return
-                    }
-                    self.deselectSelectionCaretSafe(selOpt)
-                    if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) } // проглоченный сепаратор возвращаем — слова не склеиваются
-                    self.logLine("convert paste-fallback: выделение '\(selNow.prefix(16))' != '\(wantSel)' — сепаратор дослан, каретка на месте")
-                    return
-                }
-                if already {
-                    self.deselectSelectionCaretSafe(selOpt)
-                    if !sepChar.isEmpty { TextConverter.sendUnicode(sepChar) }
-                    self.logLine("convert paste-fallback: на экране уже '\(to)' (десинк памяти и раскладки) — не переворачиваю, сепаратор дослан")
-                    return
-                }
-                let saved = TextConverter.getClipboardTextOnce() ?? ""
-                TextConverter.setClipboardText(pasteText)
-                TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
-                self.scheduleClipboardRestore(saved)
-                self.screenProbe(expectedAfter: to, removedTail: from)
-                self.logLine("convert paste-fallback OK: '\(from)' -> '\(to)'")
-                self.performOnTapThread { [weak self] in
-                    guard let self = self else { return }
-                    if w2.count > 1 {
-                        self.switchLayoutOnMain(bl, source: "convert")
-                        self.verifySwitch(target: bl)
-                        self.expectLayout(bl)
-                        self.armGapForEngineSwitch(bl)
-                    }
-                    // точка отката: стёрто [ретро+слово], вставлено [ретро+замена+сеп]
-                    // (undoLen — часть ПОСЛЕ префикса: префикс считает undoPrefixLen)
-                    self.undoPending = true
-                    self.undoText = from
-                    self.undoLen = to.count + pasteSep.count
-                    self.undoPrefix = retroPrefix; self.undoPrefixLen = retroText.count
-                    self.undoSepText = sepChar
-                    self.undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
-                    self.undoApp = self.fgApp
-                    self.undoAt = Engine.ms()
-                    self.keysSinceUndoPoint = 0
-                    self.undoTail.removeAll()
-                    self.undoTailBroken = false
-                }
-            }
-            return true
-        }
-        screenProbe(expectedAfter: bestText, removedTail: cur.text)
-        TextConverter.sendBackspaces(word.count + retroPrefix.count)
-        TextConverter.sendUnicode(retroText + bestText)
-        // набранный знак рендерится по СТАРОЙ раскладке — до switchTo (renderKeyChar
-        // читает живую currentLayout) и идёт в точку отката; ДОСЫЛАЕМ его символом
-        // раскладки цели (порт C#): слово набрано не в той раскладке — и знак пальцы жали
-        // под целевую ('проверь' в EN + Shift+7 = '&', хотел '?'; '/' -> '.'; '@' <-> '"')
-        let sepText = (resendKey != 0 && resendKey != KeyCodeMap.enter)
-            ? TextConverter.renderKeyChar(keyCode: resendKey, shift: resendShift) : ""
-        let sentSep = Engine.sepInLayout(resendKey, resendShift, layouts.first(where: { $0.id == best.layoutID }), sepText)
-        if sentSep != sepText { logLine("convert sep: '\(sepText)' -> '\(sentSep)'") }
-        if resendKey != 0 {
-            if resendKey == KeyCodeMap.enter { TextConverter.sendEnter() }
-            else { TextConverter.sendUnicode(sentSep) }
-        }
         if resendKey == KeyCodeMap.space {
-            lastResendSpaceAt = Engine.ms()
-            lastSpaceTextTick = Engine.ms() // окно дедупа двойных пробелов учитывает и досыл
-        }
-        // РАСКЛАДКА НА ЭНТЕРЕ — только для «уверенных» конвертаций (решение
-        // юзера 07.10, порт C#): словарная цель или выученная пара переключают
-        // раскладку на правильную ('chatgpt'-бой: фикс без смены оставлял RU на
-        // следующее слово); мусорные пути без словаря HKL на энтере не трогают
-        let sureFix = acceptedWord || WordDict.has(LanguageTables.lettersOnly(bestText), best.lang)
-        if resendKey != KeyCodeMap.enter || sureFix, let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            switchLayoutOnMain(bl, source: "convert")
-            verifySwitch(target: bl)
-            expectLayout(bl)
-            armGapForEngineSwitch(bl)
+            lastSpaceTextTick = Engine.ms()
         }
 
-        // паритет C# injOk (Engine.cs:1295): без «Универсального доступа» инжекция
-        // (CGEventPostToPid) не применяется — откат не армим (Break стирал бы
-        // РЕАЛЬНЫЕ символы юзера) и замена не заучивается
+        let sureFix = acceptedWord || WordDict.has(bestCore, best.lang)
+        let targetSwitchLayout: LayoutService.LayoutData? = (resendKey != KeyCodeMap.enter || sureFix) ? bestLayoutObj : nil
+        if let bl = targetSwitchLayout {
+            expectLayout(bl)
+            armGap(for: bl)
+        }
+
         let injOk = accessibilityTrusted(prompt: false)
-        if !injOk { logLine("convert warn: accessibility off — undo/learning not armed") }
         undoPending = resendKey != KeyCodeMap.enter && injOk
+        undoFromAuto = !manual
+        autoRejectEligible = !manual && undoPending
+        undoErasedByBs = 0
         undoText = cur.text
-        // undoLen — ВСЁ, что напечатали вместо исходного: цель + досланный знак (он может
-        // отличаться от набранного: '?' вместо '&'); стирание отката считается только по нему
+        undoConvertedTail = retroText + bestText + sentSep
         undoLen = bestText.count + sentSep.count
-        // откат ретро-флипа возвращает и букву: переворот 'f' держался только на слове
         undoPrefix = retroPrefix
         undoPrefixLen = retroText.count
         undoSepText = sepText
-        undoLayout = layouts.first { $0.id == cur.layoutID }
+        undoLayout = curLayoutObj
         undoApp = fgApp
         undoAt = Engine.ms()
         keysSinceUndoPoint = 0
         undoTail.removeAll()
         undoTailBroken = false
 
-        // RU->EN заучиваем ТОЛЬКО в словарную EN-цель (порт C#): ошибочная замена русского
-        // слова, поправленная руками, иначе через 15 с становилась «выученной» навсегда
-        let learnable = cur.lang != 0 || best.lang != 1 ||
-            WordDict.has(LanguageTables.lettersOnly(bestText), 1)
-        if injOk && cur.text.count >= 3 && learnable {
-            // принятие честное: через 15 с, если юзер не откатил (v3 §12)
-            let acceptedTyped = cur.text.lowercased()
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in
-                guard let self = self, !self.isRejected(acceptedTyped) else { return }
-                self.rememberAccepted(acceptedTyped)
+        // Асинхронная инжекция на serial-очереди (0 мс блокировки потока тапа!)
+        inFlightInjections += 1
+        let finalTargetText = bestText
+        injectorQueue.async { [weak self] in
+            guard let self = self else { return }
+            let verdict = self.checkScreenBeforeAutoInject(expectedTail: expectedTail, targetText: finalTargetText)
+            if verdict == .alreadyTarget {
+                self.logLine("convert skip-inject: экран уже показывает '\(finalTargetText)' — досылаю только разделитель")
+                self.performOnTapThread { [weak self] in
+                    self?.undoPending = false
+                    self?.autoRejectEligible = false
+                }
+                if resendKey == KeyCodeMap.enter { TextConverter.sendEnter() }
+                else if !sentSep.isEmpty { TextConverter.sendUnicode(sentSep) }
+            } else {
+                TextConverter.sendBackspaces(bsCount)
+                usleep(25_000) // 25 мс settle: редактор гарантированно коммитит все deleteBackward:
+                TextConverter.sendUnicode(retroText + finalTargetText)
+                if resendKey == KeyCodeMap.enter {
+                    usleep(6_000)
+                    TextConverter.sendEnter()
+                } else if !sentSep.isEmpty {
+                    TextConverter.sendUnicode(sentSep)
+                }
+            }
+            if let bl = targetSwitchLayout {
+                self.switchLayoutOnMain(bl, source: "convert")
+                self.verifySwitch(target: bl)
+            }
+            self.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
             }
         }
 
-        // попап показывает цель с хвостом-знаком (и ретро-буквой)
+        // ВАЖНО: слепая авто-запись в accepted.txt по 15-секундному таймеру УДАЛЕНА —
+        // без клавиши Break на Mac она навсегда цементировала любые случайные срабатывания.
         fireConverted(retroPrefix + cur.text, retroText + bestText)
         return true
     }
 
-    /// Цель авто-замены по форме (порт C# TargetShapeOk): только буквы, либо буквы + ровно
-    /// один знак В КОНЦЕ.
     public static func targetShapeOk(_ t: String) -> Bool {
         let core = LanguageTables.lettersOnly(t)
         if core.isEmpty { return false }
-        return t == core || (t.count == core.count + 1 && t.hasPrefix(core))
+        if t == core || (t.count == core.count + 1 && t.hasPrefix(core)) {
+            return true
+        }
+        // Разрешаем дефисные слова: "какой-то", "из-за", "кто-нибудь" (P1-3)
+        // Но не ведущие/хвостовые дефисы и не двойные дефисы
+        let wordPart = (t.count > 0 && ",.;:!?\"'".contains(t.last!)) ? String(t.dropLast()) : t
+        if wordPart.contains("-") && !wordPart.hasPrefix("-") && !wordPart.hasSuffix("-") && !wordPart.contains("--") {
+            let parts = wordPart.split(separator: "-", omittingEmptySubsequences: false)
+            if parts.count >= 2 && parts.allSatisfy({ !$0.isEmpty && LanguageTables.lettersOnly(String($0)) == String($0) }) {
+                return true
+            }
+        }
+        return false
     }
 
-    /// Знак-разделитель в раскладке цели (порт C# SepInLayout): тот же физический знак, каким
-    /// его задумали пальцы. Сбой/не один символ — оставить набранный typed.
+    public static func isDomainOrFileName(_ text: String) -> Bool {
+        guard text.contains(".") else { return false }
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return false }
+        for (i, p) in parts.enumerated() {
+            if p.isEmpty { return false }
+            if i == parts.count - 1 {
+                if p.count < 1 || p.count > 6 { return false }
+                if !p.allSatisfy({ ($0 >= "a" && $0 <= "z") || ($0 >= "A" && $0 <= "Z") }) { return false }
+            } else {
+                if !p.allSatisfy({ ($0 >= "a" && $0 <= "z") || ($0 >= "A" && $0 <= "Z") || ($0 >= "0" && $0 <= "9") || $0 == "-" || $0 == "_" }) { return false }
+            }
+        }
+        return true
+    }
+
     static func sepInLayout(_ code: Int, _ shift: Bool, _ layout: LayoutService.LayoutData?, _ typed: String) -> String {
         guard !typed.isEmpty, let l = layout, let t = LayoutService.renderKey(l, KeyRec(code, shift, false)),
               t.count == 1 else { return typed }
         return t
     }
 
-    /// Ретро-флип одиночной буквы (§7, порт C# RetroFlipLetterOk): переворачивается, только
-    /// если набранное — НЕ однобуквенное слово своего языка ('f'), а прочтение в языке цели —
-    /// однобуквенное слово (а/и/в/к/о/с/у/я, a/i). «а», «в», 'a', 'i' как набраны — неприкосновенны.
     public static func retroFlipLetterOk(_ typed: String, _ typedLang: Int, _ target: String, _ targetLang: Int) -> Bool {
         return typed.count == 1 && target.count == 1 &&
             typedLang >= 0 && targetLang >= 0 && typedLang != targetLang &&
@@ -2148,19 +2108,27 @@ public final class Engine {
     }
 
     public func toggleAuto() {
-        s.paused.toggle()
-        if !s.paused { autoLocked = false }
-        let paused = s.paused
+        let next = s.clone()
+        next.paused.toggle()
+        if !next.paused {
+            autoLocked = false
+            autoLockedLang = -1
+            autoLockedWordsTyped = 0
+        }
+        let paused = next.paused
+        stateLock.lock()
+        _s = next
+        stateLock.unlock()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            SettingsStore.save(self.s)
-            self.apply(self.s)
+            SettingsStore.save(next)
+            self.apply(next)
         }
         fireInfo(paused ? "Автоисправление выключено" : "Автоисправление включено")
     }
 
-    /// Можно ли откатить последнюю замену прямо сейчас: nil — да, иначе причина
-    /// (порт C# UndoBlockReason; фокус-поля на macOS не отслеживается).
+    // ------------------------------------------------------------------ откат (Undo) и ручной флип
+
     private func undoBlockReason() -> String? {
         if !undoPending { return "nothing pending" }
         if undoTailBroken { return "tail broken" }
@@ -2180,470 +2148,367 @@ public final class Engine {
         }
     }
 
-    /// Отмена последней автозамены (порт UndoLastConversion).
     public func undoLastConversion() {
+        performOnTapThread { [weak self] in self?.undoLastConversionOnTap() }
+    }
+
+    private func undoLastConversionOnTap() {
         if let block = undoBlockReason() {
-            logLine("undo skip: \(block)"); fireInfo(Engine.undoBlockMessage(block)); return
+            logLine("undo skip: \(block)")
+            fireInfo(Engine.undoBlockMessage(block))
+            return
         }
 
-        // префикс — буква ретро-флипа ('а␣' -> 'f␣'): её переворот держался только на слове
-        let bs = undoPrefixLen + undoLen + undoTail.count // undoLen уже с досланным знаком (раньше force-flip считал его дважды и съедал символ перед словом)
+        let bs = undoPrefixLen + undoLen + undoTail.count
         let tailText = undoTail.isEmpty ? "" : (undoLayout.map { LayoutService.render($0, undoTail) } ?? "")
         let restore = undoPrefix + undoText + undoSepText + tailText
-        // гейт по экрану (паритет с флипом/авто-заменой): откат стирает [префикс+слово+
-        // знак+хвост] — до 16+ символов хвоста; при расхождении памяти тапа с полем
-        // вслепую стирал соседние слова. Не совпало — отказ без инжекции
-        let gate = verifyTailForInjection(restore)
-        if gate.available {
-            if gate.matches {
-                logLine("undo verify: хвост '\(restore)' у каретки подтверждён")
-            } else {
-                logLine("undo REFUSED: у каретки '\(gate.actual)' вместо '\(restore)' — стирание по памяти отменено")
-                fireInfo("Откат невозможен — текст у курсора не совпадает")
-                return
-            }
-        } else {
-            logLine("undo verify: экран не читается — откат вслепую (паритет C#)")
-        }
-        suppress(0.6)
-        screenProbe(expectedAfter: restore) // glue-проба недоступна: удалённый (конвертированный) текст строкой не хранится
-        TextConverter.sendBackspaces(bs)
-        TextConverter.sendUnicode(restore)
-        prevSingle = nil
-        if restore.hasSuffix(" ") { lastSpaceTextTick = Engine.ms() } // 'слово␣' — перед кареткой пробел
-        if let ul = undoLayout {
-            switchLayoutOnMain(ul, source: "undo-hotkey")
-            verifySwitch(target: ul)
-            expectLayout(ul)
-        }
-        lockAutoSwitch()
+        let expectedScreenTail = undoConvertedTail + tailText
+        let ul = undoLayout
         let learned = undoText
-        rememberRejected(learned)
-        removeAccepted(learned)
-        fireInfo("Отменено: \(restore) · больше не исправлять")
+        let wasAuto = undoFromAuto
+
+        prevSingle = nil
         undoPending = false
+        autoRejectEligible = false
+
+        inFlightInjections += 1
+        injectorQueue.async { [weak self] in
+            guard let self = self else { return }
+            // P0-7: AX-гейт перед откатом — не стирать чужой текст при рассинхроне каретки
+            if !expectedScreenTail.isEmpty {
+                let gate = self.verifyTailForManualAction(expectedScreenTail)
+                if gate.available && !gate.matches {
+                    self.logLine("undo REFUSED: у каретки '\(gate.actual)' вместо '\(expectedScreenTail)'")
+                    self.fireInfo("У курсора другой текст — отмена пропущена")
+                    self.performOnTapThread { [weak self] in
+                        guard let self = self else { return }
+                        self.inFlightInjections = max(0, self.inFlightInjections - 1)
+                    }
+                    return
+                }
+            }
+            TextConverter.sendBackspaces(bs)
+            usleep(25_000)
+            TextConverter.sendUnicode(restore)
+            if let targetL = ul {
+                self.switchLayoutOnMain(targetL, source: "undo")
+                self.verifySwitch(target: targetL)
+            }
+            if wasAuto {
+                self.rememberRejected(learned)
+                self.removeAccepted(learned)
+            }
+            self.fireInfo(wasAuto ? "Отменено: \(restore) · больше не исправлять" : "Возвращено: \(restore)")
+            self.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.noFlipUntil = Engine.ms() + 5.0
+                if restore.hasSuffix(" ") { self.lastSpaceTextTick = Engine.ms() }
+                if let targetL = ul {
+                    let probe = [KeyRec(KeyCodeMap.ansiCode(ofLatin: "a"), false, false)]
+                    let lang = LanguageTables.langOf(LayoutService.render(targetL, probe))
+                    self.expectLayout(targetL)
+                    self.armGap(for: targetL)
+                    self.lockAutoSwitch(lang: lang)
+                }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
+            }
+        }
     }
 
     public func forgetAllWords() {
         learnedLock.lock()
-        defer { learnedLock.unlock() }
         rejected.removeAll()
         accepted.removeAll()
-        try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: SettingsStore.dir + "/learned.txt", contents: nil)
-        FileManager.default.createFile(atPath: SettingsStore.dir + "/accepted.txt", contents: nil)
+        learnedLock.unlock()
+        ioQueue.async {
+            try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: self.learnedPath, contents: nil)
+            FileManager.default.createFile(atPath: self.acceptedPath, contents: nil)
+        }
         fireInfo("Память слов очищена")
     }
 
     public func doFixLastWord() {
+        performOnTapThread { [weak self] in self?.doFixLastWordOnTap() }
+    }
+
+    private func doFixLastWordOnTap() {
         updateForeground()
-        if keysSinceUndoPoint == 0 && !lastWord.isEmpty {
-            logLine("fix-last-word: exact path")
-            let word = lastWord
-            if !tryConvertWord(word, resendKey: 0, resendShift: false, manual: true) {
-                fireInfo("Раскладка уже верная")
-            }
+        if buf.count >= 1 {
+            _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true, skipLearn: false)
+            buf.clear()
             return
         }
-        logLine("fix-last-word: select-left path (keysSince=\(keysSinceUndoPoint))")
-        // выделяем слово слева от каретки (Option+Shift+Left) и конвертируем как выделение
+        if !lastWord.isEmpty && lastWordSepKey != 0 && lastWordApp == fgApp &&
+            (Engine.ms() - lastWordAt) < 10 && lastBsAt <= lastWordAt {
+            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift,
+                                 skipRejected: true, skipLearn: false)
+            return
+        }
+        logLine("fix-last-word: select-left path")
         TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.ALT | HK.SHIFT)
         beginFixSelection(fromFixWord: true)
     }
 
-
-    enum PasteFlipResult { case accepted, refuse, fallbackBs }
-
-    private var pasteFlipInFlight = false
-
-    /// План паст-флипа: решаем СИНХРОННО (буквы, AX-читаемость, повторный тап),
-    /// исполняем АСИНХРОННО. КРИТИЧНО: всё, что постится из тап-колбэка,
-    /// доставляется приложению только ПОСЛЕ возврата колбэка — забоям всё равно
-    /// (fire-and-forget), а флоу «выдели→проверь→вставь» обязан ждать эффект,
-    /// т.е. обязан работать вне колбэка (самотест 02:48/02:51: выделение
-    /// прочиталось пустым при живом комбо). Слово слева = Option+Shift+Left
-    /// (Cmd+Shift+Left — «до начала строки», самотест 02:45)
-    private func pasteFlipWordPlan(_ cur: LayoutCandidate, _ best: LayoutCandidate,
-                                   _ word: [KeyRec], _ layouts: [LayoutService.LayoutData],
-                                   _ skipLearn: Bool, trailSepKey: Int, trailSepShift: Bool) -> PasteFlipResult {
-        let from = cur.text, to = best.text
-        if pasteFlipInFlight {
-            logLine("paste-flip refuse: предыдущий ещё выполняется")
-            fireInfo("Предыдущий переворот ещё выполняется")
-            return .refuse
-        }
-        // ЧИТАЕМОСТЬ ДО отправки событий: слепое поле — безопасный откат в забой-путь,
-        // но ТОЛЬКО в BS-безопасном: во враждебном поле забой — шреддер (метка
-        // 11.11 20:00: ';' в слове вернул флип в забой, bs=9 съел 28 символов)
-        if selectedTextOnMain() == nil {
-            if fieldBsUnsafe() {
-                logLine("paste-flip refuse: поле враждебно к забоям и AX слеп — забой запрещён")
-                fireInfo("Поле не читается и ломается от забоев — переворот отменён")
-                return .refuse
-            }
-            return .fallbackBs
-        }
-        pasteFlipInFlight = true
-        suppress(0.6)
-        // выделяется [слово+хвост-сеп] посимвольно и заменяется ОДНОЙ вставкой
-        // [цель+сеп цели]: посимвольность снимает гранулярность Opt+Shift+Left
-        // (знаки/цифры в слове, '85in'-токены), sep внутри вставки — без гонки
-        let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
-        let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
-        let wantSel = from + trailTyped
-        let pasteText = to + trailSent
-        let from2 = from, to2 = to
-        let word2 = word, layouts2 = layouts
-        let cur2 = cur, best2 = best
-        let skipLearn2 = skipLearn
-        let fg = fgApp
-        let seq0 = inputSeq // снимок на потоке тапа: гонка «выделение vs печать»
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.runPasteFlip(from: from2, to: to2, word: word2, layouts: layouts2,
-                               cur: cur2, best: best2, skipLearn: skipLearn2, fg: fg, seq0: seq0,
-                               wantSel: wantSel, pasteText: pasteText,
-                               trailTyped: trailTyped, trailSent: trailSent)
-        }
-        logLine("paste-flip: исполнение отложено (вне тап-колбэка)")
-        return .accepted
-    }
-
-    /// Тело паст-флипа (фоновая очередь, тап-колбэк уже вернулся):
-    /// Shift+Left×n → строгая сверка выделения с AX → Cmd+V → буфер восстановлен.
-    /// Ни одного backspace. Отказ — гашение выделения стрелкой ВПРАВО (в конец =
-    /// исходная каретка), плашка
-    private func runPasteFlip(from: String, to: String, word: [KeyRec],
-                              layouts: [LayoutService.LayoutData], cur: LayoutCandidate,
-                              best: LayoutCandidate, skipLearn: Bool, fg: pid_t, seq0: UInt64,
-                              wantSel: String, pasteText: String,
-                              trailTyped: String, trailSent: String) {
-        defer { pasteFlipInFlight = false }
-        usleep(60_000) // дать тап-колбэку вернуться (доставка постов — после него)
-        // юзер печатает/фокус ушёл — не выделяем (удар замещает выделение = слово стёрто)
-        if pasteTypingAbort(seq0: seq0, fg0: fg) {
-            logLine("paste-flip abort: юзер печатает/фокус ушёл — не мешаю")
-            return
-        }
-        TextConverter.targetPid = fg
-        for _ in 0..<wantSel.count { TextConverter.sendCombo(keyCode: 0x7B /* Left */, mods: HK.SHIFT) }
-        usleep(30_000) // дать серии дойти до поля до первого чтения
-        var selOpt = selectedTextOnMain()
-        var sel = selOpt ?? ""
-        var tries = 0
-        // хвостовой сепаратор в выделении AX может тримить — диапазон тот же,
-        // вставка его переписывает знаком раскладки цели
-        func selMatches(_ s: String) -> Bool {
-            s == wantSel || (wantSel.hasSuffix(" ") && s == wantSel.dropLast())
-        }
-        while !selMatches(sel) && tries < 3 {
-            usleep(80_000)
-            if pasteTypingAbort(seq0: seq0, fg0: fg) {
-                // юзер начал печатать по живому выделению — его удар уже заменил
-                // выделение; никаких клавиш не шлём (стрелка сдвинула бы его каретку)
-                logLine("paste-flip abort: юзер печатает по выделению — не мешаю")
-                return
-            }
-            selOpt = selectedTextOnMain()
-            sel = selOpt ?? ""
-            tries += 1
-        }
-        guard selMatches(sel) else {
-            if pasteTypingAbort(seq0: seq0, fg0: fg) { // удар юзера уже заменил выделение — клавиш не шлю
-                logLine("paste-flip refuse: юзер печатает — гашение не шлю, каретка его")
-                return
-            }
-            deselectSelectionCaretSafe(selOpt) // стрелка ВПРАВО: каретка в конец выделения = где была
-            logLine("paste-flip refuse: выделение '\(sel.prefix(20))' != '\(wantSel)' — гашу вправо, тапни снова")
-            fireInfo("Не выделилось слово — тапни Option ещё раз")
-            return
-        }
-        guard let saved = TextConverter.getClipboardTextOnce() else {
-            if pasteTypingAbort(seq0: seq0, fg0: fg) {
-                logLine("paste-flip refuse: юзер печатает — гашение не шлю, каретка его")
-                return
-            }
-            deselectSelectionCaretSafe(selOpt)
-            logLine("paste-flip refuse: буфер не читается")
-            return
-        }
-        TextConverter.setClipboardText(pasteText)
-        TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
-        scheduleClipboardRestore(saved)
-        logLine("paste-flip OK: '\(from)' -> '\(to)' (selection, без забоев)")
-        fireInfo("Перевёрнуто: \(from) → \(to)")
-        // завершение — на потоке тапа (владеет undo/learning-состоянием)
-        performOnTapThread { [weak self] in
-            guard let self = self else { return }
-            self.switchLayoutAfterFlip(word: word, best: best, layouts: layouts)
-            self.armUndoAfterFlip(cur: cur, replacement: to, trailTyped: trailTyped, trailSent: trailSent)
-            self.rememberFlipPair(cur: cur, best: best, skipLearn: skipLearn)
-        }
-    }
-
-    /// Раскладка после паст-флипа (как в забой-пути: слово >1 буквы — переключаем)
-    private func switchLayoutAfterFlip(word: [KeyRec], best: LayoutCandidate, layouts: [LayoutService.LayoutData]) {
-        if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            switchLayoutOnMain(bl, source: "force-flip")
-            verifySwitch(target: bl)
-            expectLayout(bl)
-            armGapForEngineSwitch(bl)
-        }
-    }
-
-    /// Точка отката после паст-флипа: поле = [префикс][замена+сеп цели];
-    /// возвращает [слово+знак как набран] целиком (паритет забой-пути)
-    private func armUndoAfterFlip(cur: LayoutCandidate, replacement: String, trailTyped: String, trailSent: String) {
-        undoPending = true
-        undoText = cur.text
-        undoLen = replacement.count + trailSent.count
-        undoPrefix = ""; undoPrefixLen = 0
-        prevSingle = nil
-        undoSepText = trailTyped
-        undoLayout = LayoutService.getLayouts().first { $0.id == cur.layoutID }
-        undoApp = fgApp
-        undoAt = Engine.ms()
-        keysSinceUndoPoint = 0
-        undoTail.removeAll()
-        undoTailBroken = false
-        lastConvertInfo = "flip '\(cur.text)' -> '\(replacement)'"
-    }
-
-    /// Заучивание пары после флипа (как в забой-пути)
-    private func rememberFlipPair(cur: LayoutCandidate, best: LayoutCandidate, skipLearn: Bool) {
-        let wasRejected = isRejected(cur.text.lowercased())
-        if wasRejected && !skipLearn {
-            removeRejected(cur.text.lowercased())
-        }
-        if !skipLearn && cur.text.count >= 2 && cur.text == LanguageTables.lettersOnly(cur.text) &&
-            !WordDict.has(cur.text, cur.lang) {
-            rememberAccepted(cur.text.lowercased())
-            fireInfo("Заучено: \(cur.text) → \(best.text)")
-        }
-    }
-
-    /// Break при нечего-отменять: принудительный переворот (порт ForceFlipLastWord, v3 §9).
-    /// false — свежего слова у каретки нет (плашку отказа показывает вызывающий).
     @discardableResult
     public func forceFlipLastWord() -> Bool {
         updateForeground()
-        if buf.count >= 2 {
+        if buf.count >= 1 {
             logLine("force-flip: current buffer (\(buf.count) keys)")
-            _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true)
-            buf.clear() // флип живого буфера — буфер отработал
-            return true
+            let ok = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true, skipLearn: false)
+            buf.clear()
+            return ok
         }
-        // слово только что завершилось, известен разделитель после него, каретка
-        // сразу за разделителем — точный переворот куском [слово+разд] (v3: ≤10 с, то же окно).
-        // Забой после слова отменяет доверие: юзер уже правил хвост, память о слове
-        // может не совпадать с экраном (порт-надбавка к C#, у того хук не теряет события)
         if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
             lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 && lastBsAt <= lastWordAt {
             logLine("force-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
-            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true)
-            return true
+            return forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift,
+                                    skipRejected: true, skipLearn: false)
         }
-        // честный отказ — паритет коду C# v3
         logLine("force-flip skip: no fresh word at caret")
         return false
     }
 
-    /// Принудительный переворот слова. skipRejected — не блокировать переворот
-    /// выученно-отменённых слов (Option-пинг-понг: юзер гоняет слово туда-сюда
-    /// руками); skipLearn — не писать в самообучение (чистый ручной инструмент).
+    /// Ручной переворот слова через единую очередь `injectorQueue` (БЕЗ затирания
+    /// `NSPasteboard`, работает при скриншотах в буфере обмена и не оставляет
+    /// открытых выделений под пальцами).
     private func forceConvertWord(_ word: [KeyRec], trailSepKey: Int, trailSepShift: Bool = false,
                                   skipRejected: Bool = false, skipLearn: Bool = false) -> Bool {
         updateForeground()
-        if isExcludedHere() { logLine("force-flip skip: excluded app"); return false }
+        if isExcludedHere() || PasswordGuard.isSecureFocused {
+            logLine("force-flip skip: excluded/password")
+            return false
+        }
         let layouts = LayoutService.getLayouts()
         if layouts.count < 2 { logLine("force-flip skip: one layout"); return false }
         let cands = LayoutService.renderAll(word, layouts)
 
-        guard let curID = LayoutService.currentLayout()?.id,
+        guard let curID = effectiveCurrentLayout()?.id,
               let cur = cands.first(where: { $0.layoutID == curID }), cur.lang >= 0 else {
-            logLine("force-flip skip: cur unknown"); return false
+            logLine("force-flip skip: cur unknown")
+            return false
         }
-        // осознанный Break (главный путь) сильнее прошлых отказов: слово возвращаем
-        // в строй (иначе один случайный откат блокировал слово НАВСЕГДА — и авто,
-        // и ручной переворот; бой 27.09 23:20: 'free' не получить никаким путём).
-        // Option-пинг-понг (skipLearn) тоже пробивает, но rejected не трогает
-        let wasRejected = isRejected(cur.text.lowercased())
         guard let best = cands.filter({ $0.layoutID != curID && $0.lang >= 0 }).max(by: { $0.score < $1.score }),
               best.text != cur.text else {
-            logLine("force-flip skip: no other reading"); return false
+            logLine("force-flip skip: no other reading")
+            return false
         }
 
-        logLine("force-flip: '\(cur.text)' -> '\(best.text)' (bs=\(word.count + (trailSepKey != 0 ? 1 : 0)) app=\(fgProc))")
-        lastConvertInfo = "force '\(cur.text)' -> '\(best.text)'"
-        if wasRejected && !skipLearn {
-            removeRejected(cur.text.lowercased())
-            logLine("force-flip: unrejected '\(cur.text.lowercased())'")
+        if Engine.ms() - lastPasteAt < 0.35 {
+            logLine("force-flip REFUSED: paste settle window")
+            fireInfo("Только что была вставка — повтори через долю секунды")
+            return false
         }
 
-        suppress(0.6)
-        TextConverter.targetPid = fgApp
-        // хвост-разделитель после слова уже в тексте приложения — стираем вместе
-        // со словом и перепечатываем (иначе переворот съедает пробел/запятую) (v3 §9)
+        let curLayoutObj = layouts.first(where: { $0.id == cur.layoutID })
+        let bestLayoutObj = layouts.first(where: { $0.id == best.layoutID })
+        // P2-5: правило хвостового знака-двойника и в ручном флипе ('ghbdtn,' -> 'привет,')
+        var targetText = best.text
+        if let lastKey = word.last, word.count > 1, KeyCodeMap.isPunctTwinKey(lastKey.code),
+           targetText.count > 1, let pc = KeyCodeMap.punctCharOfKey(lastKey.code) {
+            let alt = String(targetText.dropLast()) + String(pc)
+            let altCore = LanguageTables.lettersOnly(alt)
+            let baseCore = LanguageTables.lettersOnly(targetText)
+            let altValid = WordDict.has(altCore, best.lang) ||
+                (altCore.count >= 3 && LanguageTables.possibleWord(altCore, best.lang))
+            let baseValid = WordDict.has(baseCore, best.lang) ||
+                (baseCore.count >= 3 && LanguageTables.possibleWord(baseCore, best.lang))
+            let altDict = WordDict.has(altCore, best.lang), baseDict = WordDict.has(baseCore, best.lang)
+            if altValid && (!baseValid || (altDict && !baseDict)) { targetText = alt }
+        }
         let trailLen = trailSepKey != 0 ? 1 : 0
-        // знак после слова — в раскладке цели, как при авто-замене ('ghbdtn/' -> 'привет.');
-        // откат вернёт набранный (undoSepText ниже)
-        let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift) : ""
-        let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, layouts.first(where: { $0.id == best.layoutID }), trailTyped)
-        // ГЕЙТ ПО ЭКРАНУ перед стиранием (главный урок боя 23.10.2026 23:20): память
-        // мак-тапа расходится с реальным вводом (события теряются — в логе того боя
-        // буфер не совпал с нажатыми клавишами), и вслепую посчитанные backspace'ы
-        // стёрли 4 чужих слова. Сверяем хвост у каретки с тем, что собираемся стереть;
-        // не совпало — честный отказ без инжекции. Экран не читается (AX молчит,
-        // как в telegram) — работаем как раньше, вслепую (паритет C#).
-        if Engine.ms() - lastPasteAt < 0.4 {
-            logLine("force-flip REFUSED: свежая вставка (paste race) — поле ещё коммитит")
-            fireInfo("Только что была вставка — переверни словом позже")
-            return false
-        }
-        // ПАСТ-РЕЖИМ (бои 17:40 + 02:36×3: забой-бёрст в Electron-полях bb
-        // детерминированно уничтожал текст далеко за пределами bs — гейт хвост
-        // проходил, а поле после инжекции теряло 31-52 символа; выделение+вставка
-        // в том же поле не портило текст ни разу за всю историю). Пробуем ПЕРВЫМ
-        // делом; не вышло (AX слеп / выделение не подтвердилось) — прежний путь
-        // с гейтом и забоями. Разделитель уже в поле: выделяем только слово
-        // ALL-OR-NOTHING (самотест 02:45: гасящая стрелка + протухший AX =
-        // вставка в начало документа): после ОТПРАВЛЕННЫХ событий выделения
-        // откат в забой-путь ЗАПРЕЩЁН — только честный отказ
-        switch pasteFlipWordPlan(cur, best, word, layouts, skipLearn,
-                                 trailSepKey: trailSepKey, trailSepShift: trailSepShift) {
-        case .accepted:
-            return true // исполнение — асинхронно, после возврата тап-колбэка
-        case .refuse:
-            return false
-        case .fallbackBs:
-            break // AX не читался ДО каких-либо событий — безопасный забой-путь
-        }
+        let trailTyped = trailSepKey != 0 ? TextConverter.renderKeyChar(keyCode: trailSepKey, shift: trailSepShift, layout: curLayoutObj) : ""
+        let trailSent = Engine.sepInLayout(trailSepKey, trailSepShift, bestLayoutObj, trailTyped)
         let expectedTail = cur.text + trailTyped
-        let gate = verifyTailForInjection(expectedTail)
-        if gate.available {
-            if gate.matches {
-                logLine("force-flip verify: хвост '\(expectedTail)' у каретки подтверждён")
-            } else {
-                logLine("force-flip REFUSED: у каретки '\(gate.actual)' вместо '\(expectedTail)' — стирание по памяти отменено")
-                fireInfo("У курсора другое слово — переворот отменён")
-                return false
-            }
-        } else {
-            logLine("force-flip verify: экран не читается — стираю вслепую (паритет C#)")
-            fireInfo("Переворот вслепую: \(cur.text) → \(best.text)") // единственное место, где гейт не видит текст — юзер должен знать
-        }
-        screenProbe(expectedAfter: best.text + (trailSent.isEmpty ? "" : String(trailSent.last!)), removedTail: cur.text)
-        TextConverter.sendBackspaces(word.count + trailLen)
-        TextConverter.sendUnicode(best.text)
-        if !trailSent.isEmpty {
-            TextConverter.sendUnicode(trailSent)
-        }
-        if trailSepKey == KeyCodeMap.space { lastSpaceTextTick = Engine.ms() } // перепечатанный пробел — перед кареткой
-        // раскладку переключаем только при перевороте СЛОВА: одиночная буква
-        // ('А'->'F' в «F8») — правка одного символа, юзер продолжает в своём языке
-        if word.count > 1, let bl = layouts.first(where: { $0.id == best.layoutID }) {
-            switchLayoutOnMain(bl, source: "force-flip")
-            verifySwitch(target: bl)
+        let bsCount = word.count + trailLen
+
+        logLine("force-flip: '\(cur.text)' -> '\(targetText)' (bs=\(bsCount) app=\(fgProc))")
+        lastConvertInfo = "force '\(cur.text)' -> '\(targetText)'"
+
+        let fromText = cur.text
+        let toText = targetText
+        let fromLang = cur.lang
+        let toCore = LanguageTables.lettersOnly(targetText)
+        let switchTarget: LayoutService.LayoutData? = (word.count > 1) ? bestLayoutObj : nil
+
+        if let bl = switchTarget {
             expectLayout(bl)
-            armGapForEngineSwitch(bl)
+            armGap(for: bl)
         }
+        if trailSepKey == KeyCodeMap.space {
+            lastSpaceTextTick = Engine.ms()
+        }
+
+        // P1-7: инициализируем состояние отката и lastWord СИНХРОННО на потоке тапа (до injectorQueue),
+        // чтобы быстрый ввод следующих клавиш не затирался асинхронно по завершении очереди;
+        // если AX-гейт откажет, undoPending откатывается назад.
+        let prevLastWord = lastWord
+        let prevLastWordAt = lastWordAt
+        let prevLastWordApp = lastWordApp
+        let prevLastWordSepKey = lastWordSepKey
+        let prevLastWordSepShift = lastWordSepShift
 
         undoPending = true
-        undoText = cur.text
-        // точка отката включает хвост-разделитель (порт C# 8e8af36): Break после
-        // force-флипа 'ии␣' вернёт 'ии␣' целиком — раньше пробел съедался и
-        // 'bb ␣ жрет' склеивалось в 'bиижрет'
-        undoLen = best.text.count + trailSent.count // всё напечатанное: слово + перепечатанный знак
-        undoPrefix = ""; undoPrefixLen = 0 // force-flip ретро-букву не трогает
+        undoFromAuto = false
+        autoRejectEligible = false
+        undoErasedByBs = 0
+        undoText = fromText
+        undoConvertedTail = toText + trailSent
+        undoLen = toText.count + trailSent.count
+        undoPrefix = ""
+        undoPrefixLen = 0
         prevSingle = nil
-        undoSepText = trailTyped // вернуть знак как набран
-        undoLayout = layouts.first { $0.id == cur.layoutID }
+        undoSepText = trailTyped
+        undoLayout = curLayoutObj
         undoApp = fgApp
         undoAt = Engine.ms()
         keysSinceUndoPoint = 0
         undoTail.removeAll()
         undoTailBroken = false
 
-        // одиночные буквы (нулевого сигнала), слова со знаками внутри и уже словарные
-        // слова не заучиваем; 2-буквенные сленговые пары ('et'->'уе') — заучиваем (v3 §9);
-        // Option-пинг-понг (skipLearn) самообучение не трогает вовсе
-        if !skipLearn && cur.text.count >= 2 && cur.text == LanguageTables.lettersOnly(cur.text) &&
-            !WordDict.has(cur.text, cur.lang) {
-            let learned = cur.text.lowercased()
-            rememberAccepted(learned)
-            fireInfo("Заучено: \(cur.text) → \(best.text)")
+        lastWord = word
+        lastWordAt = undoAt
+        lastWordApp = fgApp
+        lastWordSepKey = trailSepKey
+        lastWordSepShift = trailSepShift
+
+        inFlightInjections += 1
+        injectorQueue.async { [weak self] in
+            guard let self = self else { return }
+            let gate = self.verifyTailForManualAction(expectedTail)
+            if gate.available && !gate.matches {
+                self.logLine("force-flip REFUSED: у каретки '\(gate.actual)' вместо '\(expectedTail)'")
+                self.fireInfo("У курсора другое слово — выдели его и нажми Option")
+                self.performOnTapThread { [weak self] in
+                    guard let self = self else { return }
+                    self.undoPending = false
+                    self.undoTailBroken = true
+                    self.lastWord = prevLastWord
+                    self.lastWordAt = prevLastWordAt
+                    self.lastWordApp = prevLastWordApp
+                    self.lastWordSepKey = prevLastWordSepKey
+                    self.lastWordSepShift = prevLastWordSepShift
+                    self.inFlightInjections = max(0, self.inFlightInjections - 1)
+                }
+                return
+            }
+
+            TextConverter.sendBackspaces(bsCount)
+            usleep(25_000)
+            TextConverter.sendUnicode(toText + trailSent)
+
+            if let bl = switchTarget {
+                self.switchLayoutOnMain(bl, source: "force-flip")
+                self.verifySwitch(target: bl)
+            }
+            self.fireConverted(fromText, toText)
+
+            self.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.inFlightInjections = max(0, self.inFlightInjections - 1)
+                let low = fromText.lowercased()
+                if self.isRejected(low) && !skipLearn {
+                    self.removeRejected(low)
+                }
+                // P2-5: защита RU->EN в rememberAccepted — не запоминаем возможное русское слово и мусорные EN-цели
+                let canLearnAccepted = (fromLang == 1) ||
+                    (!LanguageTables.possibleWord(fromText, 0) && WordDict.hasCore(toCore, 1))
+                if !skipLearn && canLearnAccepted && fromText.count >= 3 && fromText == LanguageTables.lettersOnly(fromText) &&
+                    !WordDict.has(fromText, fromLang) {
+                    self.rememberAccepted(low)
+                }
+            }
         }
         return true
     }
 
-    /// Option-тап (как в Caramba): принудительный «пинг-понг» переворотов.
-    /// В отличие от Shift+Break НЕ блокируется rejected-защитой и НЕ пишет в
-    /// самообучение (rejected/accepted) — чистый ручной инструмент. Точку
-    /// отката ставим (Break работает), раскладка переключается (как force-flip).
+    /// Option-тап («как в Caramba»):
+    /// P1-7: проверяет `isExcludedHere() / PasswordGuard.isSecureFocused` ПЕРВЫМ делом и не блокирует `tapCallback`
+    /// синхронным ожиданием AX-выделения на main-очереди.
     private func carambaFlip() {
         updateForeground()
-        if buf.count >= 2 {
+        if isExcludedHere() || PasswordGuard.isSecureFocused {
+            logLine("caramba-flip skip: excluded/password")
+            return
+        }
+        if undoPending && undoFromAuto && keysSinceUndoPoint == 0 && undoBlockReason() == nil {
+            logLine("caramba-flip: undo recent auto-convert ('\(undoText)')")
+            undoLastConversionOnTap()
+            return
+        }
+        if buf.count >= 1 {
             logLine("caramba-flip: live buffer (\(buf.count) keys)")
             _ = forceConvertWord(buf.snapshot(), trailSepKey: 0, skipRejected: true, skipLearn: true)
-            buf.clear() // флип живого буфера — буфер отработал
+            buf.clear()
             return
         }
-        // выделение юзера — переворот ВЫДЕЛЕННОГО (двойной клик по слову + тап):
-        // мусорное слово может быть не последним или старше 10 с — точный путь
-        // его не достанет, а плашка отказа обещает «выдели и нажми ещё раз».
-        // Гейт вставки внутри (выделение == скопированному) уже стоит (69826de)
-        if buf.count == 0, let sel = selectedTextOnMain(), !sel.isEmpty, sel.count <= 200 {
-            logLine("caramba-flip: user selection ('\((sel.count > 30 ? String(sel.prefix(30)) + "…" : sel))')")
-            beginFixSelection(fromFixWord: false)
-            return
-        }
-        // свежее последнее слово (≤10 с, разделитель известен, то же приложение) —
-        // точный переворот куском [слово+разд]; забой после слова — доверие снято
-        // (бой 23.10.2026: стёртое юзером слово флипался «по памяти» и ел соседние)
-        if buf.count == 0 && !lastWord.isEmpty && lastWordSepKey != 0 &&
-            lastWordApp == fgApp && (Engine.ms() - lastWordAt) < 10 && lastBsAt <= lastWordAt {
-            logLine("caramba-flip: exact path (last word, sep=0x\(String(lastWordSepKey, radix: 16)))")
-            _ = forceConvertWord(lastWord, trailSepKey: lastWordSepKey, trailSepShift: lastWordSepShift, skipRejected: true, skipLearn: true)
-            return
-        }
-        // свежего слова нет (нет выделения юзера, слово >10 с или в другом
-        // приложении) — ЧЕСТНЫЙ ОТКАЗ: иначе тап схватит кусок предложения
-        // слева от каретки и «затрёт» его конвертацией (бой 2026-09-24 22:31).
-        // Причина в лог ПОЭЛЕМЕНТНО: иначе отказ «без причины» неотличим от
-        // расходится памяти тапа (бой 30-31.10: 4 отказа — буфер был жив, но
-        // его чистил Option-down; теперь видно по buf>0)
-        var why: [String] = []
-        if buf.count > 0 { why.append("buf=\(buf.count)") }
-        if lastWord.isEmpty { why.append("no lastWord") }
-        if lastWordSepKey == 0 { why.append("no sep") }
-        if lastWordApp != fgApp { why.append("app \(fgProc) != \(lastWordApp)") }
-        if Engine.ms() - lastWordAt >= 10 { why.append(String(format: "word %.1fs old", Engine.ms() - lastWordAt)) }
-        if lastBsAt > lastWordAt { why.append(String(format: "bs %.2fs after word", lastBsAt - lastWordAt)) }
-        logLine("caramba-flip: refuse (\(why.isEmpty ? "?" : why.joined(separator: ", ")))")
-        fireInfo("Нет свежего слова у курсора — выдели текст и нажми Option ещё раз")
-    }
-
-    /// «Вставить без форматирования» (как в Caramba): содержимое буфера обмена
-    /// заменяется чистым текстом и вставляется Cmd+V. На main: NSPasteboard
-    /// не потокобезопасен. Собственная инжекция помечена магией и в тапе
-    /// ре-перехватываться не будет.
-    private func pastePlainAction() {
+        let seqAtTap = currentInputSeq
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+            guard self.currentInputSeq == seqAtTap else { return }
+            if let sel = PasswordGuard.selectedText(), !sel.isEmpty, sel.count <= 500 {
+                self.logLine("caramba-flip: user selection (\(sel.count) chars)")
+                self.beginFixSelection(fromFixWord: false)
+                return
+            }
+            self.performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                guard self.currentInputSeq == seqAtTap else { return }
+                self.updateForeground()
+                if self.isExcludedHere() || PasswordGuard.isSecureFocused { return }
+                if !self.lastWord.isEmpty && self.lastWordSepKey != 0 &&
+                    self.lastWordApp == self.fgApp && (Engine.ms() - self.lastWordAt) < 10 && self.lastBsAt <= self.lastWordAt {
+                    self.logLine("caramba-flip: exact path (last word, sep=0x\(String(self.lastWordSepKey, radix: 16)))")
+                    _ = self.forceConvertWord(self.lastWord, trailSepKey: self.lastWordSepKey, trailSepShift: self.lastWordSepShift,
+                                              skipRejected: true, skipLearn: true)
+                    return
+                }
+                if !self.lastWord.isEmpty && self.lastWordSepKey == 0 && self.keysSinceUndoPoint == 0 &&
+                    self.lastWordApp == self.fgApp && (Engine.ms() - self.lastWordAt) < 10 && self.lastBsAt <= self.lastWordAt {
+                    self.logLine("caramba-flip: last word without sep")
+                    _ = self.forceConvertWord(self.lastWord, trailSepKey: 0, skipRejected: true, skipLearn: true)
+                    return
+                }
+                self.logLine("caramba-flip: refuse (no fresh word or selection)")
+                self.fireInfo("Нет свежего слова у курсора — выдели текст и нажми Option")
+            }
+        }
+    }
+
+    private func pastePlainAction() {
+        let app = fgApp
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let pb = NSPasteboard.general
+            let tiffData = pb.data(forType: .tiff)
+            let pngData = pb.data(forType: .png)
+            let text = TextConverter.getClipboardTextOnMain()
+            if (text == nil || text?.isEmpty == true) && (tiffData != nil || pngData != nil) {
+                // P2-2: в буфере только картинка (скриншот) — вставляем без перезаписи буфера
+                TextConverter.targetPid = app
+                self.lastPasteAt = Engine.ms()
+                TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
+                self.logLine("paste-plain: image-only paste preserved")
+                return
+            }
+            guard let cleanText = text, !cleanText.isEmpty else {
                 self.logLine("paste-plain skip: no text in clipboard")
                 self.fireInfo("В буфере обмена нет текста")
                 return
             }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string) // только plain
-            TextConverter.targetPid = self.fgApp
-            self.suppress(0.3)
+            pb.clearContents()
+            pb.setString(cleanText, forType: .string)
+            // Сохраняем растровую картинку, если она шла в паре с богатым текстом
+            if let tiff = tiffData { pb.setData(tiff, forType: .tiff) }
+            if let png = pngData { pb.setData(png, forType: .png) }
+            TextConverter.targetPid = app
+            self.lastPasteAt = Engine.ms()
             TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
-            self.logLine("paste-plain: sent Cmd+V (\(text.count) chars)")
+            self.logLine("paste-plain: sent Cmd+V (\(cleanText.count) chars)")
         }
     }
 
-    // ------------------------------------------------------------------ конвертация выделенного
+    // ------------------------------------------------------------------ конвертация выделенного (строго на main!)
 
     private var selTimer: Timer?
     private var selApp: pid_t = 0
@@ -2651,121 +2516,166 @@ public final class Engine {
     private var selPhase = 0
     private var selFromFixWord = false
     private var selRetried = false
-    private var selBaseline: String?
+    private var selSnapshot: PasteboardSnapshot?
     private var selBaseSeq = 0
+    private var selStartInputSeq: UInt64 = 0
+    private var pendingRestoreSnapshot: PasteboardSnapshot?
+    private var pendingRestorePasteSeq = 0
 
     public func beginFixSelection(fromFixWord: Bool) {
         updateForeground()
-        selApp = fgApp
-        selFromFixWord = fromFixWord
-        selRetried = false
-        selBaseline = TextConverter.getClipboardTextOnce()
-        selBaseSeq = TextConverter.clipboardChangeCount()
-        selPhase = 0
-        selTries = 0
-        DispatchQueue.main.async { [weak self] in self?.restartSelTimer() }
-        logLine("sel: started")
-    }
-
-    private func restartSelTimer() {
-        selTimer?.invalidate()
-        selTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
-            self?.selPollTick()
+        let app = fgApp
+        let startInputSeq = currentInputSeq
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.selApp = app
+            self.selFromFixWord = fromFixWord
+            self.selRetried = false
+            self.selStartInputSeq = startInputSeq
+            let snap: PasteboardSnapshot
+            if let pending = self.pendingRestoreSnapshot,
+               TextConverter.clipboardChangeCountOnMain() == self.pendingRestorePasteSeq {
+                snap = pending
+                self.pendingRestoreSnapshot = nil
+            } else {
+                snap = TextConverter.savePasteboardOnMain()
+            }
+            self.selSnapshot = snap
+            self.selBaseSeq = snap.changeCount
+            self.selPhase = 0
+            self.selTries = 0
+            self.restartSelTimerOnMain()
+            self.logLine("sel: started (savedItems=\(snap.items.count))")
         }
     }
 
-    private func selPollTick() {
+    private func restartSelTimerOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        selTimer?.invalidate()
+        selTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.selPollTickOnMain()
+        }
+    }
+
+    private func deselectIfOursOnMain() {
+        guard selFromFixWord else { return }
+        if let s = PasswordGuard.selectedText(), s.isEmpty { return }
+        TextConverter.sendCombo(keyCode: 0x7C /* Right */, mods: 0)
+    }
+
+    private func selPollTickOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
         if selPhase == 0 {
-            // ждём отпускания модификаторов хоткея
             let f = CGEventSource.flagsState(.hidSystemState)
             let held = f.contains(.maskShift) || f.contains(.maskControl) || f.contains(.maskAlternate) || f.contains(.maskCommand)
             selTries += 1
             if held && selTries < 10 { return }
             selPhase = 1
             selTries = 0
-            TextConverter.targetPid = selApp // инжекция — в приложение выделения, не в переднее
+            TextConverter.targetPid = selApp
             TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "c"), mods: HK.CMD)
-            restartSelTimer()
             logLine("sel: cmd+c sent")
             return
         }
 
-        let text = TextConverter.getClipboardTextOnce() ?? ""
-        let seqChanged = TextConverter.clipboardChangeCount() != selBaseSeq
+        let curSeq = TextConverter.clipboardChangeCountOnMain()
+        let text = TextConverter.getClipboardTextOnMain() ?? ""
+        let seqChanged = curSeq != selBaseSeq
         selTries += 1
-        let isNew = !text.isEmpty && (seqChanged || text != selBaseline)
-        if !isNew && selTries < 20 { return } // ~1.2 с на Cmd+C
+        if (!seqChanged || text.isEmpty) && selTries < 16 { return }
         selTimer?.invalidate()
+        selTimer = nil
 
-        if text.isEmpty || !seqChanged {
+        guard seqChanged, !text.isEmpty else {
             if selFromFixWord && !selRetried {
                 selRetried = true
                 selPhase = 0
                 selTries = 0
-                // ретрай: расширяем выделение до 2 слов влево
                 TextConverter.targetPid = selApp
                 TextConverter.sendCombo(keyCode: 0x7B, mods: HK.ALT | HK.SHIFT)
                 TextConverter.sendCombo(keyCode: 0x7B, mods: HK.ALT | HK.SHIFT)
-                restartSelTimer()
+                restartSelTimerOnMain()
                 logLine("sel: retry with 2 words left")
                 return
             }
-            logLine("sel: no new clipboard (text \(text.isEmpty ? "empty" : "present")\(seqChanged ? "" : ", seq unchanged"))")
-            // выделение создавал движок (fix-word) — оставшееся живым, оно съест
-            // следующий удар юзера; гасим вправо (каретка в конец = где была)
-            if selFromFixWord { deselectSelectionCaretSafe(PasswordGuard.selectedText()) }
-            fireInfo("Не удалось скопировать выделение в этом приложении")
+            logLine("sel: failed to copy selection")
+            deselectIfOursOnMain()
+            if let snap = selSnapshot, s.restoreClipboard {
+                TextConverter.restorePasteboardOnMain(snap, expectedChangeCount: curSeq)
+            }
+            selSnapshot = nil
+            fireInfo("Не удалось скопировать выделение")
             return
         }
-        logLine("sel: got \(text.count) chars")
 
         let lang = LanguageTables.langOf(LanguageTables.lettersOnly(text))
         if lang < 0 {
             logLine("sel: lang unknown")
-            if selFromFixWord { deselectSelectionCaretSafe(PasswordGuard.selectedText()) }
-            fireInfo("Не удалось определить язык")
+            deselectIfOursOnMain()
+            if let snap = selSnapshot, s.restoreClipboard {
+                TextConverter.restorePasteboardOnMain(snap, expectedChangeCount: curSeq)
+            }
+            selSnapshot = nil
+            fireInfo("Не удалось определить язык выделенного текста")
             return
         }
+
+        guard currentInputSeq == selStartInputSeq else {
+            logLine("sel REFUSED: ввод пользователя во время опроса буфера")
+            deselectIfOursOnMain()
+            if let snap = selSnapshot, s.restoreClipboard {
+                TextConverter.restorePasteboardOnMain(snap, expectedChangeCount: curSeq)
+            }
+            selSnapshot = nil
+            return
+        }
+
         let converted = CharMaps.mapText(text, toRu: lang == 1)
-        // гейт вставки: выделение обязано быть ровно тем, что скопировали, —
-        // иначе Cmd+V затрёт чужой текст (выделение съехало/схлопнулось)
-        if let sel = PasswordGuard.selectedText(), sel != text {
-            logLine("sel REFUSED: выделение '\(sel)' != скопированному '\(text)' — вставка отменена")
-            // выделение движка (fix-word) гасим, своё — юзера не трогаем
-            if selFromFixWord { deselectSelectionCaretSafe(sel) }
+        if let liveSel = PasswordGuard.selectedText(), liveSel != text {
+            logLine("sel REFUSED: выделение изменилось ('\(liveSel.prefix(20))' != '\(text.prefix(20))')")
+            deselectIfOursOnMain()
+            if let snap = selSnapshot, s.restoreClipboard {
+                TextConverter.restorePasteboardOnMain(snap, expectedChangeCount: curSeq)
+            }
+            selSnapshot = nil
             fireInfo("Выделение изменилось — конвертация отменена")
             return
         }
-        TextConverter.setClipboardText(converted)
+
+        let pasteSeq = TextConverter.setTransientClipboardTextOnMain(converted)
         TextConverter.targetPid = selApp
+        lastPasteAt = Engine.ms()
         TextConverter.sendCombo(keyCode: KeyCodeMap.ansiCode(ofLatin: "v"), mods: HK.CMD)
-        logLine("sel: pasted converted (lang=\(lang))")
+        logLine("sel: pasted converted (\(text.count) chars, lang=\(lang))")
         lastConvertInfo = "sel '\(text)' -> '\(converted)'"
 
-        if selFromFixWord && text.count >= s.minWordLen && text.count <= 24
-            && text == LanguageTables.lettersOnly(text) && !WordDict.has(text, lang) {
-            rememberAccepted(text.lowercased())
-        }
-
-        if let target = LayoutService.findLayoutByLang(lang == 1 ? 0 : 1) {
+        let targetLang = lang == 1 ? 0 : 1
+        if let target = LayoutService.findLayoutByLang(targetLang) {
             logLine("layout switch: ? -> \(target.id.prefix(8)) (fix-selection)")
-            LayoutService.switchTo(target)
-            verifySwitch(target: target)
-            expectLayout(target)
+            _ = LayoutService.switchTo(target)
+            performOnTapThread { [weak self] in
+                guard let self = self else { return }
+                self.expectLayout(target)
+                self.armGap(for: target)
+                self.lockAutoSwitch(lang: targetLang)
+            }
         }
-        lockAutoSwitch()
 
-        if s.restoreClipboard { scheduleClipboardRestore(text) }
+        if let snap = selSnapshot, s.restoreClipboard {
+            self.pendingRestoreSnapshot = snap
+            self.pendingRestorePasteSeq = pasteSeq
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self = self else { return }
+                if let pSnap = self.pendingRestoreSnapshot, self.pendingRestorePasteSeq == pasteSeq {
+                    TextConverter.restorePasteboardOnMain(pSnap, expectedChangeCount: pasteSeq)
+                    self.pendingRestoreSnapshot = nil
+                }
+            }
+        }
+        selSnapshot = nil
 
         if converted != text { fireConverted(text, converted) }
         else { fireInfo("Раскладка уже верная") }
-    }
-
-    private func scheduleClipboardRestore(_ original: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.suppress(0.3)
-            TextConverter.setClipboardText(original)
-        }
     }
 
     // ------------------------------------------------------------------ обучение
@@ -2816,33 +2726,36 @@ public final class Engine {
         appendFile(acceptedPath, w)
     }
 
+    private let ioQueue = DispatchQueue(label: "os.io", qos: .utility)
+
     private func removeAccepted(_ typed: String) {
         learnedLock.lock()
-        let removed = accepted.remove(typed) != nil
+        let removed = accepted.remove(typed.lowercased()) != nil
         let snapshot = accepted
         learnedLock.unlock()
         guard removed else { return }
-        // синхронная запись файла на потоке тапа (до 10 мс на тормозящем диске) недопустима
-        DispatchQueue.global(qos: .utility).async {
-            let _ = try? snapshot.joined(separator: "\n").appending("\n").write(toFile: self.acceptedPath, atomically: true, encoding: .utf8)
+        ioQueue.async {
+            try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
+            let content = snapshot.isEmpty ? "" : snapshot.sorted().joined(separator: "\n") + "\n"
+            let _ = try? content.write(toFile: self.acceptedPath, atomically: true, encoding: .utf8)
         }
     }
 
-    /// Снять отказ: слово снова в строю (юзер force-flip'нул его осознанно).
-    /// Перезапись learned.txt обязательна — иначе после рестарта отказ возвращался.
     private func removeRejected(_ typed: String) {
         learnedLock.lock()
-        let removed = rejected.remove(typed) != nil
+        let removed = rejected.remove(typed.lowercased()) != nil
         let snapshot = rejected
         learnedLock.unlock()
         guard removed else { return }
-        DispatchQueue.global(qos: .utility).async {
-            let _ = try? snapshot.joined(separator: "\n").appending("\n").write(toFile: self.learnedPath, atomically: true, encoding: .utf8)
+        ioQueue.async {
+            try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
+            let content = snapshot.isEmpty ? "" : snapshot.sorted().joined(separator: "\n") + "\n"
+            let _ = try? content.write(toFile: self.learnedPath, atomically: true, encoding: .utf8)
         }
     }
 
     private func appendFile(_ path: String, _ line: String) {
-        DispatchQueue.global(qos: .utility).async {
+        ioQueue.async {
             try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
             if !FileManager.default.fileExists(atPath: path) {
                 FileManager.default.createFile(atPath: path, contents: nil)
@@ -2856,13 +2769,6 @@ public final class Engine {
 
     // ------------------------------------------------------------------ вспомогательное
 
-    private func suppress(_ sec: TimeInterval) {
-        let until = Engine.ms() + sec
-        if until > suppressUntil { suppressUntil = until }
-    }
-
-    /// Точка экрана для всплывашки: на macOS каретку чужого окна не спросить —
-    /// показываем у курсора (мышь почти всегда у поля ввода).
     public func caretPoint() -> NSPoint {
         NSEvent.mouseLocation
     }
@@ -2880,7 +2786,6 @@ public final class Engine {
         }
     }
 
-    // журнал решений
     private let logQueue = DispatchQueue(label: "os.log", qos: .utility)
     private var logBuf: [String] = []
     private let logLock = NSLock()
@@ -2892,11 +2797,7 @@ public final class Engine {
     }()
 
     func logLine(_ line: String) {
-        // журнал ведётся только в режиме разработчика (настройка DevLog):
-        // для открытой версии — никаких записей о нажатиях пользователя
-        // (паритет C#: Log() при !S.DevLog не буферизует и не пишет ничего)
         guard s.devLog else { return }
-        // DateFormatter не потокобезопасен: форматируем под общим локом
         logLock.lock()
         let entry = "\(Self.logDateFormatter.string(from: Date()))  \(line)"
         logBuf.append(entry)
@@ -2924,5 +2825,4 @@ public final class Engine {
             }
         }
     }
-
 }

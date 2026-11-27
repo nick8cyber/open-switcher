@@ -6,9 +6,10 @@ enum App {
     static var engine: Engine!
     static var statusItem: StatusItemService!
 
-    /// pid-файл single-instance (аналог мьютекса); при падении не остаётся
-    /// мёртвым замком — pid проверяется через kill(pid, 0).
-    static let pidPath = "/tmp/com.openswitcher.pid"
+    /// Файл блокировки single-instance на flock(LOCK_EX|LOCK_NB):
+    /// ядро само снимает замок при завершении или краше процесса, нет гонок PID.
+    static var lockFd: Int32 = -1
+    static var lockPath: String { SettingsStore.dir + "/openswitcher.lock" }
 
     /// Онбординг-окно разрешений. Engine (Core) зовёт его через хук
     /// Engine.showOnboardingHook — прямой зависимости Core → UI нет.
@@ -33,19 +34,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // внешняя смена раскладки (системное меню, юзер) — инвалидирует
         // висящие verifySwitch-ретраи движка и сразу обновляет TIS-кэш
-        // (TIS-вызовы — только на main, поэтому main.async: блок наблюдателя
-        // с queue: nil исполняется на произвольном потоке)
+        // (P0-6: подписываемся строго на queue: .main — без гонок с произвольным потоком)
         DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("AppleSelectedInputSourceChangedNotification"), object: nil, queue: nil) { _ in
+            forName: NSNotification.Name("AppleSelectedInputSourceChangedNotification"), object: nil, queue: .main) { _ in
             App.engine?.bumpSwitchSerial()
-            DispatchQueue.main.async { LayoutService.refreshOnMain() }
+            LayoutService.refreshOnMain()
         }
         DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: nil) { _ in
-            DispatchQueue.main.async {
-                UiTheme.shared.refreshFromSystem()
-                ThemeEnv.shared.refresh()
-            }
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main) { _ in
+            UiTheme.shared.refreshFromSystem()
+            ThemeEnv.shared.refresh()
         }
         UiTheme.shared.changed = {
             DispatchQueue.main.async {
@@ -65,11 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // удаляем pid-файл только если он наш (второй инстанс мог перезаписать своим)
-        if let data = FileManager.default.contents(atPath: App.pidPath),
-           let pid = Int(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespaces)),
-           pid == getpid() {
-            try? FileManager.default.removeItem(atPath: App.pidPath)
+        if App.lockFd >= 0 {
+            close(App.lockFd)
+            App.lockFd = -1
         }
     }
 }
@@ -139,37 +135,22 @@ private func osCrashOnSignal(_ sig: Int32) {
 }
 CrashLog.install()
 
-// --- single-instance: живая копия = «открой настройки» у неё и выход
-/// Жив ли pid И это наш процесс (защита от переиспользования PID чужим процессом).
-func pidIsOurs(_ pid: Int) -> Bool {
-    guard pid > 0, pid <= Int32.max, kill(pid_t(pid), 0) == 0 else { return false }
-    var pathbuf = [CChar](repeating: 0, count: 4096)
-    let len = proc_pidpath(pid_t(pid), &pathbuf, 4096)
-    guard len > 0 else { return true } // путь недоступен — консервативно считаем живым
-    let path = String(cString: pathbuf)
-    return path == CommandLine.arguments[0]
-        || path == Bundle.main.executableURL?.path
-}
-
-// атомарное создание (O_EXCL): два одновременных старта не смогут оба пройти
+// --- single-instance через flock(LOCK_EX | LOCK_NB): без гонок /tmp и reuse PID
 var running = false
-let fd = open(App.pidPath, O_WRONLY | O_CREAT | O_EXCL, 0o644)
-if fd >= 0 {
-    let pidStr = "\(getpid())"
-    _ = pidStr.withCString { write(fd, $0, strlen($0)) }
-    close(fd)
-} else if errno == EEXIST {
-    // файл уже есть: живой ли это наш процесс?
-    if let data = FileManager.default.contents(atPath: App.pidPath),
-       let pid = Int(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespaces)),
-       pidIsOurs(pid) {
+try? FileManager.default.createDirectory(atPath: SettingsStore.dir, withIntermediateDirectories: true)
+let lockFd = open(App.lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+if lockFd >= 0 {
+    if flock(lockFd, LOCK_EX | LOCK_NB) == 0 {
+        App.lockFd = lockFd
+        ftruncate(lockFd, 0)
+        let pidStr = "\(getpid())\n"
+        _ = pidStr.withCString { write(lockFd, $0, strlen($0)) }
+    } else if errno == EWOULDBLOCK || errno == EAGAIN {
+        close(lockFd)
         running = true
     } else {
-        // мёртвый/чужой — забираем файл
-        FileManager.default.createFile(atPath: App.pidPath, contents: Data("\(getpid())".utf8))
+        close(lockFd)
     }
-} else {
-    // неожиданная ошибка — работает без single-instance
 }
 
 if running {

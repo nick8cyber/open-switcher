@@ -37,7 +37,7 @@ namespace OpenSwitcher.Core
         public int HotAutoToggleMods = 0;
         public bool LockAutoAfterManualSwitch = false; // ручной выбор раскладки отключает автодетект до новой сессии
         public bool DoubleShiftSwitch = true;      // двойной Shift = отмена последней замены (как в Caramba)
-        public int InputMode = 1;                  // 0 = SendInput, 1 = сообщения окна (обход HIPS)
+        public int InputMode = 0;                  // 0 = SendInput (по умолчанию), 1 = сообщения окна (обход HIPS)
 
         // --- система ---
         public bool ShowPopup = true;
@@ -52,9 +52,10 @@ namespace OpenSwitcher.Core
         /// mac-паритет 02.11 (PasteConvertApps); на вин SendInput упорядочен, но
         /// залипчивые поля существуют и тут.</summary>
         public string PasteConvertApps = "";
-        public string Exclusions = "cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe"; // популярные игры: инжекция/конвертация в них только мешает (чат всё равно руками)
+        public const string DefaultExclusions = "wt.exe,windowsterminal.exe,powershell.exe,pwsh.exe,cmd.exe,mintty.exe,alacritty.exe,wezterm-gui.exe,bitwarden.exe,1password.exe,keepass.exe,keepassxc.exe,cs2.exe,csgo.exe,dota2.exe,valorant-win64-shipping.exe,valorant.exe,fortniteclient-win64-shipping.exe,tslgame.exe,r5apex.exe,gta5.exe,gta5_enhanced.exe,rdr2.exe,rust.exe,escapefromtarkov.exe,overwatch.exe,call of duty.exe,modernwarfare.exe,league of legends.exe,rocketleague.exe,hl2.exe,hl.exe,wow.exe,aces.exe,wot.exe,worldoftanks.exe,genshinimpact.exe,yuanshen.exe,starrail.exe,bf2042.exe,bf6.exe,marvelrivals.exe,thefinals.exe,deadlock.exe";
+        public string Exclusions = DefaultExclusions; // терминалы, менеджеры паролей и игры
         public int ThemeMode = 0; // 0 системная / 1 светлая / 2 тёмная
-        public int DefaultsV = 7; // версия дефолтов (7 = ввод сообщениями окна включён; 6 = автоправка вкл; 5 = Shift+Break конвертация выделенного)
+        public int DefaultsV = 9; // версия дефолтов (9 = SendInput дефолт; 8 = очистка PasteConvertApps)
     }
 
     public static class SettingsStore
@@ -148,6 +149,24 @@ namespace OpenSwitcher.Core
             {
                 s.InputMode = 1;
                 s.DefaultsV = 7;
+                Save(s);
+            }
+            // v8: очистка устаревшего PasteConvertApps и добавление терминалов/менеджеров паролей
+            if (s.DefaultsV < 8)
+            {
+                s.PasteConvertApps = "";
+                if (string.IsNullOrEmpty(s.Exclusions) || s.Exclusions.StartsWith("cs2.exe,", StringComparison.OrdinalIgnoreCase))
+                {
+                    s.Exclusions = Settings.DefaultExclusions;
+                }
+                s.DefaultsV = 8;
+                Save(s);
+            }
+            // v9: возврат SendInput (InputMode = 0) как надёжного системного дефолта (P0-3: PostMessage ломает Win32 EDIT)
+            if (s.DefaultsV < 9)
+            {
+                s.InputMode = 0;
+                s.DefaultsV = 9;
                 Save(s);
             }
             return s;

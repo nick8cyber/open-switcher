@@ -381,9 +381,10 @@ struct StatusHero: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     paused.toggle()
-                    engine.s.paused = paused
-                    SettingsStore.save(engine.s)
-                    engine.apply(engine.s)
+                    let snap = engine.s.clone()
+                    snap.paused = paused
+                    SettingsStore.save(snap)
+                    engine.apply(snap)
                 }
                 .onHover { hover = $0 }
         }
@@ -950,8 +951,8 @@ struct MainPage: View {
         VStack(alignment: .leading, spacing: 12) {
             PageHeader(title: "Основное", sub: "Автоисправление неверной раскладки при вводе")
             PageCard {
-                Row(title: "Живое автоисправление",
-                    sub: "Слово переворачивается прямо при наборе, не дожидаясь пробела") {
+                Row(title: "Автоисправление по границе слова",
+                    sub: "Исправляет слово не в той раскладке после пробела или знака препинания") {
                     ToggleButton(on: model.autoConvert) { model.autoConvert.toggle() }
                 }
                 DividerW()
@@ -1135,14 +1136,14 @@ struct ExclusionsPage: View {
             PageHeader(title: "Исключения", sub: "Программы, где исправление выключено")
             PageCard {
                 Row(title: "Не исправлять в",
-                    sub: "Имена приложений через запятую: Terminal, iTerm2. Сейчас активно: \(engine.currentAppName)")
+                    sub: "Имена приложений через запятую: Terminal, iTerm2. Сейчас активно: \(engine.lastExternalAppName)")
                 DarkTextField(text: $model.exclusions, multiline: true)
                     .overlay(RoundedRectangle(cornerRadius: 7)
                         .stroke(theme.t.inputBorder))
                     .frame(height: 64)
                     .padding(.horizontal, 16)
                 AccentButton(title: "Добавить текущее приложение", accent: false) {
-                    let name = engine.currentAppName
+                    let name = engine.lastExternalAppName
                     guard !name.isEmpty else { return }
                     let parts = model.exclusions
                         .split(separator: ",")
@@ -1175,7 +1176,7 @@ struct Footer: View {
     var body: some View {
         let t = theme.t
         HStack(spacing: 10) {
-            Text("OpenSwitcher 1.2.0 · Ru ⇄ En")
+            Text("OpenSwitcher 1.3.0 · Ru ⇄ En")
                 .font(.system(size: 10))
                 .foregroundColor(t.dim)
             Spacer()

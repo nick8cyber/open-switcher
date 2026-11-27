@@ -2,128 +2,201 @@ import Foundation
 import AppKit
 import CoreGraphics
 
-/// Инжекция ввода (порт TextConverter.cs): юникод-символы, Backspace, комбинации
-/// клавиш. На macOS всё через CGEvent, posted в .cghidEventTap.
-/// Собственную инжекцию помечаем магикой в поле 87 (eventSourceUserData) и
-/// глотаем в тапе — аналог LLMHF_INJECTED.
-public enum TextConverter {
-    static let selfMagic: Int64 = 0x05FA_5717
-    static let userField = CGEventField(rawValue: 42)! // kCGEventSourceUserData (CGEventTypes.h)
+/// Снимок всех элементов буфера обмена со всеми типами данных (картинки, RTF,
+/// файлы, текст), чтобы конвертация выделения никогда не разрушала скриншоты
+/// или форматированный буфер пользователя.
+public struct PasteboardSnapshot {
+    public let changeCount: Int
+    public let items: [[(NSPasteboard.PasteboardType, Data)]]
+}
 
-    /// PID переднего приложения: инжекция адресуется ему (CGEventPostToPid,
-    /// спека v3 §16) — смена окна в момент доставки не уводит текст в чужое окно.
+/// Инжекция ввода: юникод-символы, Backspace, Enter, комбинации клавиш.
+/// Все синтетические события создаются через выделенный приватный `CGEventSource`
+/// (`.privateState`, `localEventsSuppressionInterval = 0`) и несут явные чистые
+/// флаги `.maskNonCoalesced` — физически зажатые пользователем `Shift`, `Option`,
+/// `Command` или `Control` никогда не протекают на синтетические нажатия.
+public enum TextConverter {
+    public static let selfMagic: Int64 = 0x05FA_5717
+    public static let userField = CGEventField.eventSourceUserData
+
     public static var targetPid: pid_t = 0
+
+    private static let privateSource: CGEventSource? = {
+        let src = CGEventSource(stateID: .privateState)
+        src?.localEventsSuppressionInterval = 0
+        return src
+    }()
+
+    private static func makeSource() -> CGEventSource? {
+        privateSource ?? CGEventSource(stateID: .privateState)
+    }
 
     private static func post(_ event: CGEvent) {
         event.setIntegerValueField(userField, value: selfMagic)
-        // ВОССТАНОВЛЕН паритет с C# SendInput: глобальная HID-очередь, событие
-        // встаёт СТРОГО после недообработанных клавиш юзера. PostToPid (порт
-        // v3 §16) вставлял события в голову очереди ПРИЛОЖЕНИЯ — в Electron
-        // с асинхронным paste-коммитом забои обгоняли его недообработанный
-        // ввод и СТИРАЛИ ЧУЖОЙ ТЕКСТ (бой 02:54: bs=7 по 'ybrfrb ' съел
-        // 'сам - opus 5.5 xhigh,'); там же — корень «INJECTION NOT APPLIED»
-        // (01:23): часть Electron-полей PostToPid-события не съедали вовсе.
-        // Риск cghidEventTap: смена окна в полёте уводит текст — покрывается
-        // suppress-окном и редкостью (окно не меняется за 100 мс инжекции)
         event.post(tap: .cghidEventTap)
     }
 
-    /// Отпустить все модификаторы физически не нужно — CGEvent-комбо несут свои флаги.
     public static func releaseModifiers() {}
 
-    /// Системный лимит CGEventKeyboardSetUnicodeString — 20 кодовых единиц UTF-16
-    /// (uxUTF16StringMaxLength, CGEvent.h; тот же лимит режет чанки Chromium в
-    /// input_injector_mac.cc). Чанк больше лимита молча ОБРЕЗАЕТСЯ до 20 единиц:
-    /// прежние 60 теряли хвост слов длиннее ~20 символов.
-    private static let maxUTF16Chunk = 20
-
-    /// Ввести текст «юникодом» (аналог KEYEVENTF_UNICODE). Чанки считаются в
-    /// единицах UTF-16 (лимит системный именно в них); суррогатная пара
-    /// (символ вне BMP) не разрывается между чанками.
-    public static func sendUnicode(_ text: String) {
+    /// Посимвольная отправка текста через Unicode CGEvent (1 символ / суррогатная
+    /// пара на событие, чистые флаги `.maskNonCoalesced`). Исключает обрезку длинных
+    /// слов, гонку `interpretKeyEvents:` в Electron/Chromium и случайный `Cmd+A`
+    /// на `virtualKey: 0`.
+    public static func sendUnicode(_ text: String, interCharDelayUs: useconds_t = 1500) {
+        guard !text.isEmpty else { return }
+        let src = makeSource()
         let units = Array(text.utf16)
         var i = 0
+        var sentAny = false
         while i < units.count {
-            var end = min(i + maxUTF16Chunk, units.count) // остаток ≤ 20 единиц UTF-16
-            if end > i + 1, end < units.count,
-               units[end - 1] >= 0xD800, units[end - 1] <= 0xDBFF {
-                end -= 1 // граница попала между high/low суррогатом — отдвигаем её
+            let u0 = units[i]
+            if u0 == 0x000A || u0 == 0x000D {
+                if sentAny && interCharDelayUs > 0 { usleep(interCharDelayUs) }
+                sendEnter()
+                sentAny = true
+                i += 1
+                continue
             }
-            let chunk = String(decoding: units[i..<end], as: UTF16.self)
-            let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)
-            down?.keyboardSetUnicodeString(stringLength: chunk.utf16.count,
-                                           unicodeString: chunk.utf16.map { $0 as UniChar })
-            if let d = down { post(d) }
-            let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
-            up?.keyboardSetUnicodeString(stringLength: chunk.utf16.count,
-                                         unicodeString: chunk.utf16.map { $0 as UniChar })
-            if let u = up { post(u) }
-            i = end
+            var chunk: [UniChar] = [u0]
+            if u0 >= 0xD800 && u0 <= 0xDBFF && i + 1 < units.count {
+                let u1 = units[i + 1]
+                if u1 >= 0xDC00 && u1 <= 0xDFFF {
+                    chunk.append(u1)
+                    i += 1
+                }
+            }
+            if sentAny && interCharDelayUs > 0 { usleep(interCharDelayUs) }
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+               let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                down.flags = .maskNonCoalesced
+                up.flags = .maskNonCoalesced
+                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                post(down)
+                post(up)
+                sentAny = true
+            }
+            i += 1
         }
     }
 
-    public static func sendBackspaces(_ n: Int) {
+    public static func sendBackspaces(_ n: Int, delayUs: useconds_t = 4000) {
         guard n > 0 else { return }
+        let src = makeSource()
         for i in 0..<n {
-            // пауза между парами: непрерывный burst часть приложений
-            // интерпретирует как залипание (одно нажатие = удаление множества
-            // символов); Electron/Chromium при 2 мс (порт C# Thread.Sleep(2),
-            // там SendInput — общая очередь и склейки нет) СКЛЕИВАЕТ быстрые
-            // repeated Backspace — из пачки bs=5 дошёл 4, поле получило
-            // 'bизучи' вместо 'изучи' (бой 19:08:56). 8 мс — вне окна склейки
-            if i > 0 { usleep(8000) }
-            let d = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: true)
-            let u = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: false)
-            if let d = d { post(d) }
-            if let u = u { post(u) }
+            if i > 0 && delayUs > 0 { usleep(delayUs) }
+            if let d = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: true),
+               let u = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(KeyCodeMap.backspace), keyDown: false) {
+                d.flags = .maskNonCoalesced
+                u.flags = .maskNonCoalesced
+                post(d)
+                post(u)
+            }
         }
     }
 
-    public static func sendEnter() {
-        let d = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.enter), keyDown: true)
-        let u = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(KeyCodeMap.enter), keyDown: false)
-        if let d = d { post(d) }
-        if let u = u { post(u) }
+    public static func sendEnter(shift: Bool = false) {
+        let src = makeSource()
+        let flags: CGEventFlags = shift ? [.maskShift, .maskNonCoalesced] : [.maskNonCoalesced]
+        if let d = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(KeyCodeMap.enter), keyDown: true),
+           let u = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(KeyCodeMap.enter), keyDown: false) {
+            d.flags = flags
+            u.flags = flags
+            post(d)
+            post(u)
+        }
     }
 
     /// Комбинация: код клавиши + модификаторы (биты HK.*).
     public static func sendCombo(keyCode: Int, mods: Int) {
-        var flags: CGEventFlags = []
+        let src = makeSource()
+        var flags: CGEventFlags = [.maskNonCoalesced]
         if mods & HK.CTRL != 0 { flags.insert(.maskControl) }
         if mods & HK.SHIFT != 0 { flags.insert(.maskShift) }
         if mods & HK.ALT != 0 { flags.insert(.maskAlternate) }
         if mods & HK.CMD != 0 { flags.insert(.maskCommand) }
-        let d = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true)
-        d?.flags = flags
-        let u = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: false)
-        u?.flags = flags
-        if let d = d { post(d) }
-        if let u = u { post(u) }
+        if let d = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(keyCode), keyDown: true),
+           let u = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(keyCode), keyDown: false) {
+            d.flags = flags
+            u.flags = flags
+            post(d)
+            post(u)
+        }
     }
 
-    /// Символ, который печатает клавиша в текущей раскладке (для досылки разделителей).
-    public static func renderKeyChar(keyCode: Int, shift: Bool) -> String {
-        // renderKey, а не render: у render сбой = '?', и настоящий '?' (Shift+/) тут терялся
-        guard let data = LayoutService.currentLayout(),
+    /// Символ, который печатает клавиша в указанной (или текущей) раскладке.
+    public static func renderKeyChar(keyCode: Int, shift: Bool, layout: LayoutService.LayoutData? = nil) -> String {
+        guard let data = layout ?? LayoutService.currentLayout(),
               let s = LayoutService.renderKey(data, KeyRec(keyCode, shift, false)) else { return "" }
         return s
     }
 
-    // ---------------------------------------------------------------- буфер обмена
+    // ---------------------------------------------------------------- буфер обмена (только main!)
 
-    public static func clipboardChangeCount() -> Int {
-        NSPasteboard.general.changeCount
+    private static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+    private static let autoGeneratedType = NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
+
+    public static func clipboardChangeCountOnMain() -> Int {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return NSPasteboard.general.changeCount
     }
 
-    public static func getClipboardTextOnce() -> String? {
+    public static func getClipboardTextOnMain() -> String? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return NSPasteboard.general.string(forType: .string)
+    }
+
+    /// Полный снимок буфера обмена (включая картинки/скриншоты/файлы/RTF).
+    public static func savePasteboardOnMain() -> PasteboardSnapshot {
+        dispatchPrecondition(condition: .onQueue(.main))
         let pb = NSPasteboard.general
-        guard let types = pb.types, types.contains(.string) else { return nil }
-        return pb.string(forType: .string)
+        var savedItems: [[(NSPasteboard.PasteboardType, Data)]] = []
+        if let items = pb.pasteboardItems {
+            for item in items {
+                var pairs: [(NSPasteboard.PasteboardType, Data)] = []
+                for t in item.types {
+                    if let d = item.data(forType: t) {
+                        pairs.append((t, d))
+                    }
+                }
+                if !pairs.isEmpty { savedItems.append(pairs) }
+            }
+        }
+        return PasteboardSnapshot(changeCount: pb.changeCount, items: savedItems)
     }
 
-    public static func setClipboardText(_ text: String) {
+    /// Записывает временный текст с маркерами TransientType/AutoGeneratedType
+    /// (менеджеры буфера обмена Raycast/Maccy/Paste не засоряют историю) и
+    /// возвращает актуальный changeCount для безопасного восстановления.
+    @discardableResult
+    public static func setTransientClipboardTextOnMain(_ text: String) -> Int {
+        dispatchPrecondition(condition: .onQueue(.main))
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(text, forType: .string)
+        let item = NSPasteboardItem()
+        item.setString(text, forType: .string)
+        item.setData(Data(), forType: transientType)
+        item.setData(Data(), forType: autoGeneratedType)
+        pb.writeObjects([item])
+        return pb.changeCount
+    }
+
+    /// Восстанавливает полный снимок буфера обмена, если за время ожидания
+    /// пользователь сам не скопировал что-то новое.
+    public static func restorePasteboardOnMain(_ snapshot: PasteboardSnapshot, expectedChangeCount: Int) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let pb = NSPasteboard.general
+        guard pb.changeCount == expectedChangeCount else { return }
+        pb.clearContents()
+        guard !snapshot.items.isEmpty else { return }
+        var restored: [NSPasteboardItem] = []
+        for pairs in snapshot.items {
+            let item = NSPasteboardItem()
+            for (t, d) in pairs {
+                item.setData(d, forType: t)
+            }
+            restored.append(item)
+        }
+        pb.writeObjects(restored)
     }
 }

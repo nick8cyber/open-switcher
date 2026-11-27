@@ -16,7 +16,7 @@ if not exist tools\app.ico (
     powershell -NoProfile -ExecutionPolicy Bypass -File tools\make-icon.ps1
 )
 
-"%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ ^
+"%CSC%" /nologo /codepage:65001 /target:winexe /platform:anycpu /optimize+ ^
   /out:OpenSwitcher.exe ^
   /win32icon:tools\app.ico ^
   /win32manifest:app.manifest ^

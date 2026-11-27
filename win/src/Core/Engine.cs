@@ -49,8 +49,11 @@ namespace OpenSwitcher.Core
         private IntPtr _prevSingleHwnd;
         private bool _boundaryClean = true;  // перед кареткой чистая граница слова (пробел/Enter/начало ввода)
         private bool _wordStartClean;        // слово в буфере началось после чистой границы ('b2b' — нет)
+        private bool _wordTainted;           // токен содержит цифры, '_', '/', '@', '#' — не конвертировать до пробела/Enter
 
         private int _suppressUntil;          // тикант до которого игнорируем собственную инжекцию
+        private int _lastDownVk;             // последний нажатый VK — для отсечения авторепита хоткеев
+        private bool _isAutoRepeat;
         private int _lastShiftDown;
         private bool _anyKeySinceShift;
         private int _tapVk;                  // клавиша, чей «тап» отслеживается
@@ -58,7 +61,8 @@ namespace OpenSwitcher.Core
         private int _tapDownTick;
         private int _lastTapDoneTick;        // когда прошлёл последний успешный тап-переключатель (для дребезг-фильтра)
         private bool _tapAlone;              // между нажатием и отпусканием не было других клавиш
-        private bool _autoLocked;            // юзер сам выбрал раскладку — автодетект молчит до конца текущего сеанса набора
+        private bool _autoLocked;            // юзер сам выбрал раскладку — автодетект защищает минимум первое слово
+        private int _autoLockedWordsTyped;   // сколько слов набрано после ручного выбора раскладки
         private int _lastInputTick;          // последний НЕмодификаторный keydown — отсчёт паузы между сеансами
         private const int SessionPauseMs = 3000; // пауза в наборе дольше этого = сеанс кончился, лок отпускает
         private int _wdTicks;                // счётчик тиков watchdog'а (heartbeat раз в 10 тиков)
@@ -74,8 +78,11 @@ namespace OpenSwitcher.Core
 
         // точка отката последней автозамены
         private bool _undoPending;
+        private bool _undoFromAuto;          // true = точка поставлена авто-конвертацией (для авто-отказа по BS/Ctrl+Z)
+        private bool _autoRejectEligible;    // P0-4: выживает ТОЛЬКО на серии чистых BS или мгновенных Ctrl+Z / Ctrl+BS
         private string _undoText = "";       // что было набрано (до замены)
         private int _undoLen;                // длина заменённого текста (сколько стирать)
+        private int _undoErasedByBs;         // сколько символов заменённого слова юзер уже стёр Backspace'ом
         private string _undoPrefix = "";     // ретро-флип: исходная буква+пробел перед словом ('f␣'), вернуть при откате
         private int _undoPrefixLen;          // ... и длина напечатанного вместо неё («а␣» = 2)
         private string _undoSepText = "";    // разделитель после слова, как его напечатал юзер (в старой раскладке)
@@ -275,6 +282,9 @@ namespace OpenSwitcher.Core
 
         public void Dispose()
         {
+            if (_hookWatchdog != null) { _hookWatchdog.Stop(); _hookWatchdog.Dispose(); _hookWatchdog = null; }
+            StopSelTimer();
+            if (_clipTimer != null) { _clipTimer.Stop(); _clipTimer.Dispose(); _clipTimer = null; }
             if (_kbHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_kbHook);
             if (_mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_mouseHook);
             if (_winHook != IntPtr.Zero) Native.UnhookWinEvent(_winHook);
@@ -297,6 +307,8 @@ namespace OpenSwitcher.Core
                 if (TestInjectMode)
                     Log("window-switch: " + _fgHwnd.ToInt64().ToString("X") + " (was " + prevHwnd.ToInt64().ToString("X") + ")");
                 _autoLocked = false;
+                _autoLockedWordsTyped = 0;
+                _wordTainted = false;
                 _spaceAtCaretTick = 0; // окно дедупа пробела не переносится в другое окно
                 _undoPending = false;
                 _undoTailBroken = true;
@@ -332,6 +344,7 @@ namespace OpenSwitcher.Core
                 && unchecked(Environment.TickCount - _expectGraceUntil) >= 0)
             {
                 _autoLocked = true;
+                _autoLockedWordsTyped = 0;
                 if (TestInjectMode)
                     Log("auto-lock: hkl=" + _fgHkl.ToInt64().ToString("X8") +
                         " expected=" + _expectedHkl.ToInt64().ToString("X8") +
@@ -349,21 +362,6 @@ namespace OpenSwitcher.Core
             _expectedHwnd = _fgHwnd;
             _expectedValid = true;
             _expectGraceUntil = Environment.TickCount + 1200;
-        }
-
-        /// <summary>Процесс в списке PasteConvertApps (авто-конверт через
-        /// выделение+вставку, без BS) — веб-поля в Chromium, mac-паритет 02.11.</summary>
-        private bool PasteConvertListContains(string proc)
-        {
-            string list = S.PasteConvertApps;
-            if (string.IsNullOrEmpty(list) || string.IsNullOrEmpty(proc)) return false;
-            foreach (string part in list.ToLowerInvariant().Split(new[] { ',', ';' }))
-            {
-                string p = part.Trim();
-                if (p.Length == 0) continue;
-                if (proc == p) return true;
-            }
-            return false;
         }
 
         private static string ProcessNameOf(uint pid)
@@ -556,8 +554,12 @@ namespace OpenSwitcher.Core
                 // хоткея Ctrl+Space его собственное нажатие засчитывалось как
                 // «набор после слова», и точный путь (каретка сразу после слова)
                 // никогда не срабатывал — всегда шло выделение слева.
+                bool isCtrlZ = (k.vkCode & 0xFF) == 0x5A &&
+                               (Native.GetAsyncKeyState(0x11) & 0x8000) != 0 &&
+                               (Native.GetAsyncKeyState(0x10) & 0x8000) == 0 &&
+                               (k.flags & Native.LLKHF_ALTDOWN) == 0;
                 if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) && !IsUndoHotkey(k) &&
-                    !IsFixWordHotkey(k) && !(_undoPending && (k.vkCode & 0xFF) == 0x08))
+                    !IsFixWordHotkey(k) && !(_undoPending && ((k.vkCode & 0xFF) == 0x08 || isCtrlZ)))
                     _keysSinceUndoPoint++;
 
                 // лок живёт только внутри сеанса набора, при котором сработал: пауза
@@ -568,9 +570,25 @@ namespace OpenSwitcher.Core
                     if (_autoLocked && unchecked(Environment.TickCount - _lastInputTick) >= SessionPauseMs)
                     {
                         _autoLocked = false;
+                        _autoLockedWordsTyped = 0;
                         Log("auto-unlock: session pause " + unchecked(Environment.TickCount - _lastInputTick) + " ms");
                     }
                     _lastInputTick = Environment.TickCount;
+                }
+
+                if (treatAsReal)
+                {
+                    int rvk = (int)(k.vkCode & 0xFF);
+                    if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
+                    {
+                        _isAutoRepeat = !IsModifierVk(k.vkCode) && rvk == _lastDownVk;
+                        _lastDownVk = rvk;
+                    }
+                    else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
+                    {
+                        if (rvk == _lastDownVk) _lastDownVk = 0;
+                        _isAutoRepeat = false;
+                    }
                 }
 
                 if (Environment.TickCount >= _suppressUntil)
@@ -584,90 +602,140 @@ namespace OpenSwitcher.Core
                         if (treatAsReal && !OnKeyUp(k)) return SwallowKey; // проглотить (Caps Lock и т.п.)
                     }
                 }
-                else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
-                         IsLetterVk((int)(k.vkCode & 0xFF)))
+                else if (treatAsReal && (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN))
                 {
-                    // suppress-окно: конвертация запрещена, но БУФЕР синхронизируем —
-                    // иначе следующая конвертация сотрёт меньше, чем юзер успел набрать тут
-                    // Ctrl/Alt/Win+буква — команда, не текст: буфер под ноль (как в OnKeyDown)
-                    if (HeldCmdMods(k))
+                    int svk = (int)(k.vkCode & 0xFF);
+                    bool sctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
+                    // P1-6: Break или Ctrl+Z внутри suppress-окна не должны блокироваться, иначе юзер не может мгновенно откатить
+                    if (!IsModifierVk(k.vkCode) && (svk == S.HotUndoVk || (sctrl && svk == 0x5A) || IsUndoHotkey(k)))
                     {
+                        _suppressUntil = 0;
+                        if (!OnKeyDown(k)) return SwallowKey;
+                    }
+                    else if (!IsModifierVk(k.vkCode) && IsLetterVk(svk))
+                    {
+                        // suppress-окно: конвертация запрещена, но БУФЕР синхронизируем —
+                        // иначе следующая конвертация сотрёт меньше, чем юзер успел набрать тут
+                        if (HeldCmdMods(k))
+                        {
+                            _buf.Clear();
+                            _lastWordSepVk = 0;
+                            _prevSingle = null; _boundaryClean = false;
+                            _autoRejectEligible = false;
+                            if (_undoPending) _undoTailBroken = true;
+                        }
+                        else
+                        {
+                            bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+                            bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
+                            _autoRejectEligible = false;
+                            if ((sh && svk == 0xBD) || (svk == 0xBD && _buf.Count == 0)) // '_' или ведущий '-' (-rf, --help)
+                            {
+                                _buf.Clear();
+                                _wordTainted = true;
+                                _lastWordSepVk = 0;
+                                _prevSingle = null; _boundaryClean = false;
+                                if (_undoPending && !_undoTailBroken)
+                                {
+                                    if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(svk, sh, cp));
+                                    else _undoTailBroken = true;
+                                }
+                            }
+                            else
+                            {
+                                var recS = new KeyRec(svk, sh, cp);
+                                if (_buf.Count == 0) { _wordStartClean = _boundaryClean && !_wordTainted; _bufStartHkl = _fgHkl; }
+                                _buf.Push(recS);
+                                if (_buf.Overflowed) { _wordTainted = true; _prevSingle = null; }
+                                if (_undoPending && !_undoTailBroken)
+                                {
+                                    if (_undoTail.Count < 16) _undoTail.Add(recS);
+                                    else _undoTailBroken = true;
+                                }
+                            }
+                        }
+                    }
+                    else if (!IsModifierVk(k.vkCode) && IsDigitVk(svk) && (Native.GetAsyncKeyState(0x10) & 0x8000) == 0)
+                    {
+                        bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
                         _buf.Clear();
+                        if (!HeldCmdMods(k)) { _wordTainted = true; _autoRejectEligible = false; }
                         _lastWordSepVk = 0;
                         _prevSingle = null; _boundaryClean = false;
-                    }
-                    else
-                    {
-                        bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
-                        bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
-                        var recS = new KeyRec((int)(k.vkCode & 0xFF), sh, cp);
-                        if (_buf.Count == 0) { _wordStartClean = _boundaryClean; _bufStartHkl = _fgHkl; }
-                        _buf.Push(recS);
-                        if (_undoPending && !_undoTailBroken)
+                        if (!HeldCmdMods(k) && _undoPending && !_undoTailBroken)
                         {
-                            if (_undoTail.Count < 16) _undoTail.Add(recS);
+                            if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(svk, false, cp));
                             else _undoTailBroken = true;
                         }
                     }
-                }
-                else if (msg == Native.WM_KEYDOWN && treatAsReal && !IsModifierVk(k.vkCode) &&
-                         IsSeparatorVk((int)(k.vkCode & 0xFF)))
-                {
-                    // suppress-окно и РАЗДЕЛИТЕЛЬ (пробел, цифры, знаки): граница слова обязана
-                    // делить буфер, иначе слова слипаются ('чтосправками') и конвертация теряется
-                    int sv = (int)(k.vkCode & 0xFF);
-                    bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
-                    bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
-                    if (_buf.Count > 0)
+                    else if (!IsModifierVk(k.vkCode) &&
+                             IsSeparatorVk(svk, (Native.GetAsyncKeyState(0x10) & 0x8000) != 0))
                     {
-                        _lastWord = _buf.Snapshot();
-                        _lastWordAt = Environment.TickCount;
-                        _lastWordHwnd = IntPtr.Zero;
+                        bool sh = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
+                        bool cp = (Native.GetAsyncKeyState(0x14) & 0x0001) != 0;
+                        if (_buf.Count > 0)
+                        {
+                            _lastWord = _buf.Snapshot();
+                            _lastWordAt = Environment.TickCount;
+                            _lastWordHwnd = IntPtr.Zero;
+                        }
+                        _lastWordSepVk = 0;
+                        _autoRejectEligible = false;
+                        if (!HeldCmdMods(k) && _undoPending && !_undoTailBroken)
+                        {
+                            if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(svk, sh, cp));
+                            else _undoTailBroken = true;
+                        }
+                        if (svk == 0x20 && !HeldCmdMods(k)) _spaceAtCaretTick = Environment.TickCount;
+                        _prevSingle = null;
+                        bool plainSp = svk == 0x20 && !sh && !HeldCmdMods(k);
+                        if (plainSp) _wordTainted = false;
+                        _boundaryClean = plainSp;
+                        _buf.Clear();
                     }
-                    _lastWordSepVk = 0; // и при пустом буфере: 'привет␣' + пробел — после слова уже два символа
-                    // знак дошёл до приложения — он часть хвоста отката, иначе Break
-                    // после быстрого 'ghbdtn␣vbh␣' стирал на символ меньше и оставлял 'п'.
-                    // Ctrl/Alt/Win-сочетания текста не вставляют — не хвост
-                    if (!HeldCmdMods(k) && _undoPending && !_undoTailBroken)
+                    else if (svk == 0x08) // Backspace: даём OnKeyDown единую обработку отката и стирания хвоста
                     {
-                        if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(sv, sh, cp));
-                        else _undoTailBroken = true;
+                        if (_undoPending && _undoFromAuto && _autoRejectEligible)
+                        {
+                            if (!OnKeyDown(k)) return SwallowKey;
+                        }
+                        else if (HeldCmdMods(k))
+                        {
+                            _buf.Clear();
+                            _lastWordSepVk = 0;
+                            _prevSingle = null; _boundaryClean = false;
+                            _autoRejectEligible = false;
+                            if (_undoPending) _undoTailBroken = true;
+                        }
+                        else
+                        {
+                            if (_buf.Count == 0) { _lastWordSepVk = 0; _prevSingle = null; _boundaryClean = false; }
+                            _buf.Pop();
+                            if (_undoPending && !_undoTailBroken)
+                            {
+                                if (_undoTail.Count > 0) _undoTail.RemoveAt(_undoTail.Count - 1);
+                                else _undoTailBroken = true;
+                            }
+                        }
                     }
-                    if (sv == 0x20 && !HeldCmdMods(k)) _spaceAtCaretTick = Environment.TickCount; // пробел ушёл в текст
-                    // в suppress слово не конвертируется — кандидата ретро-флипа не армим
-                    _prevSingle = null;
-                    _boundaryClean = sv == 0x20 && !sh && !HeldCmdMods(k);
-                    _buf.Clear();
-                }
-                else if (msg == Native.WM_KEYDOWN && treatAsReal && (k.vkCode & 0xFF) == 0x08)
-                {
-                    // suppress-окно и ЗАБОЙ: тот же учёт, что в OnKeyDown — иначе откат после
-                    // быстрого забоя стирал на символ больше (хвост/буфер не знали о забое)
-                    if (HeldCmdMods(k)) // Ctrl+Backspace = удалить слово — откат небезопасен
+                    else if (svk == 0x0D) // Enter (P1-6: очищаем буфер, чтобы слова не склеивались между сообщениями)
                     {
                         _buf.Clear();
                         _lastWordSepVk = 0;
-                        _prevSingle = null; _boundaryClean = false;
+                        _prevSingle = null; _boundaryClean = true; _wordTainted = false;
+                        _autoRejectEligible = false;
                         if (_undoPending) _undoTailBroken = true;
                     }
-                    else
+                    else if (svk == 0x09 || svk == 0x1B || (svk >= 0x21 && svk <= 0x28) || svk == 0x2D || svk == 0x2E || (svk >= 0x70 && svk <= 0x87))
                     {
-                        if (_buf.Count == 0) { _lastWordSepVk = 0; _prevSingle = null; _boundaryClean = false; }
-                        _buf.Pop();
-                        if (_undoPending && !_undoTailBroken)
-                        {
-                            if (_undoTail.Count > 0) _undoTail.RemoveAt(_undoTail.Count - 1);
-                            else _undoTailBroken = true; // стёрли сам заменённый текст/досланный разделитель
-                        }
+                        // P1-6: Tab / Esc / стрелки / Home / End / Del внутри suppress тоже обязаны чистить буфер
+                        _buf.Clear();
+                        _lastWordSepVk = 0;
+                        _wordTainted = false;
+                        _prevSingle = null; _boundaryClean = false;
+                        _autoRejectEligible = false;
+                        if (_undoPending) _undoTailBroken = true;
                     }
-                }
-                else if (msg == Native.WM_KEYDOWN && treatAsReal && (k.vkCode & 0xFF) == 0x0D)
-                {
-                    // suppress-окно и ENTER: буфер не делим (известное расхождение), но откат
-                    // после Enter запрещён и точный force-flip невозможен — как в OnKeyDown
-                    _lastWordSepVk = 0;
-                    _prevSingle = null; _boundaryClean = true;
-                    if (_undoPending) _undoTailBroken = true;
                 }
             }
             return Native.CallNextHookEx(_kbHook, code, wParam, lParam);
@@ -726,11 +794,23 @@ namespace OpenSwitcher.Core
                    (vk >= 0xA0 && vk <= 0xA5);
         }
 
-        /// <summary>Настоящий разделитель — знак В ОБОИХ раскладках (пробел, цифры, '=', '/', '\').
-        /// б/ю/ж/э/х/ъ/ё-клавиши — буквы (IsLetterVk), слово они не заканчивают.</summary>
-        private static bool IsSeparatorVk(int vk)
+        /// <summary>Цифровая клавиша верхнего ряда 0..9 или Numpad 0..9.</summary>
+        public static bool IsDigitVk(int vk)
         {
-            return vk == 0x20 || (vk >= 0x30 && vk <= 0x39) || vk == 0xBB || vk == 0xBF || vk == 0xDC;
+            return (vk >= 0x30 && vk <= 0x39) || (vk >= 0x60 && vk <= 0x69);
+        }
+
+        public static bool IsNumpadOpVk(int vk)
+        {
+            return vk >= 0x6A && vk <= 0x6F; // *, +, Sep, -, ., /
+        }
+
+        /// <summary>Разделитель конца слова: пробел, '=', '/', '\' и Shift+цифра ('!', '?', '"', ';', ':').
+        /// Голые цифры 0..9 НЕ считаются разделителями конца слова, чтобы не ломать 'snow7', 'gpt4', 'v2'.</summary>
+        public static bool IsSeparatorVk(int vk, bool shift)
+        {
+            if (IsDigitVk(vk)) return shift;
+            return vk == 0x20 || vk == 0xBB || vk == 0xBF || vk == 0xDC;
         }
 
         /// <summary>Зажаты Ctrl/Alt/Win — сочетание-команда, текст оно не вставляет
@@ -832,8 +912,8 @@ namespace OpenSwitcher.Core
                 return true;
             }
 
-            // пауза автоперевода — глобальный тумблер, работает в любом окне
-            if (S.HotAutoToggleVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotAutoToggleVk, S.HotAutoToggleMods))
+            // пауза автоперевода — глобальный тумблер, работает в любом окне (авторепит игнорируем)
+            if (!_isAutoRepeat && S.HotAutoToggleVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotAutoToggleVk, S.HotAutoToggleMods))
             {
                 ToggleAuto();
                 return false;
@@ -841,14 +921,8 @@ namespace OpenSwitcher.Core
 
             // ---- ручные действия: работают всегда (и в паузе, и в исключённых приложениях)
 
-            // Backspace после автозамены — ОБЫЧНЫЙ ЗАБОЙ (юзер запретил
-            // backspace-cancel 07.10: в Caramba/Punto отмена — только Break,
-            // хоткей ниже; он же кладёт слово в rejected). Забой при пустом
-            // хвосте ломает точку отката (_undoTailBroken в обработчике 0x08) —
-            // Break после правки честно откажется, force-flip подхватит
-
             // отмена последней автозамены (Break по умолчанию)
-            if (S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))
+            if (!_isAutoRepeat && S.HotUndoVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotUndoVk, S.HotUndoMods))
             {
                 _prevSingle = null; // ручная правка текста — ретро-кандидат недостоверен
                 string undoBlock = UndoBlockReason();
@@ -860,11 +934,6 @@ namespace OpenSwitcher.Core
                 }
                 else
                 {
-                    // откатить нечего ИЛИ откат уже невозможен (протух/хвост сломан/другое поле):
-                    // Break означает «детектор слово не осилил, а надо было» — переворачиваем
-                    // последнее слово. Раньше протухшая точка отката перехватывала Break навсегда:
-                    // бой 28.09 16:53 — 'СУЩ' в буфере, откат 'pdjyjr' 38 с назад, Break ×2 ->
-                    // 'undo skip: tail broken', слово не перевернуть до следующей замены
                     Log("hotkey: undo -> " + undoBlock + ", force flip");
                     if (!ForceFlipLastWord())
                         FireInfo(_undoPending ? UndoBlockMessage(undoBlock)
@@ -872,14 +941,14 @@ namespace OpenSwitcher.Core
                 }
                 return false;
             }
-            if (S.HotFixWordVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixWordVk, S.HotFixWordMods))
+            if (!_isAutoRepeat && S.HotFixWordVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixWordVk, S.HotFixWordMods))
             {
                 Log("hotkey: fix-last-word");
                 _prevSingle = null;
                 DoFixLastWord();
                 return false;
             }
-            if (S.HotFixSelVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixSelVk, S.HotFixSelMods))
+            if (!_isAutoRepeat && S.HotFixSelVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotFixSelVk, S.HotFixSelMods))
             {
                 Log("hotkey: fix-selection");
                 _prevSingle = null; _boundaryClean = false;
@@ -887,13 +956,13 @@ namespace OpenSwitcher.Core
                 return false;
             }
             // клавиши раскладок: сочетания с модификаторами — срабатывают по нажатию
-            if (S.HotRuMods != 0 && S.HotRuVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotRuVk, S.HotRuMods))
+            if (!_isAutoRepeat && S.HotRuMods != 0 && S.HotRuVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotRuVk, S.HotRuMods))
             {
                 Log("hotkey: layout RU (combo)");
                 SwitchToLanguage(0);
                 return false;
             }
-            if (S.HotEnMods != 0 && S.HotEnVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotEnVk, S.HotEnMods))
+            if (!_isAutoRepeat && S.HotEnMods != 0 && S.HotEnVk != 0 && MatchHot(vk, ctrl, shift, alt, win, S.HotEnVk, S.HotEnMods))
             {
                 Log("hotkey: layout EN (combo)");
                 SwitchToLanguage(1);
@@ -901,8 +970,8 @@ namespace OpenSwitcher.Core
             }
             // клавиши раскладок: тап-режим (Caps Lock, Scroll Lock, Insert, F-клавиши).
             // с зажатыми Ctrl/Alt/Win пропускаем — это уже чужое сочетание
-            if ((S.HotRuMods == 0 && S.HotRuVk != 0 && vk == S.HotRuVk) ||
-                (S.HotEnMods == 0 && S.HotEnVk != 0 && vk == S.HotEnVk))
+            if (!_isAutoRepeat && ((S.HotRuMods == 0 && S.HotRuVk != 0 && vk == S.HotRuVk) ||
+                (S.HotEnMods == 0 && S.HotEnVk != 0 && vk == S.HotEnVk)))
             {
                 if (heldMods) return true;
                 _tapVk = vk;
@@ -924,7 +993,7 @@ namespace OpenSwitcher.Core
                 }
                 else
                 {
-                    if (IsLetterVk(vk))
+                    if (IsLetterVk(vk) && !(shift && vk == 0xBD))
                     {
                         // Ctrl/Alt/Win+буква в лаге смены раскладки — команда: в
                         // отложенные буквы не пишем (та же фантомная 'a'), как есть
@@ -939,40 +1008,81 @@ namespace OpenSwitcher.Core
                     }
                     if (vk == 0x08)
                     {
-                        if (_gapBuf.Count == 0) return true; // откладывать нечего — backspace проходит как есть
-                        _gapBuf.RemoveAt(_gapBuf.Count - 1);
-                        return false;
+                        if (_gapBuf.Count == 0)
+                        {
+                            _gapActive = false;
+                        }
+                        else
+                        {
+                            _gapBuf.RemoveAt(_gapBuf.Count - 1);
+                            return false;
+                        }
                     }
-                    FlushGap();
-                    return true; // остальное (пробел и т.п.) — как есть, после отложенных букв
+                    else
+                    {
+                        FlushGap();
+                        _gapActive = false;
+                        // НЕ выходим по return true: даём разделителю/цифре/Enter штатно обработаться ниже!
+                    }
                 }
             }
 
             // ---- дальше — только авто-логика; в исключённых приложениях глушим
             if (IsExcludedHere()) { _buf.Clear(); return true; }
 
+            // ---- Ctrl+Z сразу после автозамены: юзер отменил исправление штатным Undo редактора ->
+            //      запоминаем слово в rejected и ставим кулдаун 5 с (ТОЛЬКО если не было промежуточного ввода!)
+            if (vk == 0x5A && ctrl && !shift && !alt && !win)
+            {
+                if (_undoPending && _undoFromAuto && _autoRejectEligible && !_undoTailBroken &&
+                    _keysSinceUndoPoint == 0 && unchecked(Environment.TickCount - _undoTick) < 8000)
+                {
+                    string badZ = _undoText;
+                    Log("auto-reject via Ctrl+Z: '" + badZ + "'");
+                    Defer(delegate { RememberRejected(badZ); RemoveAccepted(badZ); });
+                    _noFlipUntil = Environment.TickCount + 5000;
+                    _undoPending = false;
+                }
+                _autoRejectEligible = false;
+                _buf.Clear();
+                _lastWordSepVk = 0;
+                _prevSingle = null; _boundaryClean = false;
+                if (_undoPending) _undoTailBroken = true;
+                return true;
+            }
+
             if (IsLetterVk(vk))
             {
-                // Ctrl/Alt/Win+буква — сочетание-команда, а не текст (Ctrl+A/V/C/Z):
-                // после него текст у каретки ненадёжен — буфер под ноль. Пушить букву
-                // нельзя: фантомная 'a' от Ctrl+A собирала мусорное слово и дёргала
-                // конвертацию с флипом раскладки (бой mac 23:31)
+                // Ctrl/Alt/Win+буква — сочетание-команда, а не текст (Ctrl+A/V/C/X/T/W):
+                // после него текст у каретки ненадёжен — буфер под ноль и ломаем откат.
                 if (heldMods)
                 {
                     _buf.Clear();
                     _lastWordSepVk = 0;
                     _prevSingle = null; _boundaryClean = false;
+                    _autoRejectEligible = false;
+                    if (_undoPending) { _undoPending = false; _undoTailBroken = true; }
+                    return true;
+                }
+                _autoRejectEligible = false;
+                // Shift + '-' = '_' (snake_case) или ведущий '-' (-rf, --help): помечаем токен кодом
+                if ((shift && vk == 0xBD) || (vk == 0xBD && _buf.Count == 0))
+                {
+                    _buf.Clear();
+                    _wordTainted = true;
+                    _lastWordSepVk = 0;
+                    _prevSingle = null; _boundaryClean = false;
+                    if (_undoPending && !_undoTailBroken)
+                    {
+                        if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
+                        else _undoTailBroken = true;
+                    }
                     return true;
                 }
                 KeyRec rec = new KeyRec(vk, shift, caps);
-                if (_buf.Count == 0) { _wordStartClean = _boundaryClean; _bufStartHkl = _fgHkl; } // что стоит перед словом (ретро-флип)
+                if (_buf.Count == 0) { _wordStartClean = _boundaryClean && !_wordTainted; _bufStartHkl = _fgHkl; }
                 _buf.Push(rec);
-
-
-                // ЖИВОЕ ИСПРАВЛЕНИЕ УДАЛЕНО: переворот до разделителя — это конвертация
-                // недопечатанного слова прямо под пальцами (юзер жмёт дальше, инжекция
-                // вклинивается — получаются 'ce,,fuента'). Слово ловится строго по
-                // разделителю (пробел/знак/Enter).
+                if (_buf.Overflowed) { _wordTainted = true; _prevSingle = null; }
 
                 // хвост отката: запоминаем, что юзер напечатал после замены
                 if (_undoPending && !_undoTailBroken && !ctrl && !alt && !win)
@@ -983,25 +1093,90 @@ namespace OpenSwitcher.Core
                 return true;
             }
 
-            if (vk == 0x08) // Backspace: обычный забой — правим и хвост отката
+            // Голые цифры 0..9 + Numpad 0..9 и Numpad-операторы (* + - . /):
+            // НЕ конвертируем предшествующий кусок слова ('snow7', 'gpt4', 'v2'), помечаем токен смешанным
+            if (IsDigitVk(vk) && (!shift || (vk >= 0x60 && vk <= 0x69)))
             {
-                if (ctrl || alt || win) // Ctrl+Backspace = удалить слово — откат небезопасен
+                if (heldMods)
                 {
                     _buf.Clear();
                     _lastWordSepVk = 0;
                     _prevSingle = null; _boundaryClean = false;
+                    _autoRejectEligible = false;
                     if (_undoPending) _undoTailBroken = true;
                     return true;
                 }
-                // забой при пустом буфере стирает разделитель/само слово — каретка уже
-                // не за [слово+разд], точный force-flip стёр бы лишний символ; ретро-кандидат
-                // ('f␣' — стёрли пробел) и чистота границы тоже больше не известны
-                if (_buf.Count == 0) { _lastWordSepVk = 0; _prevSingle = null; _boundaryClean = false; }
-                _buf.Pop();
+                _buf.Clear();
+                _wordTainted = true;
+                _autoRejectEligible = false;
+                _lastWordSepVk = 0;
+                _prevSingle = null; _boundaryClean = false;
                 if (_undoPending && !_undoTailBroken)
                 {
-                    if (_undoTail.Count > 0) _undoTail.RemoveAt(_undoTail.Count - 1);
-                    else _undoTailBroken = true; // стёрли сам заменённый текст — откат больше не воспроизведёт историю
+                    if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, false, caps));
+                    else _undoTailBroken = true;
+                }
+                return true;
+            }
+
+            if (IsNumpadOpVk(vk))
+            {
+                _buf.Clear();
+                _wordTainted = true;
+                _autoRejectEligible = false;
+                _lastWordSepVk = 0;
+                _prevSingle = null; _boundaryClean = false;
+                if (_undoPending) _undoTailBroken = true;
+                return true;
+            }
+
+            if (vk == 0x08) // Backspace: забой + распознавание ручного стирания свежей автозамены
+            {
+                if (ctrl || alt || win) // Ctrl+Backspace = удалить слово
+                {
+                    if (_undoPending && _undoFromAuto && _autoRejectEligible && !_undoTailBroken &&
+                        _undoTail.Count == 0 && _keysSinceUndoPoint == 0 &&
+                        unchecked(Environment.TickCount - _undoTick) < 8000)
+                    {
+                        string badW = _undoText;
+                        Log("auto-reject via Ctrl+BS: '" + badW + "'");
+                        Defer(delegate { RememberRejected(badW); RemoveAccepted(badW); });
+                        _noFlipUntil = Environment.TickCount + 5000;
+                    }
+                    _autoRejectEligible = false;
+                    _buf.Clear();
+                    _lastWordSepVk = 0;
+                    _prevSingle = null; _boundaryClean = false;
+                    if (_undoPending) { _undoPending = false; _undoTailBroken = true; }
+                    return true;
+                }
+                if (_buf.Count == 0) { _lastWordSepVk = 0; _prevSingle = null; _boundaryClean = false; }
+                _buf.Pop();
+                if (_undoPending)
+                {
+                    if (!_undoTailBroken && _undoTail.Count > 0)
+                    {
+                        _undoTail.RemoveAt(_undoTail.Count - 1);
+                        _autoRejectEligible = false;
+                    }
+                    else
+                    {
+                        _undoTailBroken = true;
+                        if (_undoFromAuto && _autoRejectEligible && unchecked(Environment.TickCount - _undoTick) < 8000)
+                        {
+                            _undoErasedByBs++;
+                            int threshold = Math.Max(2, _undoLen - 1);
+                            if (_undoErasedByBs >= threshold)
+                            {
+                                string badBs = _undoText;
+                                Log("auto-reject via BSx" + _undoErasedByBs + ": '" + badBs + "'");
+                                Defer(delegate { RememberRejected(badBs); RemoveAccepted(badBs); });
+                                _noFlipUntil = Environment.TickCount + 5000;
+                                _undoPending = false;
+                                _autoRejectEligible = false;
+                            }
+                        }
+                    }
                 }
                 return true;
             }
@@ -1018,99 +1193,83 @@ namespace OpenSwitcher.Core
                     _lastWordAt = Environment.TickCount;
                     _lastWordHwnd = _fgHwnd;
                 }
-                // после Enter (любого, и при пустом буфере: 'слово␣' + Enter) точный
-                // переворот невозможен — строка ушла/перенеслась, Break печатал бы в пустое поле
                 _lastWordSepVk = 0;
                 if (!modified && S.FixOnEnter)
-                    converted = TryConvertWord(word, 0x0D, false, false); // ретро-флип 'f␣ns'+Enter — внутри
-                _prevSingle = null; _boundaryClean = true; // новая строка / сообщение ушло
-                // одиночные буквы на Enter не конвертируются (как и на пробеле):
-                // у одной буквы нет сигнала намерения
-                // ВАЖНО: Enter лок НЕ снимает — в длинном тексте энтеры подряд,
-                // а сессия ввода (окно) не сменилась. Лок держится до смены окна.
-                // хвост отката после Enter восстановить нельзя
+                    converted = TryConvertWord(word, 0x0D, false, false);
+                if (!converted && _autoLocked && word.Count > 0)
+                    _autoLockedWordsTyped++;
+                _prevSingle = null; _boundaryClean = true; _wordTainted = false;
                 _undoTailBroken = true;
+                _autoRejectEligible = false;
                 _buf.Clear();
                 return !converted; // проглотить Enter, если конвертнули (перешлём свой)
             }
 
             if (vk == 0x09 || vk == 0x1B) // Tab / Esc
             {
-                _buf.Clear(); _lastWordSepVk = 0;
+                _buf.Clear(); _lastWordSepVk = 0; _wordTainted = false;
                 _prevSingle = null; _boundaryClean = false; // что перед кареткой — неизвестно
+                _autoRejectEligible = false;
+                if (_undoPending) _undoTailBroken = true;
                 return true;
             }
 
-            // настоящие разделители — знаки В ОБОИХ раскладках (пробел, цифры, '=', '.', '\').
-            // б/ю/ж/э/х/ъ/ё-клавиши — буквы (IsLetterVk), слово они не заканчивают
-            if (IsSeparatorVk(vk))
+            // настоящие разделители — пробел, '=', '/', '\' и Shift+цифра ('!', '?', '"', ';', ':').
+            if (IsSeparatorVk(vk, shift))
             {
-                // при зажатых Ctrl/Alt/Win (шорткаты) не вмешиваемся. Shift — НЕ шорткат:
-                // '?', '!', '"', ',' (RU Shift+/) — текст и конец слова (бой 29.09 19:24:37 —
-                // слово+'?' не конвертилось вовсе, без строки в логе, и Break его не видел)
                 bool cmdMods = ctrl || alt || win;
                 bool modified = cmdMods || shift;
                 bool converted = false;
-                // дедуп двойных пробелов — в KeyboardProc (до suppress): пробел сразу после пробела
 
-                // ОДИНОЧНЫЕ БУКВЫ НЕ КОНВЕРТИРУЮТСЯ АВТОМАТИЧЕСКИ (v2, после жалоб):
-                // у одной буквы нет сигнала намерения — wordness-флип то не срабатывал
-                // когда нужен ('f' в начале фразы), то портил латинские токены
-                // ('b2b' -> 'b2и'). Осознанный переворот — Break (force-flip).
-                // Исключение — ретро-флип: буква переворачивается ВМЕСТЕ со следующим
-                // сконвертированным словом ('f␣ns' -> «а ты»), см. TryConvertWord.
+                // Префиксы команд/упоминаний/путей при пустом буфере ('/plan', '@nick', '#tag', '$var')
+                bool isSlashPrefix = (vk == 0xBF && !shift && _buf.Count == 0);
+                bool isMentionPrefix = (shift && _buf.Count == 0 && (vk == 0x32 || vk == 0x33 || vk == 0x34));
+                if (isSlashPrefix || isMentionPrefix) _wordTainted = true;
 
                 if (!converted && !cmdMods && S.AutoConvertOnWordEnd && _buf.Count > 0)
                 {
                     List<KeyRec> word = _buf.Snapshot();
-                    // разделитель проглатывается и досылается ПОСЛЕ замены — иначе он
-                    // доходит до приложения раньше backspace'ов и ломает слово
                     converted = TryConvertWord(word, vk, shift, false);
+                }
+                if (!converted && vk == 0xBF && !shift && !cmdMods)
+                {
+                    _wordTainted = true; // 'fix/branch', 'https://site/path' — остаток пути не трогаем
                 }
                 if (_buf.Count > 0 && !cmdMods)
                 {
                     _lastWord = _buf.Snapshot();
                     _lastWordAt = Environment.TickCount;
-                    _lastWordHwnd = _fgHwnd; _lastWordSepVk = vk;       // разделитель сразу после слова — нужен точному перевороту
-                    _lastWordSepShift = shift;                         // '?' = Shift+/ — перепечатать тем же знаком
+                    _lastWordHwnd = _fgHwnd; _lastWordSepVk = vk;
+                    _lastWordSepShift = shift;
+                    if (!converted && _autoLocked && vk == 0x20)
+                        _autoLockedWordsTyped++;
                 }
                 else
                 {
-                    // второй разделитель подряд ('слово.␣', 'слово␣␣') или сочетание-команда —
-                    // после слова уже не ровно один известный символ: точный путь стёр бы
-                    // 'слово+1' и зацепил чужую букву
                     _lastWordSepVk = 0;
                 }
-                // цифры/знаки после замены — тоже хвост, иначе Break вернёт слово
-                // ПОВЕРХ них с перепутанным порядком символов. Shift — НЕ шорткат: '!', '?',
-                // ',' (RU Shift+/), Shift+пробел доходят до текста и обязаны быть в хвосте
-                // ('привет мир!' + Break стирал на символ меньше -> 'пghbdtn vbh').
-                // Перерисовка в исходной раскладке — как у букв: юзер жал клавиши, имея
-                // в виду её (Shift+/ после ошибочного 'акуу' ждал '?', а не ',')
                 if (!(ctrl || alt || win) && !converted && _undoPending && !_undoTailBroken && vk != 0x09)
                 {
                     if (_undoTail.Count < 16) _undoTail.Add(new KeyRec(vk, shift, caps));
                     else _undoTailBroken = true;
                 }
-                // пробел ушёл в текст (сам или досылом замены) — перед кареткой пробел: следующий
-                // пробел подряд дедуп проглотит. Ctrl/Alt/Win+пробел текста не вставляет
                 if (vk == 0x20 && !(ctrl || alt || win) && !converted) _spaceAtCaretTick = Environment.TickCount;
-                // трассировка пробелов: лишние/пропавшие пробелы ловятся здесь
                 if (vk == 0x20 && !modified)
                 {
                     Log("space: " + (converted ? "flip+resend" : "pass") +
                         " bufWas=" + _buf.Count);
                 }
-                // ретро-флип: одиночная буква после чистой границы + голый пробел — кандидат
-                // для СЛЕДУЮЩЕГО слова ('f␣' ждёт 'ns'). 'b2b␣' — нет: 'b' начата после цифры
                 bool plainSpace = vk == 0x20 && !modified;
-                if (plainSpace && !converted && _buf.Count == 1 && _wordStartClean)
+                if (plainSpace && !converted && _buf.Count == 1 && _wordStartClean && !_wordTainted)
                 {
                     _prevSingle = _buf.Snapshot();
                     _prevSingleHkl = _fgHkl;
                     _prevSingleHwnd = _fgHwnd;
                 }
                 else _prevSingle = null;
+                if (!converted) _autoRejectEligible = false;
+                if (cmdMods && _undoPending) _undoTailBroken = true;
+                if (plainSpace) _wordTainted = false;
                 _boundaryClean = plainSpace;
                 _buf.Clear();
                 return !converted; // заменили — разделитель дослали внутри
@@ -1124,6 +1283,7 @@ namespace OpenSwitcher.Core
                 // и каретка больше не за [слово+разд]
                 _lastWordSepVk = 0;
                 _prevSingle = null; _boundaryClean = false;
+                _autoRejectEligible = false;
                 if (_undoPending) _undoTailBroken = true;
                 return true;
             }
@@ -1140,11 +1300,13 @@ namespace OpenSwitcher.Core
                 {
                 if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
                 _buf.Clear();
+                _wordTainted = false;
                 _tapAlone = false;        // клик между нажатием и отпусканием отменяет тап
                 _prevSingle = null;       // каретка переехала: 'f␣' уже не перед словом
                 _spaceAtCaretTick = 0;    // и что перед ней — неизвестно (дедуп пробела снят)
                 _boundaryClean = true;    // клик в поле — как начало ввода
                 _keysSinceUndoPoint++;    // клик мог сдвинуть каретку — откат отменяем
+                _autoRejectEligible = false;
                 if (_undoPending) _undoTailBroken = true; // клик ломает откат (контракт)
                 }
             }
@@ -1158,14 +1320,17 @@ namespace OpenSwitcher.Core
             if (_buf.Count > 0) { _lastWord = _buf.Snapshot(); } _lastWordSepVk = 0; _lastWordHwnd = IntPtr.Zero;
             _spaceAtCaretTick = 0; // окно дедупа не переносится в другое окно
             _buf.Clear();
+            _wordTainted = false;
             _prevSingle = null; _boundaryClean = true; // новое окно — начало ввода
             _anyKeySinceShift = true;
             _tapAlone = false;
             _undoPending = false; // сменилось окно — откатывать нечего/небезопасно
+            _autoRejectEligible = false;
             _undoTailBroken = true;
             _gapActive = false; _gapBuf.Clear(); // буквы из другого окна не переносим
             // новое окно — новая сессия ввода: лок снимается
             _autoLocked = false;
+            _autoLockedWordsTyped = 0;
             _expectedValid = false;
             UpdateForeground();
         }
@@ -1182,34 +1347,25 @@ namespace OpenSwitcher.Core
             int vk = (int)(k.vkCode & 0xFF);
             if (_tapVk == 0 || vk != _tapVk) return true;
 
-            // тап одноразовый: после отпускания клавиши disarm, иначе осиротевший
-            // KEYUP той же клавиши (Alt+Tab, инжекция, гонка с двойным Shift)
-            // спровоцирует повторное переключение раскладки
             int armedVk = _tapVk;
             _tapVk = 0;
 
-            bool swallow = IsSwallowableTap(vk);
             int now = Environment.TickCount;
-            // Тап короче TapMinMs — случайный задев клавиши: раскладку не переключаем
-            // (сброс _tapAlone делает alone=false ниже — свитча нет, клавиша уходит
-            // в приложение как обычно). Настройка TapMinMs, 0 = ВЫКЛ (дефолт):
-            // жёсткий порог 120 мс ел РЕАЛЬНЫЕ рефлекторные тапы юзера — фильтр
-            // включается только осознанно, значением в ini
-            if (S.TapMinMs > 0)
+            int minHold = Math.Max(15, S.TapMinMs);
+            int heldMs = unchecked(now - _tapDownTick);
+            if (heldMs >= 0 && heldMs < minHold)
             {
-                int heldMs = unchecked(now - _tapDownTick);
-                if (heldMs >= 0 && heldMs < S.TapMinMs)
-                {
-                    Log("tap too short: " + heldMs + " ms");
-                    _tapAlone = false;
-                }
+                Log("tap too short: " + heldMs + " ms");
+                _tapAlone = false;
             }
-            // тап засчитывается только «голой» клавишей: Ctrl/Alt/Win рядом — чужое сочетание
+            // Защита от зажатого второго Shift'а и чужих модификаторов (Ctrl/Alt/Win)
+            bool otherShift = (armedVk == 0xA0 && (Native.GetAsyncKeyState(0xA1) & 0x8000) != 0) ||
+                              (armedVk == 0xA1 && (Native.GetAsyncKeyState(0xA0) & 0x8000) != 0);
             bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
             bool alt = (k.flags & Native.LLKHF_ALTDOWN) != 0 || (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
             bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
-            bool alone = _tapAlone && !ctrl && !alt && !win &&
-                         unchecked(now - _tapDownTick) >= 0 && unchecked(now - _tapDownTick) < 700;
+            bool alone = _tapAlone && !otherShift && !ctrl && !alt && !win &&
+                         heldMs >= 0 && heldMs < 400;
             if (alone)
             {
                 Log("tap fired: lang=" + _tapTarget);
@@ -1233,8 +1389,11 @@ namespace OpenSwitcher.Core
             }
             LayoutService.SwitchForegroundTo(_fgHwnd, target);
             ExpectLayout(target);
-            // юзер выбрал язык явно — автодетект молчит до смены окна / Enter
-            if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+            if (S.LockAutoAfterManualSwitch)
+            {
+                _autoLocked = true;
+                _autoLockedWordsTyped = 0;
+            }
             // и 2 с никаких авто-конвертаций: пока ОС применяет новую раскладку,
             // движок видит СТАРУЮ и переворачивает свеженабранное в обратную
             // сторону ('ith'->«шер» сразу после тапа на EN) — бой 23:26:01
@@ -1352,25 +1511,56 @@ namespace OpenSwitcher.Core
             return t.Length == 1 ? t : typed;
         }
 
+        /// <summary>Есть ли переход строчная -> ЗАГЛАВНАЯ внутри слова ('JoeSnow', 'iPhone', 'OpenSwitcher').</summary>
+        public static bool HasCamelCaseTransition(List<KeyRec> keys)
+        {
+            if (keys == null || keys.Count < 2) return false;
+            // P2-3: инвертированный CapsLock ('gHBDTN' -> 'пРИВЕТ': Caps ON + Shift только на 1-й букве) — не camelCase
+            if (keys[0].Caps && keys[0].Shift)
+            {
+                bool restCapsNoShift = true;
+                for (int i = 1; i < keys.Count; i++)
+                {
+                    if (!IsLetterVk(keys[i].Vk) || keys[i].Vk == 0xBD) continue;
+                    if (keys[i].Shift || !keys[i].Caps) { restCapsNoShift = false; break; }
+                }
+                if (restCapsNoShift) return false;
+            }
+            bool prevUpper = keys[0].Shift != keys[0].Caps;
+            for (int i = 1; i < keys.Count; i++)
+            {
+                if (!IsLetterVk(keys[i].Vk) || keys[i].Vk == 0xBD) continue;
+                bool curUpper = keys[i].Shift != keys[i].Caps;
+                if (!prevUpper && curUpper) return true;
+                prevUpper = curUpper;
+            }
+            return false;
+        }
+
+        /// <summary>Аббревиатура ALL_CAPS, набранная с Shift (при выключенном CapsLock), 2..5 латинских клавиш:
+        /// 'TV', 'PR', 'UI', 'API', 'SDK', 'VIP' — авто-конвертация их не трогает.</summary>
+        public static bool IsAllCapsAcronym(List<KeyRec> keys)
+        {
+            if (keys == null || keys.Count < 2 || keys.Count > 5) return false;
+            for (int i = 0; i < keys.Count; i++)
+            {
+                KeyRec kr = keys[i];
+                if (!kr.Shift || kr.Caps || kr.Vk < 0x41 || kr.Vk > 0x5A) return false;
+            }
+            return true;
+        }
+
         /// <summary>Попытка конвертации слова; manual=true — вызов явным хоткеем (игнорирует лок).
         /// resendVk — проглоченный разделитель (пробел/OEM) или Enter, который надо дослать после.</summary>
         private bool TryConvertWord(List<KeyRec> word, int resendVk, bool resendShift, bool manual)
         {
             string why = null;
-            // пол в 2 буквы (а не MinWordLen): 2-буквенные слова идут через обычные
-            // словарные ворота — переворот только если цель словарная, а набранное
-            // нет ('ye'->'ну', 'yt'->'не'); словарные 'to','ok','he' защищены
-            // cur-in-dict. Одиночные буквы не обрабатываем вовсе — сигнала ноль.
             if (S.Paused) why = "paused";
-            // поле пароля (порт с мак): конвертации там ВОВСЕ нет — буквы невидимы,
-            // любой флип посреди ввода ломает пароль целиком; ручной путь (Break) не режем
             else if (!manual && IsPasswordField()) why = "password field";
+            else if (!manual && _wordTainted) why = "tainted token (code/digits/path)";
             else if (word == null || word.Count < 2)
-                // сама буква в логе: без неё не отличить законное «в» от брошенного 'f' перед 'ns'->'ты'
                 why = "too-short (" + (word == null ? 0 : word.Count) +
                       (word != null && word.Count == 1 ? " '" + LayoutService.Render(_fgHkl, word) + "'" : "") + ")";
-            else if (!manual && S.LockAutoAfterManualSwitch && _autoLocked)
-                why = "locked (hkl=" + _fgHkl.ToInt64().ToString("X8") + " hwnd=" + _fgHwnd.ToInt64().ToString("X") + ")";
             if (why != null) { Log("convert skip: " + why); return false; }
 
             UpdateForeground();
@@ -1384,18 +1574,25 @@ namespace OpenSwitcher.Core
             foreach (LayoutCandidate c in cands) if (c.Hkl == _fgHkl) { cur = c; break; }
             if (cur == null || cur.Lang < 0) { Log("convert skip: cur unknown"); return false; }
 
-            // РАСКЛАДКА СМЕНИЛАСЬ ПОСРЕДИ СЛОВА (мac-паритет 'момогу', бой 00:19 05.11:
-            // смешанное слово конвертить нельзя — рендер буфера одной раскладкой врёт)
+            // РАСКЛАДКА СМЕНИЛАСЬ ПОСРЕДИ СЛОВА (мac-паритет 'момогу')
             if (!manual && _bufStartHkl != IntPtr.Zero && _bufStartHkl != _fgHkl)
             {
                 Log("convert skip: layout changed mid-word");
                 return false;
             }
 
+            // Защита camelCase/PascalCase (JoeSnow, OpenSwitcher); ALL_CAPS проверяется ниже после выбора цели (P2-3)
+            if (!manual)
+            {
+                if (HasCamelCaseTransition(word))
+                {
+                    Log("convert skip: camelCase ('" + cur.Text + "')");
+                    return false;
+                }
+            }
+
             string typedLow = cur.Text.ToLowerInvariant();
 
-            // обучение: это слово юзер уже отменил — автоматически не трогаем
-            // (ручной хоткей в обход: manual=true проверку не проходит)
             if (!manual && _rejected.Contains(typedLow))
             {
                 Log("convert skip: learned-rejected '" + cur.Text + "'");
@@ -1411,27 +1608,58 @@ namespace OpenSwitcher.Core
             }
             if (best == null) { Log("convert skip: no candidate"); return false; }
 
-            // РУ->EN: если набранное — СЛОВАРНОЕ русское слово, это правильный текст,
-            // набранный правильной раскладкой («нет», «была», «тип»), а не чужая
-            // раскладка — EN-прочтение не рассматриваем вовсе. Раньше такие попытки
-            // ('нет'->'ytn', 'была'->',skf') спамили лог и были опасны: любой сдвиг
-            // scoring'а — и правильное слово испорчено. EN->РУ не трогаем (ядро).
-            if (!manual && !acceptedWord && cur.Lang == 0 && best.Lang == 1 &&
-                WordDict.Has(cur.Text, 0))
+            // Умный лок после ручного выбора раскладки: первое слово защищено на 100%,
+            // но если на последующих словах юзер забыл переключиться обратно и набрал >= 4 букв
+            // однозначного слова другого языка ('cfqn'->'сайт', 'ghbdtn'->'привет') — снимаем лок.
+            if (!manual && S.LockAutoAfterManualSwitch && _autoLocked)
             {
-                Log("convert skip: cur is ru dict word ('" + cur.Text + "' -> '" + best.Text + "')");
+                string lockBestCore = LanguageTables.LettersOnly(best.Text);
+                string lockCurCore = LanguageTables.LettersOnly(cur.Text);
+                bool unambiguousForgot = _autoLockedWordsTyped >= 1 &&
+                                         word.Count >= 4 &&
+                                         WordDict.HasCore(lockBestCore, best.Lang) &&
+                                         !WordDict.Has(lockCurCore, cur.Lang) &&
+                                         !LanguageTables.PossibleWord(lockCurCore, cur.Lang);
+                if (unambiguousForgot)
+                {
+                    _autoLocked = false;
+                    _autoLockedWordsTyped = 0;
+                    Log("auto-unlock: unambiguous wrong-layout word '" + cur.Text + "' -> '" + best.Text + "'");
+                }
+                else
+                {
+                    Log("convert skip: locked (hkl=" + _fgHkl.ToInt64().ToString("X8") + " hwnd=" + _fgHwnd.ToInt64().ToString("X") + ")");
+                    return false;
+                }
+            }
+
+            // Порог минимальной длины (S.MinWordLen, по умолчанию 3) + закрытый белый список 2-буквенных слов
+            if (!manual && !acceptedWord && word.Count < S.MinWordLen)
+            {
+                bool allowedEnd = ((resendVk == 0x20 || resendVk == 0x0D) && !resendShift) ||
+                                  (resendVk == 0xBC /* , */ || resendVk == 0xBE /* . */ || resendVk == 0xBA /* ; */ || resendVk == 0xDE /* ' */ ||
+                                   (resendShift && (resendVk == 0x31 /* ! */ || resendVk == 0x37 /* ? / & */ || resendVk == 0xBF /* ? */)));
+                string twoBestCore = LanguageTables.LettersOnly(best.Text);
+                if (!(word.Count == 2 && _wordStartClean && allowedEnd &&
+                      WordDict.IsAllowedTwoLetterAuto(cur.Text, twoBestCore, cur.Lang, best.Lang)))
+                {
+                    Log("convert skip: below MinWordLen ('" + cur.Text + "' -> '" + best.Text + "')");
+                    return false;
+                }
+            }
+
+            string curCoreLetters = LanguageTables.LettersOnly(cur.Text);
+            // РУ->EN защита любого реального/возможного русского слова
+            if (!manual && !acceptedWord && cur.Lang == 0 && best.Lang == 1 &&
+                (WordDict.Has(curCoreLetters, 0) || LanguageTables.PossibleWord(curCoreLetters, 0)))
+            {
+                Log("convert skip: cur is real ru word ('" + cur.Text + "' -> '" + best.Text + "')");
                 return false;
             }
 
             // РУ->EN авто-переворот коротких (<5 букв): ДО 3 букв — всегда нет
-            // («ща», «рф», «фс» — правильный русский, его EN-прочтение — мусор 'of'/'ha').
-            // 3-4 буквы — отказ только если набранное ПРАВИЛЬНОЕ русское («еще», «она»);
-            // мусор вроде 'кфп' конвертится в словарную EN-цель ('rag', 'git') — гейт
-            // целиком блокировал класс коротких EN-слов (бой 03:19:46, юзер рвался
-            // Break'ом и получал хаос отката). Цель без словаря всё равно отсечётся
-            // главным правилом ниже. 5+ букв — без гейта.
             if (!manual && !acceptedWord && cur.Lang == 0 && best.Lang == 1 && word.Count < 5 &&
-                (word.Count < 3 || WordDict.Has(cur.Text, 0)))
+                (word.Count < 3 || WordDict.Has(curCoreLetters, 0)))
             {
                 Log("convert skip: ru->en short ('" + cur.Text + "' -> '" + best.Text + "')");
                 return false;
@@ -1524,14 +1752,72 @@ namespace OpenSwitcher.Core
             if (!pass && acceptedWord && best.Text == LanguageTables.LettersOnly(best.Text))
                 pass = true;
 
+            string curCore = LanguageTables.LettersOnly(cur.Text);
+            string bestCore = LanguageTables.LettersOnly(best.Text);
+
+            // P2-3: аббревиатуры (TV, API, SQL) защищаем, НО русские слова в ALL_CAPS без английских
+            // гласных (XNJ -> ЧТО, YTN -> НЕТ, GJRF -> ПОКА) разрешаем к автоконвертации
+            if (!manual && cur.Lang == 1 && IsAllCapsAcronym(word))
+            {
+                string cLowEn = curCore.ToLowerInvariant();
+                bool hasEnVowel = false;
+                for (int i = 0; i < cLowEn.Length; i++)
+                {
+                    char c = cLowEn[i];
+                    if (c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u') { hasEnVowel = true; break; }
+                }
+                bool isRuCapsWord = word.Count >= 3 && best.Lang == 0 && !hasEnVowel &&
+                    fuzzyNeighbor == null && !WordDict.Has(curCore, 1) && WordDict.HasCore(bestCore, 0);
+                if (!isRuCapsWord)
+                {
+                    Log("convert skip: all-caps acronym ('" + cur.Text + "')");
+                    return false;
+                }
+                Log("convert: ru all-caps word ('" + cur.Text + "' -> '" + best.Text + "')");
+            }
+
+            if (!manual && !acceptedWord && cur.Lang == 1 && IsDomainOrFileName(cur.Text))
+            {
+                Log("convert skip: domain/filename ('" + cur.Text + "')");
+                return false;
+            }
+
+            // P0-2: Защита английских слов со знаками препинания ("here.", "it.", "her,", "keys.", "vs."):
+            // если набранное английское ядро — валидное слово в словаре, не переключаем на русский
+            if (!manual && !acceptedWord && cur.Lang == 1 && best.Lang == 0 && WordDict.Has(curCore, 1))
+            {
+                Log("convert skip: en-word with punctuation ('" + cur.Text + "' -> '" + best.Text + "')");
+                return false;
+            }
+
+            if (!manual && !acceptedWord && cur.Lang == 1 && cur.Text.IndexOf('-') >= 0)
+            {
+                string[] parts = cur.Text.Split('-');
+                if (parts.Length >= 2)
+                {
+                    bool allEnWords = true;
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        if (!WordDict.Has(parts[i], 1)) { allEnWords = false; break; }
+                    }
+                    if (allEnWords)
+                    {
+                        Log("convert skip: en compound word ('" + cur.Text + "')");
+                        return false;
+                    }
+                }
+            }
+
             // Частотный пол цели (EN -0.05 / RU -0.55) режет и настоящие слова с редкими
             // биграммами ('что' ниже пола: пары 'чт' нет в таблице). Если цель — словарное
             // слово, а набранное — нет, скорингу верить нельзя: словарь перевешивает
             // (selftest давно ожидал это правило — в движке его не было).
             // Для целей с хвостовым знаком-двойником («привет,») словарь проверяем
             // по буквенной части
-            if (!pass && !acceptedWord && WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang) &&
-                !WordDict.Has(cur.Text, cur.Lang))
+            // dict-over-score разрешён ТОЛЬКО для чистого основного словаря (HasCore),
+            // чтобы шум из 350k субтитров (Huge) не пробивал скоринг в одиночку
+            if (!pass && !acceptedWord && WordDict.HasCore(bestCore, best.Lang) &&
+                !WordDict.Has(curCore, cur.Lang))
             {
                 pass = true;
                 Log("convert: dict-over-score ('" + cur.Text + "' -> '" + best.Text + "')");
@@ -1547,10 +1833,10 @@ namespace OpenSwitcher.Core
             // (бой 27.09 23:25: 'twitter,'->'ецшееукб')
             bool punctSignal = !acceptedWord && cur.Lang == 1 && best.Lang == 0 &&
                                ContainsPunctTwinChar(cur.Text) &&
-                               best.Text == LanguageTables.LettersOnly(best.Text) &&
-                               LanguageTables.PossibleWord(LanguageTables.LettersOnly(best.Text), 0) &&
-                               !WordDict.Has(LanguageTables.LettersOnly(cur.Text), 1) &&
-                               LanguageTables.LettersOnly(best.Text).Length >= 5;
+                               best.Text == bestCore &&
+                               LanguageTables.PossibleWord(bestCore, 0) &&
+                               !WordDict.Has(curCore, 1) &&
+                               bestCore.Length >= 5;
             if (!pass && punctSignal)
             {
                 pass = true;
@@ -1561,8 +1847,8 @@ namespace OpenSwitcher.Core
             // требует ДВОЙНОГО запаса скора — иначе опечатка юзера конвертится
             // в ближайший мусор ('lfdfqw' -> «давайц» при пропущенной «те»).
             // Словарные цели — обычный порог, выученные — без порога
-            if (pass && !acceptedWord && !punctSignal &&
-                !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
+            if (pass && !acceptedWord &&
+                !WordDict.Has(bestCore, best.Lang))
             {
                 // словарная цель — обычный порог; умный режим: dist1 — 1x (сильный
                 // сигнал), dist2/нет — 2x (полный запас несловарной цели)
@@ -1576,8 +1862,8 @@ namespace OpenSwitcher.Core
 
             // последнее предохранительное: набранное — частое слово, цель — нет:
             // не трогаем (выученные пары не проверяем — юзер настоял)
-            if (pass && !acceptedWord && WordDict.Has(cur.Text, cur.Lang) &&
-                !WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang))
+            if (pass && !acceptedWord && WordDict.Has(curCore, cur.Lang) &&
+                !WordDict.Has(bestCore, best.Lang))
             {
                 Log("convert skip: cur-in-dict, target-not ('" + cur.Text + "' -> '" + best.Text + "')");
                 return false;
@@ -1629,43 +1915,19 @@ namespace OpenSwitcher.Core
             _lastConvertTick = Environment.TickCount;
             _lastWord = word;
             _lastWordSepVk = 0;
-            // PasteConvertApps: веб-поля в Chromium (bb и пр.) переигрывают
-            // BS-инжекции своим обработчиком ввода — путь через выделение+вставку
-            // (механизм §8, ни одного BS; mac-паритет 02.11)
-            if (PasteConvertListContains(_fgProc))
-            {
-                Log("convert: paste-convert app ('" + cur.Text + "' -> '" + best.Text + "')");
-                TextConverter.SendCombo(0x11, 0x10, 0x25, true, false); // Ctrl+Shift+Left — слово слева
-                BeginFixSelection(true);
-                // разделитель проглочен — досылаем после вставки; строго ПОСЛЕ
-                // BeginFixSelection: он сбрасывает stale-сепаратор (аудит 06.11)
-                _selResendVk = resendVk;
-                _selResendShift = resendShift;
-                _selExpect = cur.Text; // сверка: вставлять только своё слово (мусор от гонки/реплея — отказ)
-                return true;
-            }
-            Suppress(600);
+            Suppress(200);
             TextConverter.SendBackspaces(word.Count + (retroFrom != null ? retroFrom.Length + 1 : 0));
             TextConverter.SendUnicode(retroText + best.Text);
             if (TextConverter.LastSendInputRequested > 0)
                 Log("inj: sendinput accepted " + TextConverter.LastSendInputResult + "/" +
                     TextConverter.LastSendInputRequested +
                     (TextConverter.LastSendInputResult == 0 ? " — BLOCKED (HIPS/антивирус?)" : ""));
-            // досылаем проглоченный разделитель символом раскладки цели (см. sentSep выше),
-            // Enter — клавишей, т.к. SendUnicode не передаёт \r. Знаки-двойники на буквенных
-            // клавишах (',' = б, '.' = ю) сюда не попадают — они в слове, их решает хвост-двойник
             if (resendVk != 0)
             {
                 if (resendVk == 0x0D) TextConverter.SendKey(0x0D, false, false);
                 else TextConverter.SendUnicode(sentSep);
             }
             if (resendVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // досланный пробел — перед кареткой (дедуп)
-            // РАСКЛАДКА НА ЭНТЕРЕ — только для «уверенных» конвертаций (решение
-            // юзера 07.10 после боя 'chatgpt': фикс без смены оставлял RU на
-            // следующее слово). Уверенная = словарная цель или выученная пара —
-            // юзер их подтвердил. Мусорные пути без словаря (punct-twin 'звюЖ')
-            // на энтере HKL не трогают: бой 06.10 20:51 — дёрганье раскладки при
-            // отправке мусора и было исходной жалобой
             bool sureFix = acceptedWord || WordDict.Has(LanguageTables.LettersOnly(best.Text), best.Lang);
             if (resendVk != 0x0D || sureFix)
             {
@@ -1673,20 +1935,14 @@ namespace OpenSwitcher.Core
                 ExpectLayout(best.Hkl);
             }
 
-            // точка отката: Break вернёт исходное слово и раскладку.
-            // Только для замен по разделителю — после Enter строка уже ушла в
-            // приложение, откат стирал бы переносы
-            // точка отката ставится только если замена реально доставлена: при
-            // полностью погашенной инжекции (HIPS) текст не изменился — армng отката
-            // стирал бы РЕАЛЬНЫЕ символы юзера при последующем Break
             bool injOk = TextConverter.LastSendInputRequested == 0 || TextConverter.LastSendInputResult > 0;
             _lastConvertLang = best.Lang;
             _undoPending = resendVk != 0x0D && injOk;
+            _undoFromAuto = !manual;
+            _autoRejectEligible = !manual && _undoPending;
+            _undoErasedByBs = 0;
             _undoText = cur.Text;
-            // _undoLen — ВСЁ, что напечатали вместо исходного: цель + досланный знак (он может
-            // отличаться от набранного: '?' вместо '&'); стирание отката считается только по нему
             _undoLen = best.Text.Length + sentSep.Length;
-            // откат ретро-флипа возвращает и букву: переворот 'f' держался только на слове
             _undoPrefix = retroFrom != null ? retroFrom + " " : "";
             _undoPrefixLen = retroText.Length;
             _undoSepText = typedSep; // вернуть знак как набран
@@ -1695,45 +1951,75 @@ namespace OpenSwitcher.Core
             _undoFocus = _fgFocus;
             _undoTick = Environment.TickCount;
             _keysSinceUndoPoint = 0;
-            // новая точка отката — хвост от ПРЕДЫДУЩЕЙ замены не имеет права
-            // сюда попасть, иначе Break стирал/возвращал чужие символы
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            // авто-заучивание только от 3 букв: коротыш ('су'->'ce' по запятой) не имеет
-            // права вечно портить ввод из-за одного случайного переворота. Коротким
-            // парам — осознанное обучение через Break (ForceConvertWord).
-            // Принятие честное: через 15 с, если юзер не откатил (откат кладёт в rejected)
-            // RU->EN заучиваем ТОЛЬКО в словарную EN-цель: юзер пишет по-русски, и ошибочная
-            // замена русского слова, которую он поправил руками (не Break'ом), иначе через 15 с
-            // становилась «выученной» и дальше переворачивалась ВСЕГДА в обход ворот
-            // (бой 02.10 19:08:52/57 — русское слово дважды в 'et,e'-мусор)
-            bool learnable = cur.Lang != 0 || best.Lang != 1 ||
-                             WordDict.Has(LanguageTables.LettersOnly(best.Text), 1);
-            if (injOk && cur.Text.Length >= 3 && learnable)
-            {
-                string acceptedTyped = cur.Text.ToLowerInvariant();
-                var acceptTimer = new System.Windows.Forms.Timer { Interval = 15000 };
-                acceptTimer.Tick += delegate
-                {
-                    acceptTimer.Stop();
-                    acceptTimer.Dispose();
-                    if (!_rejected.Contains(acceptedTyped)) RememberAccepted(acceptedTyped);
-                };
-                acceptTimer.Start();
-            }
-
+            // Слепая авто-запись в accepted.txt по 15-секундному таймеру удалена:
+            // она навсегда цементировала случайные срабатывания, исправленные юзером вручную.
             FireConverted((retroFrom != null ? retroFrom + " " : "") + cur.Text, retroText + best.Text);
             return true;
         }
 
-        /// <summary>Цель авто-замены по форме: только буквы, либо буквы + ровно один знак В КОНЦЕ.</summary>
+        /// <summary>Цель авто-замены по форме: только буквы, либо буквы + ровно один знак В КОНЦЕ, либо валидные дефисные слова (P1-3).</summary>
         public static bool TargetShapeOk(string t)
         {
             if (string.IsNullOrEmpty(t)) return false;
             string core = LanguageTables.LettersOnly(t);
             if (core.Length == 0) return false;
-            return t == core || (t.Length == core.Length + 1 && t.StartsWith(core, StringComparison.Ordinal));
+            if (t == core || (t.Length == core.Length + 1 && t.StartsWith(core, StringComparison.Ordinal)))
+                return true;
+
+            // Разрешаем дефисные слова: "какой-то", "из-за", "кто-нибудь" (P1-3)
+            string wordPart = (t.Length > 0 && ",.;:!?\"'".IndexOf(t[t.Length - 1]) >= 0) ? t.Substring(0, t.Length - 1) : t;
+            if (wordPart.IndexOf('-') >= 0 && !wordPart.StartsWith("-") && !wordPart.EndsWith("-") && wordPart.IndexOf("--") < 0)
+            {
+                string[] parts = wordPart.Split('-');
+                if (parts.Length >= 2)
+                {
+                    bool allLetters = true;
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        if (string.IsNullOrEmpty(parts[i]) || LanguageTables.LettersOnly(parts[i]) != parts[i])
+                        {
+                            allLetters = false;
+                            break;
+                        }
+                    }
+                    if (allLetters) return true;
+                }
+            }
+            return false;
+        }
+
+        public static bool IsDomainOrFileName(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.IndexOf('.') < 0) return false;
+            string[] parts = text.Split('.');
+            if (parts.Length < 2) return false;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string p = parts[i];
+                if (string.IsNullOrEmpty(p)) return false;
+                if (i == parts.Length - 1)
+                {
+                    if (p.Length < 1 || p.Length > 6) return false;
+                    for (int j = 0; j < p.Length; j++)
+                    {
+                        char c = p[j];
+                        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+                    }
+                }
+                else
+                {
+                    for (int j = 0; j < p.Length; j++)
+                    {
+                        char c = p[j];
+                        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+                            return false;
+                    }
+                }
+            }
+            return true;
         }
 
         /// <summary>Ретро-флип одиночной буквы (§7): переворачивается, только если набранное —
@@ -1752,7 +2038,11 @@ namespace OpenSwitcher.Core
         public void ToggleAuto()
         {
             S.Paused = !S.Paused;
-            if (!S.Paused) _autoLocked = false; // с чистого листа
+            if (!S.Paused)
+            {
+                _autoLocked = false;
+                _autoLockedWordsTyped = 0;
+            }
             bool paused = S.Paused;
             Defer(delegate
             {
@@ -1804,14 +2094,18 @@ namespace OpenSwitcher.Core
             int bs = _undoPrefixLen + _undoLen + _undoTail.Count; // _undoLen уже с досланным знаком (раньше force-flip считал его дважды и съедал символ перед словом)
             string restore = _undoPrefix + _undoText + _undoSepText +
                              (_undoTail.Count > 0 ? LayoutService.Render(_undoHkl, _undoTail) : "");
-            Suppress(600);
+            Suppress(200);
             TextConverter.SendBackspaces(bs);
             TextConverter.SendUnicode(restore);
             _prevSingle = null;
             if (restore.EndsWith(" ")) _spaceAtCaretTick = Environment.TickCount; // 'слово␣' — перед кареткой пробел
             LayoutService.SwitchForegroundTo(_fgHwnd, _undoHkl);
             ExpectLayout(_undoHkl);
-            if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер настоял на своём
+            if (S.LockAutoAfterManualSwitch)
+            {
+                _autoLocked = true;
+                _autoLockedWordsTyped = 0;
+            }
             string learned = _undoText;
             Defer(delegate { RememberRejected(learned); RemoveAccepted(learned); }); // слово больше не автозаменяем
             FireInfo("Отменено: " + restore);
@@ -1919,11 +2213,30 @@ namespace OpenSwitcher.Core
             }
             if (best == null || best.Text == cur.Text) { Log("force-flip skip: no other reading"); return false; }
 
+            // P2-5: правило хвостового знака-двойника и в ручном флипе ('ghbdtn,' -> 'привет,')
+            string targetText = best.Text;
+            if (word.Count > 1 && IsPunctTwinVk(word[word.Count - 1].Vk) && targetText.Length > 1)
+            {
+                char pc = PunctCharOfVk(word[word.Count - 1].Vk);
+                if (pc != '\0')
+                {
+                    string alt = targetText.Substring(0, targetText.Length - 1) + pc;
+                    string altCore = LanguageTables.LettersOnly(alt);
+                    string baseCore = LanguageTables.LettersOnly(targetText);
+                    bool altValid = WordDict.Has(altCore, best.Lang) ||
+                        (altCore.Length >= 3 && LanguageTables.PossibleWord(altCore, best.Lang));
+                    bool baseValid = WordDict.Has(baseCore, best.Lang) ||
+                        (baseCore.Length >= 3 && LanguageTables.PossibleWord(baseCore, best.Lang));
+                    bool altDict = WordDict.Has(altCore, best.Lang), baseDict = WordDict.Has(baseCore, best.Lang);
+                    if (altValid && (!baseValid || (altDict && !baseDict))) targetText = alt;
+                }
+            }
+
             TextConverter.ReleaseModifiers();
             TextConverter.InjectMode = S.InputMode;
             TextConverter.FocusHwnd = _fgFocus != IntPtr.Zero ? _fgFocus : _fgHwnd;
-            Log("force-flip: '" + cur.Text + "' -> '" + best.Text + "'");
-            _lastConvertInfo = "force '" + cur.Text + "' -> '" + best.Text + "'";
+            Log("force-flip: '" + cur.Text + "' -> '" + targetText + "'");
+            _lastConvertInfo = "force '" + cur.Text + "' -> '" + targetText + "'";
             _lastConvertTick = Environment.TickCount;
             // осознанный Break сильнее прошлых отказов: слово возвращаем в строй
             // (иначе один случайный откат блокировал слово НАВСЕГДА — и авто,
@@ -1935,7 +2248,7 @@ namespace OpenSwitcher.Core
                 Log("force-flip: unrejected '" + curLow + "'");
             }
 
-            Suppress(600);
+            Suppress(200);
             // хвост-разделитель после слова уже в тексте приложения — стираем вместе
             // со словом и перепечатываем (иначе переворот съедает пробел/запятую)
             int trailLen = trailSepVk != 0 ? 1 : 0;
@@ -1944,7 +2257,7 @@ namespace OpenSwitcher.Core
             string trailTyped = trailSepVk != 0 ? RenderKeyChar(trailSepVk, _fgHkl, trailSepShift) : "";
             string trailSent = SepInLayout(trailSepVk, trailSepShift, best.Hkl, trailTyped);
             TextConverter.SendBackspaces(word.Count + trailLen);
-            TextConverter.SendUnicode(best.Text);
+            TextConverter.SendUnicode(targetText);
             if (trailSent.Length > 0)
                 TextConverter.SendUnicode(trailSent);
             if (trailSepVk == 0x20) _spaceAtCaretTick = Environment.TickCount; // перепечатанный пробел — перед кареткой
@@ -1959,8 +2272,11 @@ namespace OpenSwitcher.Core
             // точка отката: повторный Break вернёт исходное слово + разделитель;
             // отмена занесёт его в rejected — «самообучение» в обратную сторону
             _undoPending = true;
+            _undoFromAuto = false;
+            _autoRejectEligible = false;
+            _undoErasedByBs = 0;
             _undoText = cur.Text;
-            _undoLen = best.Text.Length + trailSent.Length; // всё напечатанное: слово + перепечатанный знак
+            _undoLen = targetText.Length + trailSent.Length; // всё напечатанное: слово + перепечатанный знак
             _undoPrefix = ""; _undoPrefixLen = 0; // force-flip ретро-букву не трогает
             _prevSingle = null;
             _undoSepText = trailTyped; // вернуть знак как набран
@@ -1972,17 +2288,16 @@ namespace OpenSwitcher.Core
             _undoTail.Clear();
             _undoTailBroken = false;
 
-            // самообучение безопасное: одиночные буквы (нулевого сигнала), слова
-            // со знаками внутри ('le,rf[' — мусор от редких биграмм) и уже словарные
-            // слова (их переворот — почти наверняка случайный Break по нормальному
-            // тексту, так заражалось «что»→xnj) не заучиваем.
-            // 2-буквенные сленговые пары ('et'->'уе') — заучиваем: юзер сам учит
-            if (cur.Text.Length >= 2 && cur.Text == LanguageTables.LettersOnly(cur.Text) &&
+            // самообучение безопасное + P2-5 защита RU->EN в RememberAccepted
+            string toCore = LanguageTables.LettersOnly(targetText);
+            bool canLearnAccepted = (cur.Lang == 1) ||
+                (!LanguageTables.PossibleWord(cur.Text, 0) && WordDict.HasCore(toCore, 1));
+            if (canLearnAccepted && cur.Text.Length >= 2 && cur.Text == LanguageTables.LettersOnly(cur.Text) &&
                 !WordDict.Has(cur.Text, cur.Lang))
             {
                 string learned = cur.Text.ToLowerInvariant();
                 Defer(delegate { RememberAccepted(learned); });
-                FireInfo("Заучено: " + cur.Text + " → " + best.Text);
+                FireInfo("Заучено: " + cur.Text + " → " + targetText);
             }
             return true;
         }
@@ -2038,7 +2353,17 @@ namespace OpenSwitcher.Core
             _selStartRealKeyTick = _lastRealKeyDownTick; // триггер уже учтён хуком (keyDown до OnKeyDown)
             Native.GetAsyncKeyState(0x01); // flush «была нажата после прошлого вызова» для кнопок мыши:
             Native.GetAsyncKeyState(0x02); // дальше LSB ловит только клики ВНУТРИ флоу (SelUserInputDetected)
-            _selBaseline = TextConverter.GetClipboardTextOnce();
+            if (_clipTimer != null && _pendingClipRestoreText != null)
+            {
+                _selBaseline = _pendingClipRestoreText;
+                _clipTimer.Stop();
+                _clipTimer.Dispose();
+                _clipTimer = null;
+            }
+            else
+            {
+                _selBaseline = TextConverter.GetClipboardTextOnce();
+            }
             _selBaseSeq = Native.GetClipboardSequenceNumber();
             _selPhase = 0;
             _selTries = 0;
@@ -2271,9 +2596,10 @@ namespace OpenSwitcher.Core
                 _selResendVk = 0;
             }
 
-            // самообучение (Ctrl+Space / Break-flip): одно слово из букв — выучиваем пару,
-            // но только не коротыши и не словарные слова (см. комментарий в ForceConvertWord)
-            if (_selFromFixWord && text.Length >= S.MinWordLen && text.Length <= 24 &&
+            // самообучение (Ctrl+Space / Break-flip): P2-5 защита RU->EN в RememberAccepted
+            string convCore = LanguageTables.LettersOnly(converted);
+            bool canLearnSel = (lang == 1) || (!LanguageTables.PossibleWord(text, 0) && WordDict.HasCore(convCore, 1));
+            if (_selFromFixWord && canLearnSel && text.Length >= S.MinWordLen && text.Length <= 24 &&
                 text == LanguageTables.LettersOnly(text) && !WordDict.Has(text, lang))
             {
                 string learnedSel = text.ToLowerInvariant();
@@ -2286,20 +2612,28 @@ namespace OpenSwitcher.Core
                 LayoutService.SwitchForegroundTo(_selFgHwnd, target);
                 ExpectLayout(target);
             }
-            if (S.LockAutoAfterManualSwitch) _autoLocked = true; // юзер руками правил текст
+            if (S.LockAutoAfterManualSwitch)
+            {
+                _autoLocked = true;
+                _autoLockedWordsTyped = 0;
+            }
 
-            if (S.RestoreClipboard) ScheduleClipboardRestore(text);
+            // P0-5: восстанавливаем ИСХОДНЫЙ _selBaseline, а не text (выделенное слово)!
+            if (S.RestoreClipboard && _selBaseline != null) ScheduleClipboardRestore(_selBaseline);
 
             if (converted != text) FireConverted(text, converted);
             else FireInfo("Раскладка уже верная");
         }
 
         private System.Windows.Forms.Timer _clipTimer;
+        private string _pendingClipRestoreText;
+        private uint _pendingClipRestoreSeq;
 
         private void ScheduleClipboardRestore(string original)
         {
             if (_clipTimer != null) { _clipTimer.Stop(); _clipTimer.Dispose(); }
-            string text = original;
+            _pendingClipRestoreText = original;
+            _pendingClipRestoreSeq = Native.GetClipboardSequenceNumber();
             _clipTimer = new System.Windows.Forms.Timer();
             _clipTimer.Interval = 800;
             _clipTimer.Tick += delegate
@@ -2307,8 +2641,11 @@ namespace OpenSwitcher.Core
                 _clipTimer.Stop();
                 _clipTimer.Dispose();
                 _clipTimer = null;
-                Suppress(300);
-                TextConverter.SetClipboardTextSafe(text);
+                if (_pendingClipRestoreText != null && Native.GetClipboardSequenceNumber() == _pendingClipRestoreSeq)
+                {
+                    TextConverter.SetClipboardTextSafe(_pendingClipRestoreText);
+                }
+                _pendingClipRestoreText = null;
             };
             _clipTimer.Start();
         }
@@ -2330,7 +2667,11 @@ namespace OpenSwitcher.Core
             string name = LanguageTables.LangOf(sample) == 0 ? "РУС" : "ENG";
             LayoutService.SwitchForegroundTo(_fgHwnd, other);
             ExpectLayout(other);
-            if (S.LockAutoAfterManualSwitch) _autoLocked = true;
+            if (S.LockAutoAfterManualSwitch)
+            {
+                _autoLocked = true;
+                _autoLockedWordsTyped = 0;
+            }
             // компенсация лага: буквы в просвете доставим в целевой раскладке
             _gapActive = true; _gapHkl = other; _gapBuf.Clear();
             _gapDeadline = Environment.TickCount + 800;

@@ -16,32 +16,50 @@ public struct KeyRec: Equatable {
 public enum CharMaps {
     public static let en = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`"
     public static let ru = "йцукенгшщзхъфывапролджэячсмитьбюё"
+    public static let enUpper = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~"
+    public static let ruUpper = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ"
+
+    private static let enLowerArr = Array(en)
+    private static let ruLowerArr = Array(ru)
+    private static let enUpperArr = Array(enUpper)
+    private static let ruUpperArr = Array(ruUpper)
 
     /// macOS-keycode клавиши, которой набирается символ ru/en раскладки.
     public static func keyCode(ofChar c: Character, fromRu: Bool) -> Int {
+        let lowerSrc = fromRu ? ruLowerArr : enLowerArr
+        let upperSrc = fromRu ? ruUpperArr : enUpperArr
+        if let idx = lowerSrc.firstIndex(of: c) {
+            return KeyCodeMap.ansiCode(ofLatin: enLowerArr[idx])
+        }
+        if let idx = upperSrc.firstIndex(of: c) {
+            return KeyCodeMap.ansiCode(ofLatin: enLowerArr[idx])
+        }
         let lo = Character(String(c).lowercased())
-        let src = fromRu ? ru : en
-        guard let i = src.firstIndex(of: lo) else { return -1 }
-        let pos = src.distance(from: src.startIndex, to: i)
-        let ch = Array(en)[pos]
-        return KeyCodeMap.ansiCode(ofLatin: ch)
+        if let idx = lowerSrc.firstIndex(of: lo) {
+            return KeyCodeMap.ansiCode(ofLatin: enLowerArr[idx])
+        }
+        return -1
     }
 
-    /// Конвертация готового текста между раскладками с сохранением регистра.
+    /// Конвертация готового текста между раскладками с сохранением регистра
+    /// и двунаправленным маппингом Shift-символов (: < > " { } ~ ⇄ Ж Б Ю Э Х Ъ Ё).
     public static func mapText(_ text: String, toRu: Bool) -> String {
-        let src = Array((toRu ? en : ru).unicodeScalars)
-        let dst = Array((toRu ? ru : en).unicodeScalars)
-        var out = String.UnicodeScalarView()
-        for c in text.unicodeScalars {
-            let lower = String(String(c).lowercased())
-            guard let i = src.enumerated().first(where: { String($0.element) == lower })?.offset else {
-                out.append(c); continue
+        let srcLo = toRu ? enLowerArr : ruLowerArr
+        let dstLo = toRu ? ruLowerArr : enLowerArr
+        let srcHi = toRu ? enUpperArr : ruUpperArr
+        let dstHi = toRu ? ruUpperArr : enUpperArr
+        var out = String()
+        out.reserveCapacity(text.count)
+        for c in text {
+            if let i = srcLo.firstIndex(of: c) {
+                out.append(dstLo[i])
+            } else if let i = srcHi.firstIndex(of: c) {
+                out.append(dstHi[i])
+            } else {
+                out.append(c)
             }
-            var m = dst[i]
-            if Character(c).isUppercase { m = UnicodeScalar(String(m).uppercased().unicodeScalars.first!.value)! }
-            out.append(m)
         }
-        return String(out)
+        return out
     }
 }
 
@@ -54,20 +72,28 @@ public enum KeyCodeMap {
         0x1F: "o", 0x23: "p", 0x0C: "q", 0x0F: "r", 0x01: "s", 0x11: "t", 0x20: "u",
         0x09: "v", 0x0D: "w", 0x07: "x", 0x10: "y", 0x06: "z",
     ]
-    // знаковые клавиши, несущие русские буквы (б ю ж э х ё ъ)
+    // знаковые клавиши, несущие русские буквы (б ю ж э х ё ъ, плюс ISO ё = 0x0A)
     public static let signLetterKeys: [Int: Character] = [
-        0x29: ";", 0x27: "'", 0x21: "[", 0x1E: "]", 0x2B: ",", 0x2F: ".", 0x32: "`",
+        0x29: ";", 0x27: "'", 0x21: "[", 0x1E: "]", 0x2B: ",", 0x2F: ".", 0x32: "`", 0x0A: "`",
     ]
-    public static let digits: [Int] = [0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19]
+    public static let digits: Set<Int> = [0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19]
+    public static let keypadDigits: Set<Int> = [0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C]
+    public static let keypadOps: Set<Int> = [0x41, 0x43, 0x45, 0x47, 0x4B, 0x4E, 0x51]
 
     public static let space = 0x31
     public static let enter = 0x24
+    public static let keypadEnter = 0x4C
     public static let backspace = 0x33
     public static let tab = 0x30
     public static let esc = 0x35
     public static let equal = 0x18
     public static let minus = 0x1B
+    public static let comma = 0x2B
+    public static let period = 0x2F
+    public static let semicolon = 0x29
+    public static let quote = 0x27
     public static let slash = 0x2C
+    public static let backslash = 0x2A
     public static let leftShift = 0x38
     public static let rightShift = 0x3C  // kVK_RightShift (0x7C — это RightArrow!)
     public static let capsLock = 0x39
@@ -76,7 +102,7 @@ public enum KeyCodeMap {
     /// Латиница → ANSI keycode.
     public static func ansiCode(ofLatin c: Character) -> Int {
         for (code, ch) in letters where ch == c { return code }
-        for (code, ch) in signLetterKeys where ch == c { return code }
+        for (code, ch) in signLetterKeys where ch == c && code != 0x0A { return code }
         return -1
     }
 
@@ -98,15 +124,35 @@ public enum KeyCodeMap {
     }
 
     /// Буквенная ли клавиша: латиница + «русские» знаковые клавиши (б/ю/ж/э/х/ъ/ё)
-    /// + минус (0x1B одинаков в обоих языках — буквой введён, чтобы держать
-    /// «какой-то» целиком; спека v3 §2).
-    public static func isLetterKey(_ code: Int) -> Bool {
-        letters[code] != nil || signLetterKeys[code] != nil || code == minus
+    /// + дефис (0x1B без Shift держит «какой-то» целиком; Shift+0x1B = '_' помечает код-токен в Engine)
+    /// + 0x2A ('\'), если активная русская раскладка Apple держит на нём 'ё'/'Ё'.
+    public static func isLetterKey(_ code: Int, allowBackslashYo: Bool = false) -> Bool {
+        letters[code] != nil || signLetterKeys[code] != nil || code == minus || (allowBackslashYo && code == backslash)
     }
 
-    /// Разделители — знаки в обеих раскладках: пробел, цифры, '=', '/', '\' (спека v3 §2).
-    public static func isSeparatorKey(_ code: Int) -> Bool {
-        code == space || digits.contains(code) || code == equal || code == slash || code == 0x2A
+    /// Цифровая клавиша 0..9: НЕ запускает автоконвертацию предшествующего буквенного куска
+    /// ('snow7', 'gpt4', 'xnj1'), а помечает токен смешанным до пробела/Enter.
+    /// ВАЖНО: с зажатым Shift клавиши цифр печатают знаки препинания ('!', '?', '"', ';', ':'),
+    /// поэтому Shift+цифра считается разделителем конца слова (`isSeparatorKey(code, shift:)`).
+    public static func isDigitKey(_ code: Int) -> Bool {
+        digits.contains(code) || keypadDigits.contains(code)
+    }
+
+    public static func isKeypadDigitKey(_ code: Int) -> Bool {
+        keypadDigits.contains(code)
+    }
+
+    public static func isKeypadOpKey(_ code: Int) -> Bool {
+        keypadOps.contains(code)
+    }
+
+    /// Разделители конца слова: пробел, '=', '/', '\', а также Shift+цифры ('!', '?', '"', ';', ':', '(', ')').
+    /// Голые цифры 0..9 сюда НЕ входят — они рвут слово без конвертации, защищая логины/токены.
+    public static func isSeparatorKey(_ code: Int, shift: Bool = false, allowBackslashYo: Bool = false) -> Bool {
+        if code == backslash && allowBackslashYo { return false }
+        if code == space || code == equal || code == slash || code == backslash { return true }
+        if shift && digits.contains(code) { return true }
+        return false
     }
 
     /// F-клавиши, навигация, Ins/Del: каретку двигают / правят текст —
@@ -127,7 +173,7 @@ public enum KeyCodeMap {
     /// Модификатор ли (не считаем модификаторы «набором после слова»).
     public static func isModifier(_ code: Int) -> Bool {
         switch code {
-        case 0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36, 0x39: return true
+        case 0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36, 0x39, 0x3F: return true
         default: return false
         }
     }
@@ -151,7 +197,7 @@ public enum KeyCodeMap {
         case 0x7C: return "Right"
         case 0x7D: return "Down"
         case 0x7E: return "Up"
-        case 0x4C: return "KeypadEnter"
+        case keypadEnter: return "KeypadEnter"
         case leftShift: return "LShift"
         case rightShift: return "RShift"
         case capsLock: return "CapsLock"
@@ -172,6 +218,12 @@ public final class WordBuffer {
     private var keys: [KeyRec] = []
     private let lock = NSLock()
     public static let maxLen = 40
+    private var _overflowed = false
+
+    public var overflowed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _overflowed
+    }
 
     public var count: Int {
         lock.lock(); defer { lock.unlock() }
@@ -180,8 +232,13 @@ public final class WordBuffer {
 
     public func push(_ rec: KeyRec) {
         lock.lock(); defer { lock.unlock() }
+        if _overflowed { return }
+        if keys.count >= WordBuffer.maxLen {
+            keys.removeAll()
+            _overflowed = true
+            return
+        }
         keys.append(rec)
-        if keys.count > WordBuffer.maxLen { keys.removeFirst(10) }
     }
 
     public func pop() {
@@ -192,6 +249,7 @@ public final class WordBuffer {
     public func clear() {
         lock.lock(); defer { lock.unlock() }
         keys.removeAll()
+        _overflowed = false
     }
 
     public func snapshot() -> [KeyRec] {
@@ -202,5 +260,6 @@ public final class WordBuffer {
     public func restore(_ k: [KeyRec]) {
         lock.lock(); defer { lock.unlock() }
         keys = k
+        _overflowed = false
     }
 }
