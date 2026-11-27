@@ -1717,9 +1717,9 @@ namespace OpenSwitcher.Core
                     // possible-word и НЕ трогается). Переворот всё равно, буквы как
                     // набраны (опечатку правит юзер); запас скора 1x вместо 2x ниже.
                     // Порог 4 буквы, только замена — минимизация ложных срабатываний
-                    string curCore = LanguageTables.LettersOnly(cur.Text);
-                    if (core.Length >= 4 && !WordDict.Has(curCore, cur.Lang) &&
-                        !(curCore.Length >= 3 && LanguageTables.PossibleWord(curCore, cur.Lang)))
+                    string fuzzyCurCore = LanguageTables.LettersOnly(cur.Text);
+                    if (core.Length >= 4 && !WordDict.Has(fuzzyCurCore, cur.Lang) &&
+                        !(fuzzyCurCore.Length >= 3 && LanguageTables.PossibleWord(fuzzyCurCore, cur.Lang)))
                     {
                         fuzzyNeighbor = WordDict.DictNeighbor(core, best.Lang, 2, out fuzzyDist);
                     }
